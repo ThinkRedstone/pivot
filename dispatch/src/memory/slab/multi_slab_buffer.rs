@@ -46,6 +46,13 @@ impl<T> MultiSlabBuffer<T> {
         unsafe { self.slabs[slab_idx].ptr.add(offset_in_slab) as *mut T }
     }
 
+    /// The number of elements from `index` to the end of the slab holding it:
+    /// how far a contiguous write starting at `ptr_at_index(index)` may run.
+    pub fn elements_left_in_slab(&self, index: usize) -> usize {
+        let elems_per_slab = BUFFER_SIZE / size_of::<T>();
+        elems_per_slab - index % elems_per_slab
+    }
+
     /// Zero every backing slab, returning the buffer to its as-created state. Used
     /// to reuse a hash table's storage after its entries have been drained
     /// elsewhere, without reallocating from the slab pool.
@@ -99,6 +106,19 @@ mod tests {
         for i in 0..256 {
             assert_eq!(buf[i], 0);
         }
+    }
+
+    #[test]
+    fn elements_left_in_slab_counts_down_to_the_slab_boundary() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let per_slab = BUFFER_SIZE / size_of::<u64>();
+        let buf: MultiSlabBuffer<u64> = alloc.create_multi_slab_buffer(per_slab + 10, true);
+
+        assert_eq!(buf.elements_left_in_slab(0), per_slab);
+        assert_eq!(buf.elements_left_in_slab(per_slab - 1), 1);
+        assert_eq!(buf.elements_left_in_slab(per_slab), per_slab);
+        assert_eq!(buf.elements_left_in_slab(per_slab + 3), per_slab - 3);
     }
 
     #[test]

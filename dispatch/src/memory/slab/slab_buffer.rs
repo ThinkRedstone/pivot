@@ -35,6 +35,13 @@ impl<T> SlabBuffer<T> {
         unsafe { self.slab.ptr.add(byte_offset) as *mut T }
     }
 
+    /// The number of elements from `index` to the end of the buffer: how far a
+    /// contiguous write starting at `ptr_at_index(index)` may run. `index` must
+    /// not exceed the buffer's capacity.
+    pub fn elements_left(&self, index: usize) -> usize {
+        self.slab.size / size_of::<T>() - index
+    }
+
     /// Hand the buffer's first `byte_len` bytes to Arrow as a zero-copy
     /// [`Buffer`]. The slab rides in the buffer's allocation `Arc`, so the
     /// memory returns to the pool when the last downstream reference drops.
@@ -89,5 +96,16 @@ mod tests {
         for i in 0..128 {
             assert_eq!(buf[i], 0);
         }
+    }
+
+    #[test]
+    fn elements_left_counts_down_to_the_buffer_capacity() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let buf: SlabBuffer<u64> = alloc.create_slab_buffer(128, true);
+
+        assert_eq!(buf.elements_left(0), 128);
+        assert_eq!(buf.elements_left(100), 28);
+        assert_eq!(buf.elements_left(128), 0);
     }
 }

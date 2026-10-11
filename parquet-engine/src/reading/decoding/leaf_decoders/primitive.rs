@@ -141,12 +141,22 @@ impl ReadLeBytes for f64 {
 /// or the [`MultiSlabBuffer`] of a dictionary.
 pub(super) trait ElemPtr<T> {
     fn elem_ptr(&self, index: usize) -> *mut T;
+
+    /// How many elements from `index` onwards are laid out contiguously after
+    /// `elem_ptr(index)`: the most a single bulk copy may write there. Zero
+    /// means the buffer is full.
+    fn contiguous_elements_from(&self, index: usize) -> usize;
 }
 
 impl<T> ElemPtr<T> for SlabBuffer<T> {
     #[inline(always)]
     fn elem_ptr(&self, index: usize) -> *mut T {
         self.ptr_at_index(index)
+    }
+
+    #[inline(always)]
+    fn contiguous_elements_from(&self, index: usize) -> usize {
+        self.elements_left(index)
     }
 }
 
@@ -155,13 +165,21 @@ impl<T> ElemPtr<T> for MultiSlabBuffer<T> {
     fn elem_ptr(&self, index: usize) -> *mut T {
         self.ptr_at_index(index)
     }
+
+    #[inline(always)]
+    fn contiguous_elements_from(&self, index: usize) -> usize {
+        self.elements_left_in_slab(index)
+    }
 }
 
 /// Reads `count` fixed-width LE primitive values from scattered buffers into
 /// `output` (a single-slab builder buffer or a multi-slab dictionary buffer).
 ///
 /// Fast path: when many values fit within the current buffer, copies them
-/// in bulk via memcpy (no per-value overhead).
+/// in bulk via memcpy (no per-value overhead). A copy never crosses the end
+/// of the output's current slab: a multi-slab dictionary's slabs are separate
+/// allocations, so a copy sized by the input alone would run off one slab
+/// into unrelated memory and leave the next slab's values unwritten.
 /// Slow path: when a value straddles a buffer boundary, falls back to
 /// `MultiBufferReader` for that single value, then resumes the fast path.
 #[inline]
@@ -182,8 +200,15 @@ fn read_primitives<N: ReadLeBytes, B: ElemPtr<N>>(
         let fit = available_bytes / byte_width;
 
         if fit > 0 && byte_width == mem::size_of::<N>() {
-            // Fast path: bulk-copy all values that fit in the current buffer
-            let to_read = remaining.min(fit);
+            // Fast path: bulk-copy all values that fit in the current input
+            // buffer and the current output slab
+            let to_read = remaining
+                .min(fit)
+                .min(output.contiguous_elements_from(*output_len));
+            assert!(
+                to_read > 0,
+                "output buffer is full after {output_len} elements, {remaining} more requested"
+            );
             let byte_count = to_read * byte_width;
             let src = &buf[position.offset..position.offset + byte_count];
             unsafe {
@@ -462,8 +487,12 @@ mod tests {
     };
     use bytes::Bytes;
 
-    use super::{Dict, PrimitiveDict, PrimitiveLeafDecoder, attach_timestamp_timezone};
-    use dispatch::memory::SlabBuffer;
+    use super::{
+        Dict, PrimitiveDict, PrimitiveLeafDecoder, ReaderPosition, attach_timestamp_timezone,
+        read_primitives,
+    };
+    use dispatch::memory::{BUFFER_SIZE, MultiSlabBuffer, SlabBuffer};
+    use std::mem;
 
     /// `maybe_contains` scans raw page bytes, so the buffer flavour is
     /// irrelevant; any instantiation works.
@@ -496,6 +525,47 @@ mod tests {
         assert!(Int64Dict::maybe_contains(&data, 5, &30));
         assert!(!Int64Dict::maybe_contains(&data, 5, &35));
         assert!(!Int64Dict::maybe_contains(&data, 5, &0));
+    }
+
+    #[test]
+    fn bulk_read_into_two_slabs_stops_at_the_slab_boundary() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        // Two output slabs with a canary slab between them, as the pool may
+        // hand them out in production, and one slab of i64s plus some to read
+        // from a single input buffer: a copy sized by the input alone would
+        // run past the first slab into the canary.
+        let first = allocator.get_slab_of_size(BUFFER_SIZE, true);
+        let canary = allocator.get_slab_of_size(BUFFER_SIZE, true);
+        let second = allocator.get_slab_of_size(BUFFER_SIZE, true);
+        let mut output = MultiSlabBuffer::<i64>::new(vec![first, second]);
+        let per_slab = BUFFER_SIZE / mem::size_of::<i64>();
+        let values: Vec<i64> = (0..per_slab as i64 + 1000).map(|i| i * 7 - 3).collect();
+        let data = [Bytes::from(encode_i64s(&values))];
+        let mut position = ReaderPosition::default();
+        let mut len = 0;
+
+        read_primitives::<i64, _>(&data, &mut position, &mut output, &mut len, values.len());
+
+        assert_eq!(len, values.len());
+        for (idx, expected) in values.iter().enumerate() {
+            assert_eq!(output[idx], *expected, "entry {idx}");
+        }
+        assert!(canary.as_slice().iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    #[should_panic(expected = "output buffer is full after 100 elements")]
+    fn bulk_read_refuses_to_overrun_a_single_slab_output() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut output: SlabBuffer<i64> = allocator.create_slab_buffer(100, true);
+        let values: Vec<i64> = (0..101).collect();
+        let data = [Bytes::from(encode_i64s(&values))];
+        let mut position = ReaderPosition::default();
+        let mut len = 0;
+
+        read_primitives::<i64, _>(&data, &mut position, &mut output, &mut len, values.len());
     }
 
     #[test]
