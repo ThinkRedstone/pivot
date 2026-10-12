@@ -217,6 +217,7 @@ pub mod ffi {
         fn logical_operator_type_name(type_id: u8) -> Result<String>;
         fn limit_node_type_name(type_id: u8) -> Result<String>;
         fn order_type_name(type_id: u8) -> Result<String>;
+        fn order_by_null_type_name(type_id: u8) -> Result<String>;
 
         // ---- LogicalOperator: shared structure ----
         /// DuckDB `LogicalOperatorType` discriminant.
@@ -260,6 +261,7 @@ pub mod ffi {
         // ---- OrderBy ----
         fn lo_orderby_count(op: &LogicalOperator) -> Result<usize>;
         fn lo_orderby_direction(op: &LogicalOperator, index: usize) -> Result<u8>;
+        fn lo_orderby_null_order(op: &LogicalOperator, index: usize) -> Result<u8>;
         fn lo_orderby_expr(op: &LogicalOperator, index: usize) -> Result<&Expression>;
 
         // ---- Aggregate ----
@@ -278,6 +280,7 @@ pub mod ffi {
         // ---- TopN ----
         fn lo_topn_order_count(op: &LogicalOperator) -> Result<usize>;
         fn lo_topn_order_direction(op: &LogicalOperator, index: usize) -> Result<u8>;
+        fn lo_topn_order_null_order(op: &LogicalOperator, index: usize) -> Result<u8>;
         fn lo_topn_order_expr(op: &LogicalOperator, index: usize) -> Result<&Expression>;
         fn lo_topn_limit(op: &LogicalOperator) -> Result<usize>;
         fn lo_topn_offset(op: &LogicalOperator) -> Result<usize>;

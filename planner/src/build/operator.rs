@@ -11,7 +11,7 @@ use arrow_array::{Scalar, new_null_array};
 use dispatch::RowDelivery;
 use duckdb_planner::DuckDBTable;
 use duckdb_planner::catalog_provider::OptionalTableWrapper;
-use duckdb_planner::duckdb_bridge::duckdb_types::LimitNodeType;
+use duckdb_planner::duckdb_bridge::duckdb_types::{LimitNodeType, OrderByNullType};
 use duckdb_planner::handle::{
     Aggregate as AggregateView, BridgeError, ChunkGet as ChunkGetView, Compact as CompactView,
     CopyFromStdin as CopyFromStdinView, CreateSchema as CreateSchemaView,
@@ -447,8 +447,14 @@ impl CreateUser {
 fn build_orders(keys: Vec<OrderKey<'_>>) -> Result<Vec<OrderByNode>, ExpressionError> {
     keys.into_iter()
         .map(|key| {
+            let nulls_first = match key.null_order {
+                OrderByNullType::NULLS_FIRST => true,
+                OrderByNullType::NULLS_LAST => false,
+                unresolved => return Err(ExpressionError::UnsupportedNullOrder(unresolved)),
+            };
             Ok(OrderByNode {
                 direction: key.direction.into(),
+                nulls_first,
                 expression: Expression::from_handle(key.expression)?,
             })
         })

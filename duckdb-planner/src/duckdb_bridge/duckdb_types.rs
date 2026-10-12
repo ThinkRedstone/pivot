@@ -19,6 +19,7 @@ include_cpp! {
     generate!("duckdb::LogicalTypeId")
     generate!("duckdb::ExpressionType")
     generate!("duckdb::OrderType")
+    generate!("duckdb::OrderByNullType")
     generate!("duckdb::LogicalTypeId")
     generate!("duckdb::TableFilterType")
     generate!("duckdb::LimitNodeType")
@@ -31,6 +32,7 @@ pub use ffi::duckdb::JoinType;
 pub use ffi::duckdb::LimitNodeType;
 pub use ffi::duckdb::LogicalOperatorType;
 pub use ffi::duckdb::LogicalTypeId;
+pub use ffi::duckdb::OrderByNullType;
 pub use ffi::duckdb::OrderType;
 pub use ffi::duckdb::TableFilterType;
 pub use ffi::duckdb::TransactionType;
@@ -90,6 +92,7 @@ impl_from_u8!(
     LimitNodeType,
     LogicalTypeId,
     OrderType,
+    OrderByNullType,
     TransactionType,
 );
 
@@ -100,4 +103,5 @@ impl_named_format!(
     LogicalOperatorType => logical_operator_type_name,
     LimitNodeType => limit_node_type_name,
     OrderType => order_type_name,
+    OrderByNullType => order_by_null_type_name,
 );

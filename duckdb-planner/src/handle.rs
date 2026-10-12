@@ -25,8 +25,8 @@ use cxx::UniquePtr;
 
 use crate::catalog_provider::OptionalTableWrapper;
 use crate::duckdb_bridge::duckdb_types::{
-    ExpressionType, JoinType, LimitNodeType, LogicalOperatorType, LogicalTypeId, OrderType,
-    TransactionType,
+    ExpressionType, JoinType, LimitNodeType, LogicalOperatorType, LogicalTypeId, OrderByNullType,
+    OrderType, TransactionType,
 };
 use crate::duckdb_bridge::ffi;
 use crate::types::{BoundLogicalType, ScalarValue};
@@ -549,6 +549,7 @@ impl<'plan> OrderBy<'plan> {
             .map(|i| {
                 Ok(OrderKey {
                     direction: OrderType::from_u8(ffi::lo_orderby_direction(self.raw, i)?),
+                    null_order: OrderByNullType::from_u8(ffi::lo_orderby_null_order(self.raw, i)?),
                     expression: Expr {
                         raw: ffi::lo_orderby_expr(self.raw, i)?,
                     },
@@ -564,6 +565,9 @@ impl<'plan> TopN<'plan> {
             .map(|i| {
                 Ok(OrderKey {
                     direction: OrderType::from_u8(ffi::lo_topn_order_direction(self.raw, i)?),
+                    null_order: OrderByNullType::from_u8(ffi::lo_topn_order_null_order(
+                        self.raw, i,
+                    )?),
                     expression: Expr {
                         raw: ffi::lo_topn_order_expr(self.raw, i)?,
                     },
@@ -1109,9 +1113,12 @@ pub struct JoinCondition<'plan> {
     pub comparison: ExpressionType,
 }
 
-/// One sort key of an ORDER BY / TopN: a direction plus the keyed expression.
+/// One sort key of an ORDER BY / TopN: a direction, where NULLs go, and the
+/// keyed expression. The binder resolves a key written without `NULLS FIRST`
+/// / `NULLS LAST` to one of the two, so `null_order` is never `ORDER_DEFAULT`.
 pub struct OrderKey<'plan> {
     pub direction: OrderType,
+    pub null_order: OrderByNullType,
     pub expression: Expr<'plan>,
 }
 

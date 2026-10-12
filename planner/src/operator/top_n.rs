@@ -50,7 +50,7 @@ impl TopN {
                     expr => Err(Error::UnsupportedTopKExpression(expr.clone())),
                 }?;
                 let descending = matches!(node.direction, OrderByDirection::Desc);
-                Ok(DispatchOrderBy::new(col, descending, false))
+                Ok(DispatchOrderBy::new(col, descending, node.nulls_first))
             })
             .collect::<Result<Vec<_>, _>>()?;
         // If DuckDB's Top-N optimizer marked this node as a dynamic-filter

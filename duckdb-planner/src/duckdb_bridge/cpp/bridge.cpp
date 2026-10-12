@@ -342,6 +342,10 @@ rust::String order_type_name(uint8_t type) {
 	return rust::String::lossy(duckdb::EnumUtil::ToString(static_cast<duckdb::OrderType>(type)));
 }
 
+rust::String order_by_null_type_name(uint8_t type) {
+	return rust::String::lossy(duckdb::EnumUtil::ToString(static_cast<duckdb::OrderByNullType>(type)));
+}
+
 // ---- LogicalOperator: shared structure ----
 
 uint8_t lo_type(const LogicalOperator &op) {
@@ -455,6 +459,10 @@ uint8_t lo_orderby_direction(const LogicalOperator &op, size_t index) {
 	return static_cast<uint8_t>(as<duckdb::LogicalOrder>(op).orders[index].type);
 }
 
+uint8_t lo_orderby_null_order(const LogicalOperator &op, size_t index) {
+	return static_cast<uint8_t>(as<duckdb::LogicalOrder>(op).orders[index].null_order);
+}
+
 const Expression &lo_orderby_expr(const LogicalOperator &op, size_t index) {
 	return *as<duckdb::LogicalOrder>(op).orders[index].expression;
 }
@@ -499,6 +507,10 @@ size_t lo_topn_order_count(const LogicalOperator &op) {
 
 uint8_t lo_topn_order_direction(const LogicalOperator &op, size_t index) {
 	return static_cast<uint8_t>(as<duckdb::LogicalTopN>(op).orders[index].type);
+}
+
+uint8_t lo_topn_order_null_order(const LogicalOperator &op, size_t index) {
+	return static_cast<uint8_t>(as<duckdb::LogicalTopN>(op).orders[index].null_order);
 }
 
 const Expression &lo_topn_order_expr(const LogicalOperator &op, size_t index) {

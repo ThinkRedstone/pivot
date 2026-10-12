@@ -429,6 +429,87 @@ fn top_n_limit_2_ascending(mut testing_planner: TestingPlanner) {
     );
 }
 
+/// `k` has one NULL (at id 2) so the null's position is unambiguous.
+fn add_nullable_keys(testing_planner: &mut TestingPlanner) {
+    testing_planner.add_table(
+        "nullable_keys",
+        &[
+            (
+                "k",
+                Type::Int32,
+                Arc::new(Int32Array::from(vec![Some(3), None, Some(1), Some(2)])) as ArrayRef,
+            ),
+            ("id", Type::Int32, int_col(vec![1, 2, 3, 4])),
+        ],
+    );
+}
+
+fn ids(rows: &[serde_json::Value]) -> Vec<i64> {
+    rows.iter().map(|r| r["id"].as_i64().unwrap()).collect()
+}
+
+#[rstest]
+fn order_by_nulls_first_puts_the_null_key_before_every_value(mut testing_planner: TestingPlanner) {
+    add_nullable_keys(&mut testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT id FROM nullable_keys ORDER BY k NULLS FIRST",
+    );
+
+    assert_eq!(ids(&rows), vec![2, 3, 4, 1]);
+}
+
+#[rstest]
+fn order_by_descending_nulls_first_puts_the_null_key_before_the_largest(
+    mut testing_planner: TestingPlanner,
+) {
+    add_nullable_keys(&mut testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT id FROM nullable_keys ORDER BY k DESC NULLS FIRST",
+    );
+
+    assert_eq!(ids(&rows), vec![2, 1, 4, 3]);
+}
+
+#[rstest]
+fn order_by_without_a_null_clause_puts_the_null_key_last_in_both_directions(
+    mut testing_planner: TestingPlanner,
+) {
+    add_nullable_keys(&mut testing_planner);
+
+    let ascending = run(
+        &mut testing_planner,
+        "SELECT id FROM nullable_keys ORDER BY k",
+    );
+    let descending = run(
+        &mut testing_planner,
+        "SELECT id FROM nullable_keys ORDER BY k DESC",
+    );
+
+    assert_eq!(ids(&ascending), vec![3, 4, 1, 2]);
+    assert_eq!(ids(&descending), vec![1, 4, 3, 2]);
+}
+
+#[rstest]
+fn top_n_nulls_first_keeps_the_null_key(mut testing_planner: TestingPlanner) {
+    add_nullable_keys(&mut testing_planner);
+
+    let ascending = run(
+        &mut testing_planner,
+        "SELECT id FROM nullable_keys ORDER BY k NULLS FIRST LIMIT 2",
+    );
+    let descending = run(
+        &mut testing_planner,
+        "SELECT id FROM nullable_keys ORDER BY k DESC NULLS FIRST LIMIT 2",
+    );
+
+    assert_eq!(ids(&ascending), vec![2, 3]);
+    assert_eq!(ids(&descending), vec![2, 1]);
+}
+
 // A bare `LIMIT` (no ORDER BY) keeps `limit` arbitrary rows.
 #[rstest]
 fn plain_limit_keeps_limit_rows(mut testing_planner: TestingPlanner) {

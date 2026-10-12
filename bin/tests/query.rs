@@ -749,6 +749,185 @@ async fn insert_with_a_column_list_fills_only_the_named_columns(#[future] conn: 
     );
 }
 
+/// (k BIGINT, id BIGINT) table whose `k` is 3, NULL, 1, 2 for ids 1..=4, so
+/// the id order of a query sorted by `k` shows where the NULL key landed.
+async fn create_null_key_table(client: &Client, table: &str) {
+    client
+        .simple_query(&format!("CREATE TABLE {table} (k BIGINT, id BIGINT)"))
+        .await
+        .unwrap();
+    client
+        .simple_query(&format!(
+            "INSERT INTO {table} VALUES (3, 1), (NULL, 2), (1, 3), (2, 4)"
+        ))
+        .await
+        .unwrap();
+}
+
+/// The single `id` column of `sql`'s rows, in result order.
+async fn ids_in_order(client: &Client, sql: &str) -> Vec<String> {
+    select_rows(client, sql)
+        .await
+        .into_iter()
+        .map(|row| row[0].clone().expect("a non-null id"))
+        .collect()
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn order_by_places_the_null_key_where_the_null_clause_says(#[future] conn: Conn) {
+    create_null_key_table(&conn, "order_null_clause").await;
+
+    let asc_first = ids_in_order(
+        &conn,
+        "SELECT id FROM order_null_clause ORDER BY k NULLS FIRST",
+    )
+    .await;
+    let asc_last = ids_in_order(
+        &conn,
+        "SELECT id FROM order_null_clause ORDER BY k NULLS LAST",
+    )
+    .await;
+    let desc_first = ids_in_order(
+        &conn,
+        "SELECT id FROM order_null_clause ORDER BY k DESC NULLS FIRST",
+    )
+    .await;
+    let desc_last = ids_in_order(
+        &conn,
+        "SELECT id FROM order_null_clause ORDER BY k DESC NULLS LAST",
+    )
+    .await;
+
+    assert_eq!(asc_first, ["2", "3", "4", "1"]);
+    assert_eq!(asc_last, ["3", "4", "1", "2"]);
+    assert_eq!(desc_first, ["2", "1", "4", "3"]);
+    assert_eq!(desc_last, ["1", "4", "3", "2"]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn order_by_without_a_null_clause_puts_the_null_key_last(#[future] conn: Conn) {
+    create_null_key_table(&conn, "order_null_default").await;
+
+    let asc = ids_in_order(&conn, "SELECT id FROM order_null_default ORDER BY k").await;
+    let desc = ids_in_order(&conn, "SELECT id FROM order_null_default ORDER BY k DESC").await;
+
+    assert_eq!(asc, ["3", "4", "1", "2"]);
+    assert_eq!(desc, ["1", "4", "3", "2"]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn order_by_limit_keeps_the_null_key_when_nulls_sort_first(#[future] conn: Conn) {
+    create_null_key_table(&conn, "order_null_limit").await;
+
+    let asc_first = ids_in_order(
+        &conn,
+        "SELECT id FROM order_null_limit ORDER BY k NULLS FIRST LIMIT 2",
+    )
+    .await;
+    let desc_first = ids_in_order(
+        &conn,
+        "SELECT id FROM order_null_limit ORDER BY k DESC NULLS FIRST LIMIT 2",
+    )
+    .await;
+    let asc_last = ids_in_order(
+        &conn,
+        "SELECT id FROM order_null_limit ORDER BY k NULLS LAST LIMIT 2",
+    )
+    .await;
+
+    assert_eq!(asc_first, ["2", "3"]);
+    assert_eq!(desc_first, ["2", "1"]);
+    assert_eq!(asc_last, ["3", "4"]);
+}
+
+/// The key of row `i` in [`write_null_key_parquet`]: NULL on every
+/// thousandth row, otherwise a spread of the ids that is far from file order.
+fn null_key(i: i64) -> Option<i64> {
+    (i % 1_000 != 0).then_some((i * 7919) % 1_000_003)
+}
+
+/// (k BIGINT, id BIGINT) with `rows` rows keyed by [`null_key`], written in
+/// small row groups so a sort spans many batches and workers.
+fn write_null_key_parquet(rows: i64) -> TempDir {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("id", DataType::Int64, false),
+    ]));
+    let k: ArrayRef = Arc::new(Int64Array::from(
+        (0..rows).map(null_key).collect::<Vec<_>>(),
+    ));
+    let id: ArrayRef = Arc::new(Int64Array::from((0..rows).collect::<Vec<_>>()));
+    let batch = RecordBatch::try_new(schema, vec![k, id]).unwrap();
+    let dir = TempDir::new().unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_max_row_group_row_count(Some(4096))
+        .build();
+    let file = File::create(dir.path().join("data.parquet")).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    dir
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn order_by_limit_over_many_batches_honours_the_null_clause(#[future] conn: Conn) {
+    let rows = 200_000;
+    let dir = write_null_key_parquet(rows);
+    let path = dir.path().to_str().unwrap();
+    conn.simple_query(&format!(
+        "CREATE TABLE many_null_keys (k BIGINT, id BIGINT) WITH (with_pre_existing_parquets = '{path}')"
+    ))
+    .await
+    .unwrap();
+    let mut non_null_keys: Vec<i64> = (0..rows).filter_map(null_key).collect();
+    non_null_keys.sort_unstable();
+    let null_rows = (rows - non_null_keys.len() as i64) as usize;
+
+    let asc_first = ids_in_order(
+        &conn,
+        "SELECT id FROM many_null_keys ORDER BY k NULLS FIRST, id LIMIT 3",
+    )
+    .await;
+    let desc_first = select_rows(
+        &conn,
+        &format!(
+            "SELECT k FROM many_null_keys ORDER BY k DESC NULLS FIRST LIMIT {}",
+            null_rows + 1
+        ),
+    )
+    .await;
+    let asc_last = select_rows(
+        &conn,
+        "SELECT k FROM many_null_keys ORDER BY k NULLS LAST LIMIT 2",
+    )
+    .await;
+    let full = select_rows(&conn, "SELECT k FROM many_null_keys ORDER BY k NULLS FIRST").await;
+
+    assert_eq!(asc_first, ["0", "1000", "2000"]);
+    assert!(desc_first[..null_rows].iter().all(|row| row[0].is_none()));
+    assert_eq!(
+        desc_first[null_rows][0],
+        Some(non_null_keys.last().unwrap().to_string())
+    );
+    assert_eq!(asc_last[0][0], Some(non_null_keys[0].to_string()));
+    assert_eq!(asc_last[1][0], Some(non_null_keys[1].to_string()));
+    assert!(full[..null_rows].iter().all(|row| row[0].is_none()));
+    let sorted_keys: Vec<i64> = full[null_rows..]
+        .iter()
+        .map(|row| row[0].as_deref().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(sorted_keys, non_null_keys);
+}
+
 /// A variant column the statement leaves out has to travel the write path as a
 /// variant all the same: it is a struct of two leaves that only the Arrow
 /// extension tag tells apart from any other struct, and the shredding stage

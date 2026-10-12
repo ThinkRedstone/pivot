@@ -78,7 +78,7 @@ use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::types::{self, Type};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar};
-use duckdb_planner::duckdb_bridge::duckdb_types::ExpressionType;
+use duckdb_planner::duckdb_bridge::duckdb_types::{ExpressionType, OrderByNullType};
 use std::fmt::{self, Display};
 use thiserror::Error;
 
@@ -104,6 +104,9 @@ pub enum Error {
     UnsupportedInterval(String),
     #[error("Unsupported expression type: {0:?}")]
     UnsupportedExpressionType(ExpressionType),
+    /// A sort key whose null placement the binder left unresolved.
+    #[error("Unsupported null order: {0}")]
+    UnsupportedNullOrder(OrderByNullType),
     /// A DuckDB exception surfaced while reading the plan across the bridge.
     #[error("{0}")]
     Bridge(#[from] duckdb_planner::BridgeError),

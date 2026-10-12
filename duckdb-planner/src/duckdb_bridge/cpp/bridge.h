@@ -84,6 +84,7 @@ rust::String join_type_name(uint8_t type);
 rust::String logical_operator_type_name(uint8_t type);
 rust::String limit_node_type_name(uint8_t type);
 rust::String order_type_name(uint8_t type);
+rust::String order_by_null_type_name(uint8_t type);
 
 
 // ---- LogicalOperator: shared structure ----
@@ -118,6 +119,7 @@ BridgeLogicalType lo_filter_type_id(const LogicalOperator &op, size_t index);
 // ---- OrderBy ----
 size_t lo_orderby_count(const LogicalOperator &op);
 uint8_t lo_orderby_direction(const LogicalOperator &op, size_t index);
+uint8_t lo_orderby_null_order(const LogicalOperator &op, size_t index);
 const Expression &lo_orderby_expr(const LogicalOperator &op, size_t index);
 
 // ---- Aggregate ----
@@ -134,6 +136,7 @@ const Expression &lo_distinct_target(const LogicalOperator &op, size_t index);
 // ---- TopN ----
 size_t lo_topn_order_count(const LogicalOperator &op);
 uint8_t lo_topn_order_direction(const LogicalOperator &op, size_t index);
+uint8_t lo_topn_order_null_order(const LogicalOperator &op, size_t index);
 const Expression &lo_topn_order_expr(const LogicalOperator &op, size_t index);
 size_t lo_topn_limit(const LogicalOperator &op);
 size_t lo_topn_offset(const LogicalOperator &op);
