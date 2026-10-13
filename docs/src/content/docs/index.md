@@ -3,7 +3,7 @@ title: Introduction
 description: What pivotdb is and how the pieces fit together.
 ---
 
-Pivot is a high-performance analytics engine that runs on open data formats. It delivers low-latency queries and high concurrency without replicating data into a dedicated database or proprietary format.
+Pivot is a high-performance analytics database that runs on open data formats. It delivers low-latency queries and high concurrency without replicating data into a dedicated database or proprietary format.
 
 <figure class="arch-figure">
 <svg viewBox="0 0 920 578" role="img" aria-labelledby="arch-title arch-desc">

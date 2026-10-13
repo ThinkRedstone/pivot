@@ -16,7 +16,7 @@
   </p>
 </div>
 
-Pivot is a high-performance analytics engine that runs on open data formats. It delivers low-latency queries and high concurrency without replicating data into a dedicated real-time analytics database such as ClickHouse / Druid.
+Pivot is a high-performance analytics database that runs on open data formats. It delivers low-latency queries and high concurrency without replicating data into a dedicated real-time analytics database such as ClickHouse / Druid.
 
 <p align="center">
   <a href="https://github.com/pivotlake/benchmarks">
