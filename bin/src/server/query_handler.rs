@@ -29,6 +29,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::response::NoticeResponse;
+use planner::CopyFormat;
 use tracing::{info, warn};
 
 /// Per-connection flag toggled with `SET pivot_stats = true`.
@@ -316,10 +317,14 @@ impl PivotQueryHandler {
             StatementOutput::Command(command) => build_command_response(command),
             StatementOutput::Set { name, value } => apply_set(client, &name, value.as_deref())?,
             StatementOutput::CopyFromStdin(ingest) => {
-                // The CopyInResponse advertises a binary payload (the Arrow
-                // IPC stream), so clients know not to apply text escaping to
-                // the bytes they send.
-                const BINARY_FORMAT: i8 = 1;
+                // The CopyInResponse's format code tells clients whether the
+                // payload is text rows (which psql reads from the terminal or
+                // a file as is) or binary (the Arrow IPC stream, exempt from
+                // any text handling).
+                let format_code: i8 = match ingest.format() {
+                    CopyFormat::Text(_) => 0,
+                    CopyFormat::ArrowIpc => 1,
+                };
                 let columns = copy_session::begin_copy(client, *ingest)
                     .await
                     .map_err(|error| {
@@ -327,7 +332,7 @@ impl PivotQueryHandler {
                         error.into_pgwire()
                     })?;
                 info!(sql = %query, "copy from stdin started");
-                Response::CopyIn(CopyResponse::new(BINARY_FORMAT, columns, stream::empty()))
+                Response::CopyIn(CopyResponse::new(format_code, columns, stream::empty()))
             }
         };
 

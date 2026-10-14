@@ -344,22 +344,18 @@ mod tests {
     }
 
     #[test]
-    fn the_format_must_be_spelled_out_like_a_copy() {
+    fn loads_a_text_file_by_default() {
         let directory = tempfile::tempdir().unwrap();
-        let file = directory.path().join("rows.arrow");
-        write_arrow_stream(&file, &people_batch(vec![1]), false);
+        let file = directory.path().join("rows.txt");
+        std::fs::write(&file, "3\n1\n2\n\\.\n").unwrap();
 
         let (result, ids) = ids_after_copy(
             directory.path(),
             &format!("people FROM '{}'", file.display()),
         );
 
-        assert!(
-            result
-                .unwrap_err()
-                .contains("the COPY text format is not supported yet; use WITH (FORMAT arrow)")
-        );
-        assert!(ids.is_empty());
+        assert_eq!(result, Ok(3));
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 
     #[test]

@@ -1,5 +1,6 @@
-//! Wire-level `COPY <table> FROM STDIN WITH (FORMAT arrow)` tests: the
-//! copy-in sub-protocol, schema conformance, and rollback on failure.
+//! Wire-level `COPY <table> FROM STDIN` tests, in the text and arrow
+//! formats: the copy-in sub-protocol, schema conformance, and rollback on
+//! failure.
 
 mod common;
 
@@ -58,6 +59,232 @@ fn single_column_batch(column: arrow_array::ArrayRef, name: &str) -> arrow_array
         true,
     )]));
     arrow_array::RecordBatch::try_new(schema, vec![column]).unwrap()
+}
+
+/// Run a copy-in over a raw connection: the statement, then `frames` as
+/// separate CopyData messages, then CopyDone; returns the format code the
+/// CopyInResponse advertised and the messages up to ReadyForQuery.
+async fn copy_in_frames(sql: &'static str, frames: Vec<Vec<u8>>) -> (u8, Vec<(u8, Vec<u8>)>) {
+    with_raw_conn(move |raw| {
+        raw.query(sql);
+        let (kind, payload) = raw.read_message();
+        assert_eq!(kind, b'G', "expected CopyInResponse");
+        for frame in &frames {
+            raw.copy_data(frame);
+        }
+        raw.copy_done();
+        (payload[0], raw.read_until_ready())
+    })
+    .await
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_text_loads_tab_separated_rows(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE copy_text (id BIGINT, name VARCHAR, note VARCHAR)")
+        .await
+        .unwrap();
+    // Split mid-row so a row must be carried across frames; the last line is
+    // psql's end-of-data marker.
+    let rows = b"1\talice\t\\N\n2\tbob\\twith\\\\tab\tx\r\n3\t.\t\n\\.\n".to_vec();
+    let split = rows.len() / 2;
+    let frames = vec![rows[..split].to_vec(), rows[split..].to_vec()];
+
+    let (format_code, messages) = copy_in_frames("COPY copy_text FROM STDIN", frames).await;
+
+    assert_eq!(format_code, 0, "text copies advertise a text payload");
+    assert_eq!(command_tag(&messages).as_deref(), Some("COPY 3"));
+    let rows = select_rows(&conn, "SELECT id, name, note FROM copy_text ORDER BY id").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("alice".into()), None],
+            vec![
+                Some("2".into()),
+                Some("bob\twith\\tab".into()),
+                Some("x".into())
+            ],
+            vec![Some("3".into()), Some(".".into()), Some("".into())],
+        ]
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_text_casts_into_typed_columns(#[future] conn: Conn) {
+    conn.simple_query(
+        "CREATE TABLE copy_text_typed (n INTEGER, x DOUBLE, d DATE, t TIMESTAMP, \
+         amount DECIMAL(10, 2), j VARIANT, flag BOOLEAN, zoned TIMESTAMPTZ)",
+    )
+    .await
+    .unwrap();
+    // Booleans and zoned timestamps are spelled the way PostgreSQL writes them.
+    let rows = b"7\t1.5\t2024-02-29\t2024-02-29 13:45:00\t12.34\t{\"kind\":\"commit\"}\tt\t2024-02-29 13:45:00+02\n\\N\t\\N\t\\N\t\\N\t\\N\t\\N\t\\N\t\\N\n".to_vec();
+
+    let (_, messages) = copy_in_frames("COPY copy_text_typed FROM STDIN", vec![rows]).await;
+
+    assert_eq!(command_tag(&messages).as_deref(), Some("COPY 2"));
+    let rows = select_rows(
+        &conn,
+        "SELECT n, x, d, t, amount, CAST(j->'kind' AS VARCHAR), CAST(flag AS VARCHAR), \
+         CAST(zoned AS VARCHAR) FROM copy_text_typed ORDER BY n",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("7".into()),
+                Some("1.5".into()),
+                Some("2024-02-29".into()),
+                Some("2024-02-29 13:45:00".into()),
+                Some("12.34".into()),
+                Some("commit".into()),
+                Some("true".into()),
+                Some("2024-02-29T11:45:00Z".into()),
+            ],
+            vec![None, None, None, None, None, None, None, None],
+        ]
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_text_options_and_column_list_apply(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE copy_text_options (id BIGINT, name VARCHAR, note VARCHAR)")
+        .await
+        .unwrap();
+    let rows = b"alice,1\n,2\n".to_vec();
+
+    let (_, messages) = copy_in_frames(
+        "COPY copy_text_options (name, id) FROM STDIN WITH (FORMAT text, DELIMITER ',', NULL '')",
+        vec![rows],
+    )
+    .await;
+
+    assert_eq!(command_tag(&messages).as_deref(), Some("COPY 2"));
+    let rows = select_rows(
+        &conn,
+        "SELECT id, name, note FROM copy_text_options ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("alice".into()), None],
+            vec![Some("2".into()), None, None],
+        ]
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_text_ignores_whitespace_around_non_text_values(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE copy_text_padded (n INTEGER, d DATE, name VARCHAR)")
+        .await
+        .unwrap();
+    let rows = b" 5 \t 2024-02-29 \t alice \n".to_vec();
+
+    let (_, messages) = copy_in_frames("COPY copy_text_padded FROM STDIN", vec![rows]).await;
+
+    assert_eq!(command_tag(&messages).as_deref(), Some("COPY 1"));
+    let rows = select_rows(&conn, "SELECT n, d, name FROM copy_text_padded").await;
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("5".into()),
+            Some("2024-02-29".into()),
+            Some(" alice ".into()),
+        ]]
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_text_unescapes_a_variant_field_before_parsing_its_json(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE copy_text_json (n BIGINT, j VARIANT)")
+        .await
+        .unwrap();
+    // The file doubles the backslash of the JSON escape `\"`.
+    let rows = b"1\t{\"note\":\"a\\\\\"b\"}\n".to_vec();
+
+    let (_, messages) = copy_in_frames("COPY copy_text_json FROM STDIN", vec![rows]).await;
+
+    assert_eq!(command_tag(&messages).as_deref(), Some("COPY 1"));
+    let rows = select_rows(
+        &conn,
+        "SELECT CAST(j->'note' AS VARCHAR) FROM copy_text_json",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Some("a\"b".into())]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_text_invalid_json_for_a_variant_column_rolls_back(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE copy_text_bad_json (n BIGINT, j VARIANT)")
+        .await
+        .unwrap();
+    let rows = b"1\t{\"kind\":\"commit\"}\n2\t{not json\n".to_vec();
+
+    let (_, messages) = copy_in_frames("COPY copy_text_bad_json FROM STDIN", vec![rows]).await;
+
+    let error = messages
+        .iter()
+        .find(|(kind, _)| *kind == b'E')
+        .expect("an ErrorResponse");
+    assert!(
+        String::from_utf8_lossy(&error.1).contains("column \"j\""),
+        "error should name the column: {:?}",
+        String::from_utf8_lossy(&error.1)
+    );
+    let rows = select_rows(&conn, "SELECT COUNT(*) FROM copy_text_bad_json").await;
+    assert_eq!(rows, vec![vec![Some("0".into())]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_text_bad_rows_report_and_roll_back(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE copy_text_bad (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    for (rows, expected) in [
+        (
+            b"1\talice\n2\n".to_vec(),
+            "missing data for column \"name\"",
+        ),
+        (
+            b"1\talice\textra\n".to_vec(),
+            "extra data after last expected column",
+        ),
+        (b"seven\talice\n".to_vec(), "column \"id\""),
+        (
+            b"1\talice\\.\n".to_vec(),
+            "end-of-copy marker is not alone on its line",
+        ),
+    ] {
+        let (_, messages) = copy_in_frames("COPY copy_text_bad FROM STDIN", vec![rows]).await;
+
+        let error = messages
+            .iter()
+            .find(|(kind, _)| *kind == b'E')
+            .expect("an ErrorResponse");
+        assert!(
+            String::from_utf8_lossy(&error.1).contains(expected),
+            "error should mention \"{expected}\": {:?}",
+            String::from_utf8_lossy(&error.1)
+        );
+    }
+    let rows = select_rows(&conn, "SELECT COUNT(*) FROM copy_text_bad").await;
+    assert_eq!(rows, vec![vec![Some("0".into())]], "nothing was committed");
 }
 
 #[rstest]
@@ -392,20 +619,24 @@ async fn copy_format_rejections_name_the_supported_format(#[future] conn: Conn) 
 
     for (sql, expected) in [
         (
-            "COPY copy_format_errors FROM STDIN",
-            "text format is not supported yet",
-        ),
-        (
-            "COPY copy_format_errors FROM STDIN (FORMAT text)",
-            "text format is not supported yet",
-        ),
-        (
             "COPY copy_format_errors FROM STDIN (FORMAT csv)",
-            "only arrow is",
+            "use text or arrow",
         ),
         (
             "COPY copy_format_errors FROM STDIN (FORMAT arrow, DELIMITER '|')",
             "not valid for FORMAT arrow",
+        ),
+        (
+            "COPY copy_format_errors FROM STDIN (FORMAT text, HEADER)",
+            "not valid for FORMAT text",
+        ),
+        (
+            "COPY copy_format_errors FROM STDIN WITH DELIMITER 'ab'",
+            "single one-byte character",
+        ),
+        (
+            "COPY copy_format_errors FROM STDIN (DELIMITER 'n')",
+            "COPY delimiter cannot be \"n\"",
         ),
     ] {
         let messages = with_raw_conn(move |raw| {

@@ -14,7 +14,7 @@ Each command page includes examples, supported syntax, and usage notes.
 ## Writing data
 
 - [INSERT](/docs/reference/statements/insert/) - append values or query results.
-- [COPY](/docs/reference/statements/copy/) - stream Arrow IPC rows from a client.
+- [COPY](/docs/reference/statements/copy/) - stream text or Arrow IPC rows from a client.
 
 ## Schemas and tables
 

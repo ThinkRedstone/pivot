@@ -2,9 +2,14 @@
 //! lowering into an ingest dataflow.
 
 use crate::catalog::{BoundTable, Error as CatalogError};
-use crate::types::physical_arrow_type;
-use arrow_array::{ArrayRef, RecordBatch, new_null_array};
-use arrow_schema::{Field, Schema, SchemaRef};
+use crate::expression::json_to_canonical_variant;
+use crate::operator::copy_arrow::ArrowFrameDecoder;
+use crate::operator::copy_text::{TextFormat, TextFrameDecoder};
+use crate::types::{Type, physical_arrow_type, type_from_physical};
+use arrow_array::cast::AsArray;
+use arrow_array::{ArrayRef, RecordBatch, StringArray, new_null_array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use bytes::Bytes;
 use dispatch::BuildContext;
 use dispatch::{Built, BuiltUnary};
 use dispatch::{
@@ -14,8 +19,8 @@ use dispatch::{
 use std::fmt;
 use std::sync::Arc;
 
-/// `COPY <table> [(columns)] FROM STDIN WITH (FORMAT arrow)`: load rows
-/// arriving over the client protocol into a table.
+/// `COPY <table> [(columns)] FROM STDIN [WITH (FORMAT text | arrow, ...)]`:
+/// load rows arriving over the client protocol into a table.
 ///
 /// A statement, not a query: its rows arrive later over the connection's
 /// copy-in sub-protocol, so a plan never compiles it. The engine reads it off
@@ -36,11 +41,13 @@ pub struct CopyFromStdin {
     pub format: CopyFormat,
 }
 
-/// The validated data format of a COPY FROM STDIN. Only Arrow IPC is
-/// supported so far; the PostgreSQL text format (the protocol's default) and
-/// everything else are rejected at plan time.
+/// The validated data format of a COPY FROM STDIN: PostgreSQL's text format
+/// (the protocol's default, what psql sends) or an Arrow IPC stream. Any
+/// other format is rejected at plan time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopyFormat {
+    /// Tab-separated text rows; see [`TextFormat`].
+    Text(TextFormat),
     /// An Arrow IPC stream; batches conform to the table schema by position.
     ArrowIpc,
 }
@@ -53,27 +60,49 @@ impl CopyFormat {
         options: &[(String, Vec<String>)],
     ) -> Result<Self, String> {
         match format {
-            Some("arrow") => {}
-            None | Some("text") => {
-                return Err(
-                    "the COPY text format is not supported yet; use WITH (FORMAT arrow)"
-                        .to_string(),
-                );
+            None | Some("text") => Ok(Self::Text(TextFormat::from_options(options)?)),
+            Some("arrow") => {
+                if let Some((name, _)) = options.first() {
+                    return Err(format!(
+                        "COPY option \"{}\" is not valid for FORMAT arrow",
+                        name.to_lowercase()
+                    ));
+                }
+                Ok(Self::ArrowIpc)
             }
-            Some(other) => {
-                return Err(format!(
-                    "COPY FORMAT {other} is not supported; only arrow is"
-                ));
-            }
+            Some(other) => Err(format!(
+                "COPY FORMAT {other} is not supported; use text or arrow"
+            )),
         }
-        if let Some((name, _)) = options.first() {
-            return Err(format!(
-                "COPY option \"{}\" is not valid for FORMAT arrow",
-                name.to_lowercase()
-            ));
-        }
-        Ok(Self::ArrowIpc)
     }
+}
+
+/// The sequential half of one copy format: reassembles the protocol's byte
+/// frames into chunks for the dataflow's workers. A partial chunk is carried
+/// across frames, so a chunk may span any number of frames and one frame may
+/// complete several.
+///
+/// A format is its decoder and the [`CopyChunk`]s it yields, nothing else.
+pub trait FrameDecoder: Send {
+    /// Take the next protocol frame. The previous frame's chunks have all
+    /// been drained through [`next_chunk`](Self::next_chunk) by then.
+    fn push_frame(&mut self, frame: Bytes);
+
+    /// The next chunk the frames so far complete. An error means the stream
+    /// is malformed.
+    fn next_chunk(&mut self) -> Result<Option<Box<dyn CopyChunk>>, String>;
+
+    /// The stream is over: whatever is still held, or an error when it was
+    /// cut mid-chunk.
+    fn finish(&mut self) -> Result<Option<Box<dyn CopyChunk>>, String>;
+}
+
+/// The worker half of one copy format: a unit of the stream that a
+/// [`FrameDecoder`] cut, carrying what it takes to finish decoding it.
+pub trait CopyChunk: Send {
+    /// Decode into a batch of the columns the statement feeds, in the
+    /// statement's order.
+    fn into_batch(self: Box<Self>) -> Result<RecordBatch, String>;
 }
 
 impl Clone for CopyFromStdin {
@@ -104,13 +133,14 @@ impl fmt::Display for CopyFromStdin {
             write!(f, " ({})", names.join(", "))?;
         }
         match &self.format {
+            CopyFormat::Text(_) => write!(f, " format: text")?,
             CopyFormat::ArrowIpc => write!(f, " format: arrow")?,
         }
         write!(f, ")")
     }
 }
 
-/// Unclaimed batches the frontend may queue ahead of the workers.
+/// Unclaimed chunks the frontend may queue ahead of the workers.
 const CHUNK_QUEUE_CAPACITY: usize = 1048;
 
 /// The statement's column list resolved against the table: the full output
@@ -130,42 +160,75 @@ impl ColumnLayout {
     fn incoming_columns(&self) -> usize {
         self.source_positions.iter().flatten().count()
     }
+
+    /// The incoming columns as text, in the statement's order: what a
+    /// text-format row parses into before it conforms to the table.
+    fn incoming_text_schema(&self) -> SchemaRef {
+        let mut names = vec![None; self.incoming_columns()];
+        for (field, source) in self.schema.fields().iter().zip(&self.source_positions) {
+            if let Some(position) = source {
+                names[*position] = Some(field.name().clone());
+            }
+        }
+        let fields: Vec<Field> = names
+            .into_iter()
+            .map(|name| {
+                let name = name.expect("every incoming position feeds one table column");
+                Field::new(name, DataType::Utf8, true)
+            })
+            .collect();
+        Arc::new(Schema::new(fields))
+    }
 }
 
 impl CopyFromStdin {
-    /// Lower this statement into its ingest dataflow: a batch channel fanning
-    /// out to per-worker conformance stages, feeding the bound table's insert
-    /// sink (which stages into the transaction the statement was planned in).
-    /// Returns the producer half and the spec ready to execute; its single
-    /// output row is the insert count. `on_claim` fires as workers take
-    /// batches, for producer backpressure.
+    /// Lower this statement into its ingest dataflow: a chunk channel fanning
+    /// out to per-worker decode-and-conform stages, feeding the bound table's
+    /// insert sink (which stages into the transaction the statement was
+    /// planned in). `on_claim` fires as workers take chunks, for producer
+    /// backpressure. Returns the decoder the frontend runs over the
+    /// protocol's frames, the queue its chunks go into, and the dataflow
+    /// that drains it, whose single output row is the insert count.
+    #[allow(clippy::type_complexity)]
     pub fn compile_ingest(
         &self,
         dispatcher: &DataFlowDispatcher,
         on_claim: Box<dyn Fn() + Send + Sync>,
-    ) -> Result<(ChannelInputSender<RecordBatch>, RecordBatchOperatorSpec), CatalogError> {
-        let CopyFormat::ArrowIpc = self.format;
+    ) -> Result<
+        (
+            Box<dyn FrameDecoder>,
+            ChannelInputSender<Box<dyn CopyChunk>>,
+            RecordBatchOperatorSpec,
+        ),
+        CatalogError,
+    > {
         let layout = Arc::new(self.build_layout().map_err(|message| {
             CatalogError::Other(Box::<dyn std::error::Error + Send + Sync>::from(message))
         })?);
-        let (sender, batches) =
-            channel_input::<RecordBatch>(dispatcher, CHUNK_QUEUE_CAPACITY, on_claim);
-        let worker_count = dispatcher.worker_count();
-        let conformers: Vec<_> = (0..worker_count)
-            .map(|_| ConformArrowBatch {
+        let decoder: Box<dyn FrameDecoder> = match &self.format {
+            CopyFormat::Text(format) => Box::new(TextFrameDecoder::new(
+                format.clone(),
+                layout.incoming_text_schema(),
+            )),
+            CopyFormat::ArrowIpc => Box::new(ArrowFrameDecoder::new()),
+        };
+        let (sender, chunks) =
+            channel_input::<Box<dyn CopyChunk>>(dispatcher, CHUNK_QUEUE_CAPACITY, on_claim);
+        let conformers: Vec<_> = (0..dispatcher.worker_count())
+            .map(|_| ConformCopyChunk {
                 layout: layout.clone(),
             })
             .collect();
-        let conformed = batches
+        let conformed = chunks
             .chain(
-                stealable::<RecordBatch>(dispatcher.topology())
+                stealable::<Box<dyn CopyChunk>>(dispatcher.topology())
                     .into_iter()
                     .collect(),
                 conformers,
             )
             .record_batches();
-        let insert = self.table.compile_insert(conformed, dispatcher)?;
-        Ok((sender, insert))
+        let dataflow = self.table.compile_insert(conformed, dispatcher)?;
+        Ok((decoder, sender, dataflow))
     }
 
     /// Resolve the column list (positions resolved and validated by the
@@ -207,26 +270,52 @@ impl CopyFromStdin {
     }
 }
 
+fn is_text_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
 /// Cast one incoming column to its table field's physical type, with a loud
-/// error naming the column when a value does not convert.
+/// error naming the column when a value does not convert. Text into a
+/// VARIANT column parses each value as a JSON document, as a cast does, and
+/// text into any other non-text column ignores surrounding whitespace.
 fn cast_to_field(array: &ArrayRef, field: &Field) -> Result<ArrayRef, String> {
     if field.data_type() == array.data_type() {
         return Ok(array.clone());
+    }
+    let into_variant = type_from_physical(field.data_type()) == Some(Type::Variant)
+        && is_text_type(array.data_type());
+    if into_variant {
+        return json_to_canonical_variant(array)
+            .map_err(|e| format!("column \"{}\": {e}", field.name()));
     }
     let options = arrow::compute::CastOptions {
         safe: false,
         format_options: Default::default(),
     };
+    let trimmed: ArrayRef;
+    let array = match array.as_string_opt::<i32>() {
+        Some(text) if !is_text_type(field.data_type()) => {
+            trimmed = Arc::new(StringArray::from_iter(
+                text.iter().map(|value| value.map(str::trim)),
+            ));
+            &trimmed
+        }
+        _ => array,
+    };
     arrow::compute::cast_with_options(array, field.data_type(), &options)
         .map_err(|e| format!("column \"{}\": {e}", field.name()))
 }
 
-/// Conform one client-schema Arrow batch to the table's physical schema:
-/// columns map to the statement's column list by position, cast to the
-/// table's physical types, and unlisted table columns fill with NULL.
-/// Variant columns are admitted as sent: clients are trusted to encode them
-/// correctly, and a malformed document surfaces wherever it is first parsed.
-fn conform_arrow_batch(batch: &RecordBatch, layout: &ColumnLayout) -> Result<RecordBatch, String> {
+/// Conform one client-schema batch to the table's physical schema: columns
+/// map to the statement's column list by position, cast to the table's
+/// physical types, and unlisted table columns fill with NULL. Variant
+/// columns arriving as variants are admitted as sent: clients are trusted to
+/// encode them correctly, and a malformed document surfaces wherever it is
+/// first parsed.
+fn conform_batch(batch: &RecordBatch, layout: &ColumnLayout) -> Result<RecordBatch, String> {
     let incoming_columns = layout.incoming_columns();
     if batch.num_columns() != incoming_columns {
         return Err(format!(
@@ -248,20 +337,21 @@ fn conform_arrow_batch(batch: &RecordBatch, layout: &ColumnLayout) -> Result<Rec
         .map_err(|e| format!("assembling COPY batch: {e}"))
 }
 
-/// Worker-side transform: one decoded client batch in, one table-schema batch
-/// out.
-struct ConformArrowBatch {
+/// Worker-side transform: one chunk in, one table-schema batch out.
+struct ConformCopyChunk {
     layout: Arc<ColumnLayout>,
 }
 
-impl Unary<RecordBatch, RecordBatch> for ConformArrowBatch {
+impl Unary<Box<dyn CopyChunk>, RecordBatch> for ConformCopyChunk {
     fn consume(
         &mut self,
-        batch: RecordBatch,
+        chunk: Box<dyn CopyChunk>,
         sender: &mut dyn dispatch::Sender<RecordBatch>,
         _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
-        let batch = conform_arrow_batch(&batch, &self.layout)
+        let batch = chunk
+            .into_batch()
+            .and_then(|batch| conform_batch(&batch, &self.layout))
             .map_err(|message| UnaryError::Operator(message.into()))?;
         if batch.num_rows() > 0 {
             sender.send(batch)?;
@@ -271,7 +361,7 @@ impl Unary<RecordBatch, RecordBatch> for ConformArrowBatch {
 }
 
 // Stateless per worker, so it serves as its own factory.
-impl UnaryFactory<RecordBatch, RecordBatch> for ConformArrowBatch {
+impl UnaryFactory<Box<dyn CopyChunk>, RecordBatch> for ConformCopyChunk {
     type Unary = Self;
 
     fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Self> {

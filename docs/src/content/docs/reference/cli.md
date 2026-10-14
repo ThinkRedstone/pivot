@@ -186,7 +186,7 @@ Shell commands start with a backslash and take no `;`.
 | `\h`, `\help` | Show the list of shell commands. |
 | `\timing` | Toggle printing the elapsed time after each statement. |
 | `\timing on \| off` | Turn statement timing on or off. `true`/`false` and `1`/`0` are also accepted. |
-| `\copy table [(columns)] FROM 'file' WITH (FORMAT arrow)` | Load a local Arrow IPC file into a table. See [Loading a file](#loading-a-file). |
+| `\copy table [(columns)] FROM 'file' [WITH (FORMAT text \| arrow, DELIMITER 'c', NULL 'string')]` | Load a local text (psql `COPY`) or Arrow IPC file into a table. See [Loading a file](#loading-a-file). |
 
 ### Loading a file
 
@@ -196,11 +196,21 @@ takes the same table, column list, and options as
 place of `STDIN`:
 
 ```text
+pivot=> \copy events (id, region) FROM 'events.tsv'
+COPY 1000
+pivot=> \copy events (id, region) FROM 'events.csv' WITH (DELIMITER ',', NULL '')
+COPY 1000
 pivot=> \copy events (id, region) FROM 'events.arrow' WITH (FORMAT arrow)
 COPY 1000
 ```
 
-The file must be an Arrow IPC stream. The file name can be bare or
+| Option | Default | Description |
+| --- | --- | --- |
+| `FORMAT text \| arrow` | `text` | The file's format: PostgreSQL text rows or an Arrow IPC stream. |
+| `DELIMITER 'c'` | tab | Text only: the single one-byte character between fields. |
+| `NULL 'string'` | `\N` | Text only: the spelling of a NULL field. |
+
+The file name can be bare or
 single-quoted; quote it if it contains spaces. The shell prints the number of
 rows loaded. The load is all-or-nothing: if the file is incomplete or you
 press Ctrl-C, no rows are added.

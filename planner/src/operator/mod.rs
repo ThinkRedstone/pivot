@@ -15,7 +15,9 @@
 
 mod aggregate;
 mod compact;
+mod copy_arrow;
 mod copy_from_stdin;
+mod copy_text;
 mod create_schema;
 mod create_table;
 mod create_user;
@@ -41,7 +43,8 @@ mod values;
 
 pub use aggregate::Aggregate;
 pub use compact::Compact;
-pub use copy_from_stdin::{CopyFormat, CopyFromStdin};
+pub use copy_from_stdin::{CopyChunk, CopyFormat, CopyFromStdin, FrameDecoder};
+pub use copy_text::TextFormat;
 pub use create_schema::CreateSchema;
 pub use create_table::CreateTable;
 pub use create_user::CreateUser;
