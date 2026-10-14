@@ -83,7 +83,7 @@ fn cancelled_query_returns_without_hanging() {
                 dispatch::RowSelection::Indices
             }
         })
-        .execute();
+        .execute_as::<RecordBatch>();
     handle.cancel();
     let result = handle.collect();
 
