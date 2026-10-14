@@ -760,6 +760,42 @@ mod tests {
         assert_eq!(emitted, expected);
     }
 
+    /// Values copied between retained sources go into one block, rather than a
+    /// fresh block each time a retained source came last on the buffer list.
+    #[test]
+    fn copies_between_retains_share_one_block() {
+        init_test_free_pool(8);
+        // Half of a source is retained, one row of it is copied.
+        let rows_taken = [10, 1, 10, 1, 10, 1];
+        let sources: Vec<RecordBatch> = (0..rows_taken.len())
+            .map(|i| long_rows(&format!("source {i}'s value, longer than a view"), 20))
+            .collect();
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(sources[0].schema(), &mut allocator);
+
+        for (source, &rows) in sources.iter().zip(&rows_taken) {
+            let indices: Vec<u32> = (0..rows).collect();
+            accumulator.append_batch_by_indices(source, &indices, &mut allocator);
+        }
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        let taken: Vec<RecordBatch> = sources
+            .iter()
+            .zip(&rows_taken)
+            .map(|(source, &rows)| source.slice(0, rows as usize))
+            .collect();
+        assert_eq!(
+            emitted,
+            concat_batches(&sources[0].schema(), &taken).unwrap()
+        );
+        let retained_sources = 3;
+        let copy_blocks = 1;
+        assert_eq!(
+            emitted.column(0).as_string_view().data_buffers().len(),
+            retained_sources + copy_blocks
+        );
+    }
+
     #[test]
     fn a_struct_child_copies_on_a_selective_append() {
         init_test_free_pool(8);

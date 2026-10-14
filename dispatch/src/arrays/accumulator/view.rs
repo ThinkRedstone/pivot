@@ -54,6 +54,10 @@ pub(super) struct ViewColumn {
     /// indices name them: retained source buffers and owned blocks, as the
     /// appends that added them came.
     buffers: Vec<DataBlock>,
+    /// The position on `buffers` of the block copied values are going into.
+    /// Retained buffers can follow it on the list, so it need not be the last
+    /// entry.
+    open_block_idx: Option<usize>,
     validity: ValidityMask,
     /// Per-batch rebase cache for multi-batch appends: the buffer-list position
     /// a batch's data buffers were registered at. An entry is live only while
@@ -122,6 +126,7 @@ impl ViewColumn {
             capacity,
             views: allocator.create_slab_buffer(capacity, false),
             buffers: Vec::new(),
+            open_block_idx: None,
             validity: ValidityMask::new(capacity),
             batch_bases: Vec::new(),
             generation: 1,
@@ -319,7 +324,12 @@ impl ViewColumn {
                 let buffer = (view >> 64) as u32 as usize;
                 let offset = (view >> 96) as u32 as usize;
                 let value = &source_buffers[buffer][offset..offset + length as usize];
-                copy_value(&mut self.buffers, value, allocator)
+                copy_value(
+                    &mut self.buffers,
+                    &mut self.open_block_idx,
+                    value,
+                    allocator,
+                )
             };
             // SAFETY: the slab has room for `destination_start` plus the appended
             // rows, which the caller checked against the capacity.
@@ -408,6 +418,7 @@ impl ColumnAccumulator for ViewColumn {
         self.generation += 1;
         let fresh = allocator.create_slab_buffer(self.capacity, false);
         let views = std::mem::replace(&mut self.views, fresh).into_buffer(len * size_of::<u128>());
+        self.open_block_idx = None;
         let buffers: Vec<Buffer> = std::mem::take(&mut self.buffers)
             .into_iter()
             .map(DataBlock::into_buffer)
@@ -441,10 +452,12 @@ fn source_parts(source: &ArrayRef) -> (&[u128], &[Buffer], Option<&NullBuffer>) 
     }
 }
 
-/// Copy `value` into the block being filled, opening one (or a larger one for an
-/// outsized value) as needed, and return the view naming where it landed.
+/// Copy `value` into the block being filled, the one at `open_block_idx`,
+/// opening one (or a larger one for an outsized value) as needed, and return
+/// the view naming where it landed.
 pub fn copy_value(
     blocks: &mut Vec<DataBlock>,
+    open_block_idx: &mut Option<usize>,
     value: &[u8],
     allocator: &mut SlabAllocator,
 ) -> u128 {
@@ -452,9 +465,10 @@ pub fn copy_value(
         blocks.push(DataBlock::OversizedValue(value.to_vec()));
         return make_view(value, blocks.len() as u32 - 1, 0);
     }
-    let free = match blocks.last() {
+    let free = match open_block_idx.map(|block| &blocks[block]) {
         Some(DataBlock::Slab { size, used, .. }) => size - used,
-        _ => 0,
+        Some(_) => unreachable!("the block being filled is always a slab block"),
+        None => 0,
     };
     if free < value.len() {
         // A value too large for a standard block takes a block sized to it,
@@ -465,10 +479,10 @@ pub fn copy_value(
             size,
             used: 0,
         });
+        *open_block_idx = Some(blocks.len() - 1);
     }
-    let block = blocks.len() as u32 - 1;
-    let DataBlock::Slab { slab, used, .. } = blocks.last_mut().expect("a block was just ensured")
-    else {
+    let block = open_block_idx.expect("a block was just ensured");
+    let DataBlock::Slab { slab, used, .. } = &mut blocks[block] else {
         unreachable!("the block being filled is always a slab block")
     };
     let offset = *used;
@@ -478,5 +492,5 @@ pub fn copy_value(
         std::ptr::copy_nonoverlapping(value.as_ptr(), slab.ptr_at_index(offset), value.len());
     }
     *used += value.len();
-    make_view(value, block, offset as u32)
+    make_view(value, block as u32, offset as u32)
 }

@@ -308,6 +308,7 @@ fn concat_view_chunks(
 ) -> (Buffer, Vec<Buffer>) {
     let slab = allocator.create_slab_buffer::<u128>(rows, false);
     let mut blocks: Vec<DataBlock> = Vec::new();
+    let mut open_block_idx = None;
     let mut out_row = 0;
     for chunk in chunks {
         // SAFETY (of the `add`): buffer 0 of a view array holds `offset + len`
@@ -332,7 +333,7 @@ fn concat_view_chunks(
                 let buffer = (view >> 64) as u32 as usize;
                 let offset = (view >> 96) as u32 as usize;
                 let value = &data_buffers[buffer][offset..offset + length as usize];
-                copy_value(&mut blocks, value, allocator)
+                copy_value(&mut blocks, &mut open_block_idx, value, allocator)
             };
             // SAFETY: the slab holds `rows` slots.
             unsafe { slab.ptr_at_index(out_row).write(copied) };
@@ -442,6 +443,7 @@ fn gather_chunked_views(
 ) -> (Buffer, Vec<Buffer>) {
     let slab = allocator.create_slab_buffer::<u128>(mapping.len(), false);
     let mut blocks: Vec<DataBlock> = Vec::new();
+    let mut open_block_idx = None;
     let sources: Vec<(*const u128, &[Buffer], Option<&NullBuffer>)> = chunks
         .iter()
         // SAFETY (of the `add`): buffer 0 of a view array holds `offset + len`
@@ -469,7 +471,7 @@ fn gather_chunked_views(
             let buffer = (view >> 64) as u32 as usize;
             let offset = (view >> 96) as u32 as usize;
             let value = &data_buffers[buffer][offset..offset + length as usize];
-            copy_value(&mut blocks, value, allocator)
+            copy_value(&mut blocks, &mut open_block_idx, value, allocator)
         };
         // SAFETY: the slab holds `mapping.len()` slots.
         unsafe { slab.ptr_at_index(out_idx).write(copied) };
