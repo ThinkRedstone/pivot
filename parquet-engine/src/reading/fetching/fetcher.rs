@@ -1,17 +1,21 @@
 //! The [`RowGroupFetcher`]: drives the column-chunk IO for in-flight row groups.
 //!
-//! It accepts [`RowGroupRequest`]s and reads each one's projected column chunks
-//! — local files via io_uring disk reads, remote objects via HTTP range reads on
-//! the same ring — emitting a [`RowGroupBuffer`] once a row group's last block
-//! lands. The slot/routing/in-flight bookkeeping lives in the
-//! dispatch requester's private tracker; this type retains only the row-group
-//! metadata keyed by the logical request id.
+//! It accepts claimed row groups ([`QueryRowGroupMetadata`]), takes the pages
+//! the decompressed cache already holds for each one, and reads the rest of
+//! its projected column chunks — local files via io_uring disk reads, remote
+//! objects via HTTP range reads on the same ring — emitting a
+//! [`RowGroupBuffer`] once a row group's last block lands. The
+//! slot/routing/in-flight bookkeeping lives in the dispatch requester's private
+//! tracker; this type retains only the [`RowGroupRequest`] keyed by the logical
+//! request id.
 //!
 //! Disk and HTTP have very different latencies, so the fetcher bounds logical
 //! row-group reads for each medium independently. Dispatch separately bounds the
 //! resulting physical submission batches. A homogeneous scan only fills its
 //! own medium's pool, so the other never gates it.
 
+use crate::types::metadata::QueryRowGroupMetadata;
+use crate::types::projection::Projection;
 use crate::types::requests::{RowGroupBuffer, RowGroupRequest};
 use dispatch::Sender;
 use dispatch::Unary;
@@ -59,6 +63,8 @@ pub fn pending_claim_bound(table: &crate::ParquetTable) -> usize {
 }
 
 pub struct RowGroupFetcher {
+    /// The columns the scan reads from every row group.
+    projection: Arc<Projection>,
     in_flight: HashMap<ReadRequestId, RowGroupRequest>,
     /// How many row groups this worker has claimed but not yet cut into
     /// decode ranges. Incremented here per claim, decremented by the worker's
@@ -70,8 +76,13 @@ pub struct RowGroupFetcher {
 }
 
 impl RowGroupFetcher {
-    pub fn new(pending_row_groups: Arc<AtomicUsize>, max_pending_row_groups: usize) -> Self {
+    pub fn new(
+        projection: Arc<Projection>,
+        pending_row_groups: Arc<AtomicUsize>,
+        max_pending_row_groups: usize,
+    ) -> Self {
         Self {
+            projection,
             in_flight: HashMap::new(),
             pending_row_groups,
             max_pending_row_groups,
@@ -79,17 +90,18 @@ impl RowGroupFetcher {
     }
 }
 
-impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
+impl Unary<QueryRowGroupMetadata, RowGroupBuffer> for RowGroupFetcher {
     fn consume(
         &mut self,
-        request: RowGroupRequest,
+        row_group: QueryRowGroupMetadata,
         sender: &mut dyn Sender<RowGroupBuffer>,
         io: &mut OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         self.pending_row_groups.fetch_add(1, Ordering::Relaxed);
+        let request = RowGroupRequest::from(row_group, &self.projection);
         if request.reads_nothing() {
-            // Every projected leaf is absent from this file, so the buffer is
-            // built straight away and the indexer stands in its pages.
+            // Every projected leaf is absent from this file or already
+            // decompressed in memory, so the buffer is built straight away.
             sender.send(request.into_row_group_buffer(None))?;
             return Ok(());
         }

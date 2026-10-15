@@ -60,7 +60,7 @@ pub struct CompressedPage {
     /// This page's bytes, already decompressed - set when a
     /// [`DecompressedCache`](dispatch::memory::DecompressedCache) range lookup found
     /// it before any IO was issued (see
-    /// [`requests::ColumnPart`](crate::types::requests::ColumnPart)).
+    /// [`requests::CachedColumnChunk`](crate::types::requests::CachedColumnChunk)).
     /// `None` for a normal compressed page.
     pub decompressed: Option<Vec<Bytes>>,
     /// Optional row-level filter mask to propagate to the decoder.

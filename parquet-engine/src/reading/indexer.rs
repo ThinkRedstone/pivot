@@ -3,7 +3,7 @@
 //!
 //! The Indexer sits between IO (which delivers whole column chunks, or pages already
 //! resolved straight from the decompressed cache - see
-//! [`ColumnPart`]) and the Decompressor
+//! [`CachedColumnChunk`]) and the Decompressor
 //! (which expects individual pages). For each column it walks its parts in file
 //! order: a `Compressed` part's raw bytes are Thrift-parsed into pages same as
 //! always; a `Decompressed` part is already one whole decompressed page, so it
@@ -29,7 +29,7 @@ use crate::thrift::parquet_thrift::{ParquetError, ThriftReadInputProtocol};
 use crate::types::filter_mask::FilterMask;
 use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
 use crate::types::page::CompressedPage;
-use crate::types::requests::{ColumnBuffer, ColumnPart, RowGroupBuffer};
+use crate::types::requests::{CachedColumnChunk, ColumnBuffer, RowGroupBuffer};
 use bytes::Bytes;
 use dispatch::DefaultUnaryFactory;
 use dispatch::Sender;
@@ -231,10 +231,10 @@ fn build_column_pages(
     let mut pages = Vec::with_capacity(128);
     for part in parts {
         match part {
-            ColumnPart::Compressed { offset, bytes } => {
+            CachedColumnChunk::Compressed { offset, bytes } => {
                 builder.parse_compressed_pages(offset, &bytes, &mut pages)?
             }
-            ColumnPart::Decompressed {
+            CachedColumnChunk::Decompressed {
                 offset,
                 span,
                 header,
@@ -367,20 +367,20 @@ mod tests {
     }
 
     /// Concatenate serialized page headers + payloads into a single `Compressed` part.
-    fn make_column_buffer(pages: &[(PageHeader, Vec<u8>)]) -> Vec<ColumnPart> {
+    fn make_column_buffer(pages: &[(PageHeader, Vec<u8>)]) -> Vec<CachedColumnChunk> {
         let mut buf = Vec::new();
         for (header, payload) in pages {
             buf.extend_from_slice(&serialize_header(header));
             buf.extend_from_slice(payload);
         }
-        vec![ColumnPart::Compressed {
+        vec![CachedColumnChunk::Compressed {
             offset: 0,
             bytes: vec![Bytes::from(buf)],
         }]
     }
 
     fn make_row_group_buffer(
-        columns: Vec<Vec<ColumnPart>>,
+        columns: Vec<Vec<CachedColumnChunk>>,
         selection: RowSelection,
     ) -> RowGroupBuffer {
         RowGroupBuffer {
@@ -564,7 +564,7 @@ mod tests {
     fn test_decompressed_part_skips_parsing() {
         let header = data_page_header(7, 0);
         let data = vec![Bytes::from(vec![9u8, 9, 9])];
-        let col = vec![ColumnPart::Decompressed {
+        let col = vec![CachedColumnChunk::Decompressed {
             offset: 42,
             span: 20,
             header: Box::new(header),
@@ -588,7 +588,7 @@ mod tests {
         let payload = vec![0xA0];
         let mut parts =
             make_column_buffer(&[(data_page_header(10, payload.len() as i32), payload)]);
-        parts.push(ColumnPart::Decompressed {
+        parts.push(CachedColumnChunk::Decompressed {
             offset: 1000,
             span: 5,
             header: Box::new(data_page_header(10, 0)),

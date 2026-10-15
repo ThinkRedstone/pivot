@@ -3,8 +3,7 @@
 //! [`RowGroupInjectorFactory`] pre-loads every row group from a
 //! [`ParquetTable`] into one shared [`Injector`] queue per NUMA node. Each
 //! worker gets its own [`RowGroupInjector`] (via [`RootChannelFactory`]) that
-//! claims row groups from its node's queue on demand, wrapping them in a
-//! [`RowGroupRequest`] with the target projection.
+//! claims row groups from its node's queue on demand.
 //!
 //! Row groups are assigned to nodes by a stable hash of their identity (file +
 //! index within the file), so the *same* row group lands on the *same* node
@@ -16,7 +15,6 @@
 //! and decoded entirely on the claiming node; only its cached bytes end up
 //! remote for a later query).
 
-use crate::RowGroupRequest;
 use crate::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata, RowSelection};
 use crate::types::projection::Projection;
 use crate::types::table::ParquetTable;
@@ -129,7 +127,6 @@ fn plain_scan_order(table: &ParquetTable, projection: &Projection) -> Vec<usize>
 #[derive(Clone)]
 pub struct RowGroupInjectorFactory {
     row_group_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>>,
-    projection: Projection,
     filter: Option<RowGroupFilter>,
     speculation: Option<Arc<SpeculationGate>>,
 }
@@ -238,14 +235,13 @@ impl RowGroupInjectorFactory {
         }
         Self {
             row_group_queues,
-            projection,
             filter,
             speculation,
         }
     }
 }
 
-impl RootChannelFactory<RowGroupRequest> for RowGroupInjectorFactory {
+impl RootChannelFactory<QueryRowGroupMetadata> for RowGroupInjectorFactory {
     type Receiver = RowGroupInjector;
 
     /// Runs on the worker thread, so the receiver can snapshot which node's
@@ -254,7 +250,6 @@ impl RootChannelFactory<RowGroupRequest> for RowGroupInjectorFactory {
         RowGroupInjector {
             numa_node_idx: dispatch::worker::current_node(),
             row_group_queues: self.row_group_queues,
-            projection: self.projection,
             filter: self.filter,
             speculation: self.speculation,
         }
@@ -268,12 +263,11 @@ pub struct RowGroupInjector {
     row_group_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>>,
     /// Index of this worker's node's queue in `row_group_queues`.
     numa_node_idx: usize,
-    projection: Projection,
     filter: Option<RowGroupFilter>,
     speculation: Option<Arc<SpeculationGate>>,
 }
 
-impl Receiver<RowGroupRequest> for RowGroupInjector {
+impl Receiver<QueryRowGroupMetadata> for RowGroupInjector {
     fn is_empty(&self) -> bool {
         self.row_group_queues.iter().all(|queue| queue.is_empty())
     }
@@ -286,7 +280,7 @@ impl Receiver<RowGroupRequest> for RowGroupInjector {
     /// attempt keeps the hot loop from spinning on `Steal::Retry`; the next
     /// iteration retries. A pruned row group also returns `None` (it has been
     /// removed; the next call advances).
-    fn try_recv(&self) -> Option<RowGroupRequest> {
+    fn try_recv(&self) -> Option<QueryRowGroupMetadata> {
         // This pre-check is a plain load; once the queue drains (every pass
         // for the rest of the query) it avoids an epoch-pinning steal per
         // call.
@@ -296,7 +290,7 @@ impl Receiver<RowGroupRequest> for RowGroupInjector {
         }
         let ticket = self.acquire_speculation_ticket()?;
         match queue.steal() {
-            Steal::Success(row_group) => self.build_request_unless_pruned(row_group, ticket),
+            Steal::Success(row_group) => self.admit_unless_pruned(row_group, ticket),
             // Dropping the ticket releases its reservation; the next call
             // retries.
             Steal::Retry | Steal::Empty => None,
@@ -306,7 +300,7 @@ impl Receiver<RowGroupRequest> for RowGroupInjector {
     /// Pull on the idle path: drain this node's queue first, then fall back
     /// to other nodes' queues so a node that finished its share keeps its
     /// CPUs busy instead of waiting out the tail.
-    fn steal(&self) -> Option<RowGroupRequest> {
+    fn steal(&self) -> Option<QueryRowGroupMetadata> {
         let queue_count = self.row_group_queues.len();
         // A ticket is acquired only once a non-empty queue is found; a lost
         // steal race or a queue drained under us carries it to the next
@@ -324,7 +318,7 @@ impl Receiver<RowGroupRequest> for RowGroupInjector {
                         // A pruned row group released the ticket; keep
                         // claiming (back through the gate) rather than
                         // handing the worker a no-op.
-                        if let Some(request) = self.build_request_unless_pruned(row_group, held) {
+                        if let Some(request) = self.admit_unless_pruned(row_group, held) {
                             return Some(request);
                         }
                     }
@@ -370,14 +364,13 @@ impl SpeculationTicket<'_> {
 }
 
 impl RowGroupInjector {
-    /// Turn a claimed row group into a [`RowGroupRequest`], or `None` (and
-    /// release the ticket) when the row-group filter proves it holds no
-    /// matching row.
-    fn build_request_unless_pruned(
+    /// Admit a claimed row group, or `None` (and release the ticket) when the
+    /// row-group filter proves it holds no matching row.
+    fn admit_unless_pruned(
         &self,
         row_group: QueryRowGroupMetadata,
         ticket: SpeculationTicket<'_>,
-    ) -> Option<RowGroupRequest> {
+    ) -> Option<QueryRowGroupMetadata> {
         if let Some(gate) = &self.speculation {
             gate.note_claimed();
         }
@@ -405,7 +398,7 @@ impl RowGroupInjector {
             dispatch::waker::waker_set().notify_one_near(self.numa_node_idx);
         }
         ticket.transfer_to_row_group();
-        Some(RowGroupRequest::from(row_group, &self.projection))
+        Some(row_group)
     }
 
     /// Reserve a slot in the speculation allowance, or `None` when the scan is

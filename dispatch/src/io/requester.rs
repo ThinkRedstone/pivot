@@ -874,7 +874,6 @@ mod tests {
             id: ReadRequestId(0),
             open_file,
             locations: vec![FileRange::new(0, 4096)],
-            raw_bytes_only: false,
         }
     }
 
@@ -909,7 +908,6 @@ mod tests {
                         id: ReadRequestId(block),
                         open_file: open_file.clone(),
                         locations: vec![FileRange::new(block * 4096, 4096)],
-                        raw_bytes_only: false,
                     },
                     &mut disabled_stats(),
                 )
@@ -957,7 +955,6 @@ mod tests {
                     id: ReadRequestId(0),
                     open_file: open_file.clone(),
                     locations: vec![FileRange::new(0, 4096)],
-                    raw_bytes_only: false,
                 },
                 &mut disabled_stats(),
             )
@@ -970,7 +967,6 @@ mod tests {
                     id: ReadRequestId(1),
                     open_file,
                     locations: vec![FileRange::new(4096, 4096)],
-                    raw_bytes_only: false,
                 },
                 &mut disabled_stats(),
             )
@@ -1692,7 +1688,6 @@ mod tests {
                     id: ReadRequestId(0),
                     open_file: loc.clone(),
                     locations: vec![FileRange::new(offset, len)],
-                    raw_bytes_only: false,
                 },
                 &mut disabled_stats(),
             )

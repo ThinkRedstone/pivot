@@ -973,6 +973,7 @@ mod tests {
     use arrow_schema::Field;
     use dispatch::{DataFlowDispatcher, Dispatch};
     use parquet::arrow::ArrowWriter;
+    use parquet::basic::{Compression, ZstdLevel};
     use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use std::fs::File;
     use std::sync::{Arc, OnceLock};
@@ -1750,7 +1751,7 @@ mod tests {
             extracts: Vec::new(),
         };
 
-        let request = crate::RowGroupRequest::from(
+        let request = crate::types::requests::RowGroupRequest::from(
             crate::types::metadata::QueryRowGroupMetadata::new(
                 &table,
                 0,
@@ -1763,6 +1764,35 @@ mod tests {
         assert!(request.reads_nothing());
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.column(0).null_count(), 3);
+    }
+
+    /// A scan leaves a row group's pages in the decompressed cache, so a rescan
+    /// plans them as already resolved and reads only what is missing; the rows
+    /// it decodes from those pages are the ones the first scan read.
+    #[test]
+    fn a_rescan_decodes_the_same_rows_from_already_decompressed_pages() {
+        let batch = RecordBatch::try_from_iter([(
+            "v",
+            Arc::new(Int64Array::from_iter_values(0..20_000)) as _,
+        )])
+        .unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("compressed.parquet");
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props))
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let table = Arc::new(ParquetTable::from_files(test_dispatcher(), &[path], &[]).unwrap());
+        let first = scan(&table, vec![0]);
+
+        let second = scan(&table, vec![0]);
+
+        assert_eq!(first.column(0).as_ref(), batch.column(0).as_ref());
+        assert_eq!(second.column(0).as_ref(), first.column(0).as_ref());
     }
 
     #[test]

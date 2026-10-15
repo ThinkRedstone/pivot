@@ -75,7 +75,7 @@ pub use types::leaves::{
 };
 pub use types::metadata::{ColumnStatistics, RowGroupMetadata};
 pub use types::page::{CompressedPage, DecompressedPage};
-pub use types::requests::{RowGroupBuffer, RowGroupRequest};
+pub use types::requests::RowGroupBuffer;
 pub use types::table::{
     Error as ParquetTableError, ParquetTable, is_variant_field, variant_extension_metadata,
 };

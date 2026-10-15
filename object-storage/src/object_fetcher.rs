@@ -110,7 +110,7 @@ impl Unary<DataFile, LoadedObject> for ObjectFetcher {
             .open_entry(open_file.clone());
         // One range covering the object: the ring tiles it into cache slots
         // itself, as it does a column chunk of any size.
-        let id = io.read_raw_bytes(open_file, [FileRange::new(0, size)])?;
+        let id = io.read(open_file, [FileRange::new(0, size)])?;
         self.in_flight.insert(id, file);
         Ok(())
     }

@@ -53,7 +53,7 @@ impl FileRowGroupsFetcher {
         range: FileRange,
         io: &mut OperatorIO,
     ) -> dispatch::UnaryResult<()> {
-        let id = io.read_raw_bytes(request.open_file.clone(), [range])?;
+        let id = io.read(request.open_file.clone(), [range])?;
         self.in_flight.insert(id, request);
         Ok(())
     }

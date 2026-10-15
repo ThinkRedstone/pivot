@@ -109,8 +109,8 @@ pub trait Operator {
     /// Returns [`WorkStatus::Ran`] if work was done, [`Pending`](WorkStatus::Pending) otherwise.
     fn run_cpu_work(&mut self, io: &mut OperatorIO) -> Result<WorkStatus>;
 
-    /// Handle a completed logical read. Dispatch has already resolved all cache
-    /// tiers and committed any physical reads before making this callback.
+    /// Handle a completed logical read. Dispatch has already resolved cache
+    /// hits and committed any physical reads before making this callback.
     fn process_read_response(
         &mut self,
         _io: &mut OperatorIO,

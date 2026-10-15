@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicUsize;
 
 use crate::RowGroupFilter;
 use crate::reading::empty_projection_scan::empty_projection_scan;
+use crate::types::metadata::QueryRowGroupMetadata;
 use arrow_array::RecordBatch;
 use dispatch::{
     DataFlowDispatcher, OperatorFactory, OperatorSpec, Projection, RECORD_BATCH_SIZE,
@@ -21,8 +22,8 @@ use dispatch::{
 use crate::{
     CompressedPage, DecodeRange, DecoderFactory, DecompressedPage, DecompressorFactory,
     IndexerFactory, MaterializerFactory, ParquetTable, RangeCutterFactory, RowGroupBuffer,
-    RowGroupFetcherFactory, RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate,
-    ScanOrder, WorkerAllocator, pending_claim_bound,
+    RowGroupFetcherFactory, RowGroupInjectorFactory, ScanEqualityPredicate, ScanOrder,
+    WorkerAllocator, pending_claim_bound,
 };
 
 /// Append the index → decompress → cut → decode stages onto a source of
@@ -180,11 +181,16 @@ pub fn table_input_with_filter_and_eq_predicates(
     // One fetcher handles disk and HTTP row groups, bounding each medium's
     // in-flight count separately, plus its worker's undecoded-claims count.
     let claim_bound = pending_claim_bound(table);
+    let shared_projection = Arc::new(projection.clone());
     let factories: Vec<_> = pending_row_groups
         .iter()
         .map(|pending| {
             RootUnaryOperatorFactory::new(
-                RowGroupFetcherFactory::new(pending.clone(), claim_bound),
+                RowGroupFetcherFactory::new(
+                    shared_projection.clone(),
+                    pending.clone(),
+                    claim_bound,
+                ),
                 injector.clone(),
                 siblings.clone(),
             )
@@ -219,28 +225,33 @@ pub fn materialize(
     let pending_row_groups = pending_row_group_counters(n);
     let claim_bound = pending_claim_bound(&table);
     // Every surviving-row batch funnels to ONE worker's materializer, so each
-    // row group becomes exactly one [`RowGroupRequest`] holding all of its
-    // surviving rows. The range cutter relies on that: it tracks row groups
-    // by index and drops pages of a group it already cut, so a second
-    // request for the same group would silently lose its rows. The funneled
-    // stage only merges tiny index lists; the fetch and decode stay spread
-    // over every worker through the stealable request channel. Successive
+    // row group is emitted exactly once, holding all of its surviving rows.
+    // The range cutter relies on that: it tracks row groups by index and
+    // drops pages of a group it already cut, so a second emission of the same
+    // group would silently lose its rows. The funneled stage only merges tiny
+    // index lists; the fetch and decode stay spread over every worker through
+    // the stealable row-group channel. Successive
     // materializes take turns hosting the merge, so concurrent queries do not
     // all pin one worker.
     let host = dispatcher.next_worker();
+    let shared_projection = Arc::new(projection.clone());
     let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(n, host)
         .into_iter()
-        .zip(stealable::<RowGroupRequest>(dispatcher.topology()))
+        .zip(stealable::<QueryRowGroupMetadata>(dispatcher.topology()))
         .zip(pending_row_groups.iter())
         .map(|((rb_ch, rq_ch), pending)| {
             UnaryOperatorFactory::new(
                 UnaryOperatorFactory::new(
                     heads.pop_front().unwrap(),
-                    MaterializerFactory::new(projection.clone(), table.clone()),
+                    MaterializerFactory::new(table.clone()),
                     rb_ch,
                     siblings_materializer.clone(),
                 ),
-                RowGroupFetcherFactory::new(pending.clone(), claim_bound),
+                RowGroupFetcherFactory::new(
+                    shared_projection.clone(),
+                    pending.clone(),
+                    claim_bound,
+                ),
                 rq_ch,
                 siblings_fetcher.clone(),
             )

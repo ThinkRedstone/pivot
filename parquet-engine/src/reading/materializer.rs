@@ -4,14 +4,13 @@
 //! the surviving rows arrive here as `RecordBatch`es that still carry metadata
 //! columns (global row-group ID and per-row index). The [`Materializer`]
 //! accumulates those indices, groups them by row group, and on `finish` emits
-//! one [`RowGroupRequest`] per row group with sorted indices so that the
+//! one [`QueryRowGroupMetadata`] per row group with sorted indices so that the
 //! downstream Parquet reader can fetch only the rows that passed a filter,
 //! reading them sequentially within each row group for optimal IO.
 
+use crate::ParquetTable;
 use crate::reading::record_batch_metadata::{global_row_group, row_index};
 use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
-use crate::types::projection::Projection;
-use crate::{ParquetTable, RowGroupRequest};
 use ahash::HashMap;
 use arrow_array::{Array, RecordBatch, UInt32Array};
 use dispatch::Sender;
@@ -21,42 +20,39 @@ use std::sync::Arc;
 
 /// Factory for creating [`Materializer`] instances within the unary pipeline.
 ///
-/// Captures the columns to materialize (`projection`) and the [`ParquetTable`]
-/// handle that the materializer will later reference when building
-/// [`RowGroupRequest`]s. Consumed once via [`UnaryFactory::build_unary`].
+/// Captures the [`ParquetTable`] handle that the materializer will later
+/// reference when building each row group's [`QueryRowGroupMetadata`].
+/// Consumed once via [`UnaryFactory::build_unary`].
 pub struct MaterializerFactory {
-    projection: Projection,
     table: Arc<ParquetTable>,
 }
 
 impl MaterializerFactory {
     /// Creates a new factory.
     ///
-    /// * `projection` – the set of columns that downstream IO should read back
-    ///   from disk (i.e. the columns the query actually needs).
     /// * `table` – shared handle to the Parquet table metadata.
-    pub fn new(projection: Projection, table: Arc<ParquetTable>) -> Self {
-        Self { projection, table }
+    pub fn new(table: Arc<ParquetTable>) -> Self {
+        Self { table }
     }
 }
 
-impl UnaryFactory<RecordBatch, RowGroupRequest> for MaterializerFactory {
+impl UnaryFactory<RecordBatch, QueryRowGroupMetadata> for MaterializerFactory {
     type Unary = Materializer;
 
     fn build_unary(self) -> Materializer {
-        Materializer::new(self.projection, self.table)
+        Materializer::new(self.table)
     }
 }
 
-/// Collects filtered row indices from upstream `RecordBatch`es and emits
-/// [`RowGroupRequest`]s to fetch the matching rows from disk.
+/// Collects filtered row indices from upstream `RecordBatch`es and emits one
+/// [`QueryRowGroupMetadata`] per row group for the fetcher to read the matching
+/// rows from disk.
 ///
 /// During `consume`, incoming batches carry metadata columns (global row group
 /// ID and per-row index). The materializer groups row indices by their row
-/// group. On `finish`, it emits one `RowGroupRequest` per row group with sorted
-/// indices, allowing downstream IO to read only the needed rows.
+/// group. On `finish`, it emits one row group with sorted indices, allowing
+/// downstream IO to read only the needed rows.
 pub struct Materializer {
-    projection_to_materialize: Projection,
     /// Row group ID -> collected row indices within that group.
     pending_row_groups: HashMap<u32, Vec<u32>>,
     table: Arc<ParquetTable>,
@@ -65,26 +61,23 @@ pub struct Materializer {
 impl Materializer {
     /// Creates a new materializer.
     ///
-    /// * `projection_to_materialize` – columns the downstream reader should
-    ///   fetch from each row group.
-    /// * `table` – shared Parquet table metadata used to build row group
-    ///   requests.
-    pub fn new(projection_to_materialize: Projection, table: Arc<ParquetTable>) -> Self {
+    /// * `table` – shared Parquet table metadata used to build each row
+    ///   group's metadata.
+    pub fn new(table: Arc<ParquetTable>) -> Self {
         Self {
-            projection_to_materialize,
             pending_row_groups: HashMap::default(),
             table,
         }
     }
 }
 
-impl Unary<RecordBatch, RowGroupRequest> for Materializer {
+impl Unary<RecordBatch, QueryRowGroupMetadata> for Materializer {
     /// Extracts row group IDs and row indices from the batch metadata columns,
     /// accumulating them into `pending_row_groups` keyed by row group.
     fn consume(
         &mut self,
         batch: RecordBatch,
-        _sender: &mut dyn Sender<RowGroupRequest>,
+        _sender: &mut dyn Sender<QueryRowGroupMetadata>,
         _io: &mut dispatch::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         // The row-group column is a `RunArray` (consecutive same-group rows = one
@@ -120,19 +113,19 @@ impl Unary<RecordBatch, RowGroupRequest> for Materializer {
         Ok(())
     }
 
-    /// Drains accumulated row groups and sends one [`RowGroupRequest`] per group.
-    /// Indices are sorted so downstream IO can read them sequentially.
-    fn finish(&mut self, sender: &mut dyn Sender<RowGroupRequest>) -> dispatch::UnaryResult<bool> {
+    /// Drains accumulated row groups and sends each one. Indices are sorted so
+    /// downstream IO can read them sequentially.
+    fn finish(
+        &mut self,
+        sender: &mut dyn Sender<QueryRowGroupMetadata>,
+    ) -> dispatch::UnaryResult<bool> {
         let pending_row_groups = mem::take(&mut self.pending_row_groups);
         for (group, mut indices) in pending_row_groups {
             indices.sort_unstable();
-            sender.send(RowGroupRequest::from(
-                QueryRowGroupMetadata::new(
-                    &self.table,
-                    group as usize,
-                    RowSelection::Indices(indices.into()),
-                ),
-                &self.projection_to_materialize,
+            sender.send(QueryRowGroupMetadata::new(
+                &self.table,
+                group as usize,
+                RowSelection::Indices(indices.into()),
             ))?;
         }
         Ok(true)
@@ -142,13 +135,13 @@ impl Unary<RecordBatch, RowGroupRequest> for Materializer {
 #[cfg(test)]
 mod tests {
     use super::Materializer;
+    use crate::ParquetTable;
     use crate::reading::record_batch_metadata::with_row_group_metadata;
-    use crate::{ParquetTable, RowGroupRequest};
+    use crate::types::metadata::QueryRowGroupMetadata;
     use ahash::HashMap;
     use arrow::compute::concat_batches;
     use arrow_array::{RecordBatch, RecordBatchOptions};
     use arrow_schema::Schema;
-    use dispatch::Projection;
     use dispatch::test_utils::CollectSender;
     use std::sync::Arc;
 
@@ -168,11 +161,8 @@ mod tests {
     /// it grouped by row group. The table is unused by `consume` (only `finish`
     /// reads it), so a dummy empty one suffices.
     fn consume(batch: RecordBatch) -> HashMap<u32, Vec<u32>> {
-        let mut materializer = Materializer::new(
-            Projection::columns([0]),
-            Arc::new(ParquetTable::new(vec![])),
-        );
-        let mut sink = CollectSender::<RowGroupRequest>::default();
+        let mut materializer = Materializer::new(Arc::new(ParquetTable::new(vec![])));
+        let mut sink = CollectSender::<QueryRowGroupMetadata>::default();
         dispatch::Unary::consume(
             &mut materializer,
             batch,

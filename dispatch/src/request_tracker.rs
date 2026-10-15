@@ -12,7 +12,7 @@ use crate::io::{
     PendingReadRequest, ReadData, ReadResponse,
 };
 use crate::memory::compressed_cache::MissingExtent;
-use crate::memory::{CacheLookup, Segment, memory_ctx};
+use crate::memory::{CacheLookup, memory_ctx};
 use std::collections::HashMap;
 
 /// Where a logical operator request must be delivered when it becomes ready.
@@ -28,37 +28,22 @@ pub(crate) struct RoutedReadResponse {
     pub response: ReadResponse,
 }
 
-enum PendingReadData {
-    Compressed {
-        offset: usize,
-        lookups: Vec<CacheLookup>,
-    },
-    Decompressed {
-        offset: usize,
-        span: usize,
-        header: Vec<bytes::Bytes>,
-        data: Vec<bytes::Bytes>,
-    },
+/// One requested range as the compressed cache resolved it: its hits, plus
+/// the extents allocated for its misses, whose fills the request waits on.
+struct PendingReadData {
+    offset: usize,
+    lookups: Vec<CacheLookup>,
 }
 
 impl PendingReadData {
     fn into_ready(self) -> ReadData {
-        match self {
-            Self::Compressed { offset, lookups } => ReadData::Compressed {
-                offset,
-                bytes: lookups.into_iter().map(CacheLookup::into_data).collect(),
-            },
-            Self::Decompressed {
-                offset,
-                span,
-                header,
-                data,
-            } => ReadData::Decompressed {
-                offset,
-                span,
-                header,
-                data,
-            },
+        ReadData {
+            offset: self.offset,
+            bytes: self
+                .lookups
+                .into_iter()
+                .map(CacheLookup::into_data)
+                .collect(),
         }
     }
 }
@@ -66,7 +51,7 @@ impl PendingReadData {
 struct TrackedRead {
     route: RequestRoute,
     request: PendingReadRequest,
-    locations: Vec<Vec<PendingReadData>>,
+    locations: Vec<PendingReadData>,
     /// Number of physical cache fills this logical request still awaits.
     remaining: usize,
 }
@@ -80,7 +65,7 @@ impl TrackedRead {
                 self.request.open_file,
                 self.locations
                     .into_iter()
-                    .map(|parts| parts.into_iter().map(PendingReadData::into_ready).collect())
+                    .map(PendingReadData::into_ready)
                     .collect(),
             ),
         }
@@ -109,61 +94,29 @@ impl RequestTracker {
         let mut physical_reads = Vec::new();
 
         for location in &request.locations {
-            let mut parts = Vec::new();
-            // A raw-bytes read is served from the file's stored bytes alone.
-            let segments = if !request.raw_bytes_only {
-                memory_ctx().decompressed_cache().get_range(
-                    &request.open_file,
-                    location.offset,
-                    location.len,
-                )
-            } else if location.len == 0 {
-                Vec::new()
-            } else {
-                vec![Segment::Gap {
-                    offset: location.offset,
-                    len: location.len,
-                }]
-            };
-            for segment in segments {
-                match segment {
-                    Segment::Cached {
-                        offset,
-                        span,
-                        header,
-                        data,
-                    } => parts.push(PendingReadData::Decompressed {
-                        offset,
-                        span,
-                        header,
-                        data,
-                    }),
-                    Segment::Gap { offset, len } => {
-                        let lookups =
-                            memory_ctx()
-                                .compressed_cache()
-                                .get(&request.open_file, offset, len);
-                        for lookup in &lookups {
-                            if let Some(block) = lookup.missing() {
-                                physical_reads.push(match &request.open_file {
-                                    OpenFile::Local(file) => FsOrHttpRead::Fs(FsReadRequest {
-                                        file: file.clone(),
-                                        block: block.clone(),
-                                    }),
-                                    OpenFile::Remote(remote) => {
-                                        FsOrHttpRead::Http(HttpGetRequest {
-                                            remote: remote.clone(),
-                                            block: block.clone(),
-                                        })
-                                    }
-                                });
-                            }
-                        }
-                        parts.push(PendingReadData::Compressed { offset, lookups });
-                    }
+            let lookups = memory_ctx().compressed_cache().get(
+                &request.open_file,
+                location.offset,
+                location.len,
+            );
+            for lookup in &lookups {
+                if let Some(block) = lookup.missing() {
+                    physical_reads.push(match &request.open_file {
+                        OpenFile::Local(file) => FsOrHttpRead::Fs(FsReadRequest {
+                            file: file.clone(),
+                            block: block.clone(),
+                        }),
+                        OpenFile::Remote(remote) => FsOrHttpRead::Http(HttpGetRequest {
+                            remote: remote.clone(),
+                            block: block.clone(),
+                        }),
+                    });
                 }
             }
-            locations.push(parts);
+            locations.push(PendingReadData {
+                offset: location.offset,
+                lookups,
+            });
         }
 
         let remaining = physical_reads.len();
@@ -365,7 +318,6 @@ mod tests {
             id,
             open_file: file,
             locations: locations.into_iter().collect(),
-            raw_bytes_only: false,
         };
         (id, request)
     }
@@ -428,26 +380,6 @@ mod tests {
         );
     }
 
-    fn decompressed_part(response: ReadResponse) -> (usize, usize, bytes::Bytes, bytes::Bytes) {
-        let part = response.into_locations().pop().unwrap().pop().unwrap();
-        let ReadData::Decompressed {
-            offset,
-            span,
-            header,
-            data,
-        } = part
-        else {
-            panic!("expected decompressed data")
-        };
-
-        (
-            offset,
-            span,
-            header.into_iter().next().unwrap(),
-            data.into_iter().next().unwrap(),
-        )
-    }
-
     #[test]
     fn uncached_request_becomes_ready_after_its_physical_read() {
         init_test_free_pool(4);
@@ -482,41 +414,23 @@ mod tests {
         assert_eq!(ready.response.id(), id);
     }
 
+    /// A read is answered from the file's stored bytes alone: a decompressed
+    /// page cached over its range neither spares the read nor replaces its
+    /// bytes (a footer probe spanning a small file's data pages gets the file).
     #[test]
-    fn decompressed_cache_hit_needs_no_transport_io() {
-        init_test_free_pool(4);
-        let (file, _dir) = registered_file();
-        let location = FileRange::new(0, 4096);
-        cache_decompressed(file.clone(), location);
-        let (_, pending) = pending_read(file, [location]);
-        let mut tracker = RequestTracker::default();
-
-        let physical = register_local(&mut tracker, ROUTE, pending);
-        let response = tracker.take_ready().pop().unwrap().response;
-        let (offset, span, header, data) = decompressed_part(response);
-
-        assert!(physical.is_empty());
-        assert_eq!(offset, 0);
-        assert_eq!(span, 4096);
-        assert_eq!(header.as_ref(), b"header");
-        assert_eq!(data.as_ref(), b"data");
-    }
-
-    /// A raw-bytes read over a range holding a decompressed page (a
-    /// footer probe spanning a small file's data pages) gets the stored bytes.
-    #[test]
-    fn a_raw_bytes_read_skips_decompressed_pages() {
+    fn a_read_ignores_decompressed_pages_cached_over_its_range() {
         init_test_free_pool(4);
         let (file, _dir) = registered_file();
         cache_decompressed(file.clone(), FileRange::new(0, 4096));
-        let (_, mut pending) = pending_read(file, [FileRange::new(0, 8192)]);
-        pending.raw_bytes_only = true;
+        let (_, pending) = pending_read(file, [FileRange::new(0, 8192)]);
         let mut tracker = RequestTracker::default();
 
         let physical = register_local(&mut tracker, ROUTE, pending);
+        let needed_io = !physical.is_empty();
         complete_reads(&mut tracker, physical);
         let response = tracker.take_ready().pop().unwrap().response;
 
+        assert!(needed_io);
         assert_eq!(response.into_bytes(), vec![0u8; 8192]);
     }
 

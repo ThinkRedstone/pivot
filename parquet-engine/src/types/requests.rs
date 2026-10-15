@@ -5,8 +5,40 @@ use crate::types::leaves::projected_leaves;
 use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::types::projection::Projection;
 use bytes::Bytes;
-use dispatch::io::{FileRange, OpenFile, ReadData, ReadResponse};
-use dispatch::memory::{MultiBufferReader, ReaderPosition};
+use dispatch::io::{FileRange, OpenFile, ReadResponse};
+use dispatch::memory::{MultiBufferReader, ReaderPosition, Segment, memory_ctx};
+
+/// A row group's read as the fetcher issues it: for each projected leaf, the
+/// pages the decompressed cache already held when the read was planned and the
+/// byte ranges still to read. Built on the fetching worker right before its IO
+/// (see [`from`](Self::from)), so the cached pages it pins are pinned only
+/// while the read is in flight. Compressed-cache lookup, extent allocation and
+/// physical reads happen in dispatch's worker-local requester.
+pub struct RowGroupRequest {
+    metadata: QueryRowGroupMetadata,
+    open_file: OpenFile,
+    /// Each projected leaf's chunk, in leaf order.
+    columns: Vec<ColumnReference>,
+}
+
+enum ColumnReference {
+    /// The chunk's parts in file order, tagged with the page codec its footer
+    /// entry recorded so the buffer tags the column's parts with it.
+    InFile {
+        codec: CompressionCodec,
+        parts: Vec<ColumnChunkReference>,
+    },
+    /// The file has no chunk for the leaf (see [`ColumnChunkMeta::absent`]):
+    /// nothing is read for it, and its column of the buffer comes back empty.
+    Absent,
+}
+
+enum ColumnChunkReference {
+    /// A page the decompressed cache held: resolved, nothing to read.
+    Cached(CachedColumnChunk),
+    /// A stretch of whole pages the cache did not hold, read from the file.
+    ToRead(FileRange),
+}
 
 /// One resolved piece of a column chunk, in file order, named by the form its
 /// bytes are in:
@@ -21,7 +53,7 @@ use dispatch::memory::{MultiBufferReader, ReaderPosition};
 ///   [`parse_page_header`]), and its decompressed bytes, pinned. The indexer
 ///   builds a `CompressedPage` from it directly, no parsing or decompression
 ///   needed.
-pub enum ColumnPart {
+pub enum CachedColumnChunk {
     Compressed {
         offset: usize,
         bytes: Vec<Bytes>,
@@ -34,47 +66,10 @@ pub enum ColumnPart {
     },
 }
 
-/// Parse a page's Thrift header back out of the bytes a decompressed-cache hit
-/// returned (see [`dispatch::memory::Segment::Cached`], which
-/// stores whatever the `Decompressor`
-/// serialized at insert time) - cheap, a few bytes, entirely in memory; no disk
-/// access and nothing to do with the (possibly much larger) page payload.
-fn parse_page_header(bytes: &[Bytes]) -> PageHeader {
-    let mut position = ReaderPosition::default();
-    let mut reader = MultiBufferReader::new(bytes, &mut position);
-    let mut prot = ThriftReadInputProtocol::new(&mut reader);
-    PageHeader::read_thrift_without_stats(&mut prot)
-        .expect("a decompressed-cache hit's header round-trips: this cache wrote it")
-}
-
-/// Tracks the IO state for an entire row group read.
-///
-/// It contains only durable file locations. Cache lookup, extent allocation,
-/// physical reads happen later in dispatch's worker-local requester and its
-/// private tracker.
-pub struct RowGroupRequest {
-    metadata: QueryRowGroupMetadata,
-    open_file: OpenFile,
-    /// Where each projected leaf's chunk is, in leaf order.
-    locations: Vec<ChunkLocation>,
-}
-
-/// Where one projected leaf's chunk is in the file.
-enum ChunkLocation {
-    /// The chunk's byte range, paired with the page codec its footer entry
-    /// recorded so the buffer built from the response can tag the column's
-    /// parts with it.
-    InFile {
-        codec: CompressionCodec,
-        range: FileRange,
-    },
-    /// The file has no chunk for the leaf (see [`ColumnChunkMeta::absent`]):
-    /// nothing is read for it, and its column of the buffer comes back empty.
-    Absent,
-}
-
 impl RowGroupRequest {
-    /// Build a request for all projected columns in the given row group.
+    /// Build a request for all projected columns in the given row group: each
+    /// chunk is looked up in the decompressed cache, the pages it holds are
+    /// taken, pinned, and the stretches between them become ranges to read.
     pub fn from(metadata_handle: QueryRowGroupMetadata, projection: &Projection) -> Self {
         let open_file = metadata_handle.get_metadata().open_file.clone();
         let columns = metadata_handle.columns();
@@ -84,19 +79,38 @@ impl RowGroupRequest {
         let fields = metadata_handle.get_metadata().schema.fields();
         let leaves = projected_leaves(fields, &metadata_handle, projection);
 
-        let locations = leaves
+        let planned = leaves
             .iter()
             .map(|&leaf| {
                 let meta: &ColumnChunkMeta = &columns[leaf];
                 if meta.absent {
-                    return ChunkLocation::Absent;
+                    return ColumnReference::Absent;
                 }
-                ChunkLocation::InFile {
+                let offset = meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize;
+                let len = meta.total_compressed_size as usize;
+                ColumnReference::InFile {
                     codec: meta.codec,
-                    range: FileRange::new(
-                        meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize,
-                        meta.total_compressed_size as usize,
-                    ),
+                    parts: memory_ctx()
+                        .decompressed_cache()
+                        .get_range(&open_file, offset, len)
+                        .into_iter()
+                        .map(|segment| match segment {
+                            Segment::Cached {
+                                offset,
+                                span,
+                                header,
+                                data,
+                            } => ColumnChunkReference::Cached(CachedColumnChunk::Decompressed {
+                                offset,
+                                span,
+                                header: Box::new(Self::parse_page_header(&header)),
+                                data,
+                            }),
+                            Segment::Gap { offset, len } => {
+                                ColumnChunkReference::ToRead(FileRange::new(offset, len))
+                            }
+                        })
+                        .collect(),
                 }
             })
             .collect();
@@ -104,29 +118,47 @@ impl RowGroupRequest {
         Self {
             metadata: metadata_handle,
             open_file,
-            locations,
+            columns: planned,
         }
+    }
+
+    /// Parse a page's Thrift header back out of the bytes a decompressed-cache hit
+    /// returned (see [`dispatch::memory::Segment::Cached`], which
+    /// stores whatever the `Decompressor`
+    /// serialized at insert time) - cheap, a few bytes, entirely in memory; no disk
+    /// access and nothing to do with the (possibly much larger) page payload.
+    fn parse_page_header(bytes: &[Bytes]) -> PageHeader {
+        let mut position = ReaderPosition::default();
+        let mut reader = MultiBufferReader::new(bytes, &mut position);
+        let mut prot = ThriftReadInputProtocol::new(&mut reader);
+        PageHeader::read_thrift_without_stats(&mut prot)
+            .expect("a decompressed-cache hit's header round-trips: this cache wrote it")
     }
 
     pub fn open_file(&self) -> &OpenFile {
         &self.open_file
     }
 
-    /// The byte ranges to read, one per projected leaf the file holds.
+    /// The byte ranges left to read, in file order within each leaf.
     pub fn file_ranges(&self) -> impl Iterator<Item = FileRange> + '_ {
-        self.locations.iter().filter_map(|location| match location {
-            ChunkLocation::InFile { range, .. } => Some(*range),
-            ChunkLocation::Absent => None,
-        })
+        self.columns
+            .iter()
+            .flat_map(|column| match column {
+                ColumnReference::InFile { parts, .. } => parts.as_slice(),
+                ColumnReference::Absent => &[],
+            })
+            .filter_map(|part| match part {
+                ColumnChunkReference::ToRead(range) => Some(*range),
+                ColumnChunkReference::Cached(_) => None,
+            })
     }
 
-    /// Whether every projected leaf is absent from the file, so there is
-    /// nothing to read and the buffer is built with no response
+    /// Whether nothing is left to read: every projected leaf is absent from
+    /// the file or entirely held by the decompressed cache, so the buffer is
+    /// built with no response
     /// ([`into_row_group_buffer`](Self::into_row_group_buffer) with `None`).
     pub fn reads_nothing(&self) -> bool {
-        self.locations
-            .iter()
-            .all(|location| matches!(location, ChunkLocation::Absent))
+        self.file_ranges().next().is_none()
     }
 
     /// Pair this row group's domain metadata with dispatch's resolved
@@ -139,16 +171,28 @@ impl RowGroupRequest {
             .unwrap_or_default()
             .into_iter();
         let columns = self
-            .locations
-            .iter()
-            .map(|location| match location {
-                ChunkLocation::InFile { codec, .. } => ColumnBuffer::resolved(
-                    *codec,
-                    resolved
-                        .next()
-                        .expect("the response resolves every requested range"),
-                ),
-                ChunkLocation::Absent => ColumnBuffer::Absent,
+            .columns
+            .into_iter()
+            .map(|column| match column {
+                ColumnReference::InFile { codec, parts } => ColumnBuffer::Resolved {
+                    codec,
+                    parts: parts
+                        .into_iter()
+                        .map(|part| match part {
+                            ColumnChunkReference::Cached(part) => part,
+                            ColumnChunkReference::ToRead(_) => {
+                                let read = resolved
+                                    .next()
+                                    .expect("the response resolves every requested range");
+                                CachedColumnChunk::Compressed {
+                                    offset: read.offset,
+                                    bytes: read.bytes,
+                                }
+                            }
+                        })
+                        .collect(),
+                },
+                ColumnReference::Absent => ColumnBuffer::Absent,
             })
             .collect();
         assert!(
@@ -181,38 +225,10 @@ pub enum ColumnBuffer {
     /// pages were written with (from the column chunk's footer metadata).
     Resolved {
         codec: CompressionCodec,
-        parts: Vec<ColumnPart>,
+        parts: Vec<CachedColumnChunk>,
     },
     /// A leaf the file has no chunk for (see [`ColumnChunkMeta::absent`]):
     /// nothing was read, and the indexer stands in one page spanning every row
     /// so the column decodes as NULL.
     Absent,
-}
-
-impl ColumnBuffer {
-    /// A column the response resolved, its parts as dispatch returned them.
-    fn resolved(codec: CompressionCodec, parts: Vec<ReadData>) -> Self {
-        Self::Resolved {
-            codec,
-            parts: parts
-                .into_iter()
-                .map(|part| match part {
-                    ReadData::Compressed { offset, bytes } => {
-                        ColumnPart::Compressed { offset, bytes }
-                    }
-                    ReadData::Decompressed {
-                        offset,
-                        span,
-                        header,
-                        data,
-                    } => ColumnPart::Decompressed {
-                        offset,
-                        span,
-                        header: Box::new(parse_page_header(&header)),
-                        data,
-                    },
-                })
-                .collect(),
-        }
-    }
 }

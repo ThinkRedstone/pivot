@@ -75,7 +75,7 @@ impl Decompressor {
         };
 
         // A page already resolved from the decompressed cache before this row
-        // group's IO was even issued (see `requests::ColumnPart::Decompressed`)
+        // group's IO was even issued (see `requests::CachedColumnChunk::Decompressed`)
         // carries its bytes here directly - no cache lookup needed, and none of the
         // races one would otherwise have to reason about between that resolution
         // and now.
