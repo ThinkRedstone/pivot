@@ -1,8 +1,8 @@
 //! Fetch stage for Parquet footers.
 //!
 //! The operator submits logical file ranges through `OperatorIO`; dispatch's
-//! requester's tracker resolves cache hits and allocates missing compressed-cache
-//! extents, then the requester immediately performs the physical reads. This
+//! requester resolves cache hits, allocates missing compressed-cache extents,
+//! and immediately performs the physical reads. This
 //! module owns only the footer-specific two-step state machine: probe the tail,
 //! then request the exact footer when it is larger than the probe.
 

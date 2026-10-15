@@ -4,11 +4,12 @@ use crate::io::cached_http::CachedHttpEngine;
 use crate::io::disk_cache::DiskCache;
 use crate::io::hardware_queues::{InFlightPermit, WorkerHardwareQueues};
 use crate::io::{
-    Completion, DataFlowRequest, FailedIO, FsRequest, FsWriteRequest, HttpRequest,
-    HttpUploadRequest, OpenFile, PendingReadRequest, PendingWriteRequest, RemoteSplit,
+    Completion, DataFlowRequest, FailedIO, FsReadRequest, FsRequest, FsWriteRequest,
+    HttpGetRequest, HttpRequest, HttpUploadRequest, OpenFile, PendingReadRequest,
+    PendingWriteRequest, ReadData, ReadResponse, RemoteSplit,
 };
 use crate::memory::compressed_cache::MissingExtent;
-use crate::request_tracker::{RegisteredRead, RequestRoute, RequestTracker, RoutedReadResponse};
+use crate::memory::{CacheLookup, memory_ctx};
 use crate::stats::StatsCollector;
 use crate::worker::WORKER_IDX;
 use std::collections::{HashMap, VecDeque};
@@ -50,8 +51,112 @@ struct InFlightFsOp {
     permit: InFlightPermit,
 }
 
+/// Where a logical operator request must be delivered when it becomes ready.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RequestRoute {
+    pub data_flow_id: Identifier,
+    pub operator_idx: Identifier,
+}
+
+/// A ready logical response paired with its destination operator.
+pub(crate) struct RoutedReadResponse {
+    pub route: RequestRoute,
+    pub response: ReadResponse,
+}
+
+/// A requested ranges cache lookups. This contains the offset in the file from where this range
+/// begins, with a vector of cache lookups, so it basically represents for example:
+///
+/// -----------------\[found=5\]\[missing=10\]\[found=3\]...
+///        offset=321
+struct RangeLookups {
+    offset: usize,
+    lookups: Vec<CacheLookup>,
+}
+
+impl RangeLookups {
+    fn into_ready(self) -> ReadData {
+        ReadData {
+            offset: self.offset,
+            bytes: self
+                .lookups
+                .into_iter()
+                .map(CacheLookup::into_data)
+                .collect(),
+        }
+    }
+}
+
+struct PendingRead {
+    route: RequestRoute,
+    request: PendingReadRequest,
+    requested_range_lookups: Vec<RangeLookups>,
+    /// Number of physical cache fills this logical request still awaits.
+    remaining: usize,
+}
+
+impl PendingRead {
+    fn into_response(self) -> RoutedReadResponse {
+        RoutedReadResponse {
+            route: self.route,
+            response: ReadResponse::new(
+                self.request.id,
+                self.request.open_file,
+                self.requested_range_lookups
+                    .into_iter()
+                    .map(RangeLookups::into_ready)
+                    .collect(),
+            ),
+        }
+    }
+}
+
+pub(crate) enum IORead {
+    Fs(DataFlowRequest<FsRequest>),
+    Http(DataFlowRequest<HttpRequest>),
+}
+
+impl IORead {
+    /// The cache extent this pending read is waiting for.
+    pub(crate) fn missing_extent(&self) -> &MissingExtent {
+        match self {
+            Self::Fs(request) => match &request.request {
+                FsRequest::Read(read) => &read.block,
+                FsRequest::Write(_) => unreachable!("registered reads never contain writes"),
+            },
+            Self::Http(request) => match &request.request {
+                HttpRequest::Get(read) => &read.block,
+                HttpRequest::Upload(_) => {
+                    unreachable!("registered reads never contain uploads")
+                }
+            },
+        }
+    }
+
+    pub(crate) fn data_flow_id(&self) -> Identifier {
+        match self {
+            Self::Fs(request) => request.data_flow_id,
+            Self::Http(request) => request.data_flow_id,
+        }
+    }
+
+    pub(crate) fn pending_read_id(&self) -> Identifier {
+        match self {
+            Self::Fs(request) => request.pending_read_id,
+            Self::Http(request) => request.pending_read_id,
+        }
+        .expect("the requester assigns every registered read an id")
+    }
+}
+
 /// Bridges dataflow operators and the I/O backend, holding state on outstanding
 /// requests and returning responses together with the original requested context.
+///
+/// Operators enqueue logical file ranges in [`OperatorIO`](crate::io::OperatorIO).
+/// This is the boundary where those ranges become physical cache extents and
+/// transport operations: registration resolves a read through the compressed
+/// cache, submits each missing extent's fill immediately, and the read's
+/// response is assembled once its last fill lands.
 ///
 /// A single per-core io_uring serves **both** disk reads and HTTP(S) range reads
 /// (the standard io_uring pattern): file reads are one SQE→one CQE, while HTTP
@@ -62,10 +167,17 @@ struct InFlightFsOp {
 /// Held one per worker.
 pub struct IORequester {
     backend: IOBackend,
-    /// Resolves operators' logical file ranges and routes physical read
-    /// completions back to them. Registration submits returned operations
-    /// immediately, so the tracker itself owns no transport outbox.
-    tracker: RequestTracker,
+    /// Logical reads awaiting physical fills, by slot; a `None` slot is free
+    /// and listed in `free_pending_reads_slots`.
+    pending_reads: Vec<Option<PendingRead>>,
+    /// A vector of all the slots currently unused in pending_reads
+    free_pending_reads_slots: Vec<usize>,
+    /// Maps between a physical id for the read to the index of the `PendingRead` object in
+    /// pending_reads
+    physical_read_ids_to_pending_reads_indexes: HashMap<Identifier, usize>,
+    next_physical_read_id: Identifier,
+    /// Logical reads whose every fill has landed, awaiting the worker's drain.
+    ready_reads: Vec<RoutedReadResponse>,
     /// In-flight operator-owned local-file operations, keyed by backend id.
     pending_io_requests: HashMap<Identifier, InFlightFsOp>,
     /// Local-file operations accepted while their hardware queue was at
@@ -77,7 +189,7 @@ pub struct IORequester {
     /// Logical reads following extents currently being filled by another
     /// worker. They need no transport request of their own; the worker polls
     /// their shared extent state once per loop.
-    piggybacked_reads: Vec<RegisteredRead>,
+    piggybacked_reads: Vec<IORead>,
     /// Allocates backend disk-op ids - shared by fs reads here and the engine's
     /// cache-file reads/write-backs, so a completion routes by which map holds it.
     next_id: Identifier,
@@ -97,7 +209,11 @@ impl IORequester {
     pub fn new(disk_cache: Option<Arc<DiskCache>>) -> Self {
         Self {
             backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
-            tracker: RequestTracker::default(),
+            pending_reads: Vec::new(),
+            free_pending_reads_slots: Vec::new(),
+            physical_read_ids_to_pending_reads_indexes: HashMap::new(),
+            next_physical_read_id: 0,
+            ready_reads: Vec::new(),
             pending_io_requests: Default::default(),
             fs_backlog: VecDeque::new(),
             fs_queues: WorkerHardwareQueues::new(),
@@ -116,7 +232,11 @@ impl IORequester {
     ) -> Self {
         Self {
             backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
-            tracker: RequestTracker::default(),
+            pending_reads: Vec::new(),
+            free_pending_reads_slots: Vec::new(),
+            physical_read_ids_to_pending_reads_indexes: HashMap::new(),
+            next_physical_read_id: 0,
+            ready_reads: Vec::new(),
             pending_io_requests: Default::default(),
             fs_backlog: VecDeque::new(),
             fs_queues: WorkerHardwareQueues::new(),
@@ -154,15 +274,15 @@ impl IORequester {
         };
         let mut fs_requests = Vec::new();
         let mut http_requests = Vec::new();
-        for request in self.tracker.register_read(route, request) {
+        for request in self.register_and_create_io_reads(route, request) {
             if !request.missing_extent().fill_owner() {
                 request.missing_extent().subscribe(WORKER_IDX.get());
                 self.piggybacked_reads.push(request);
                 continue;
             }
             match request {
-                RegisteredRead::Fs(request) => fs_requests.push(request),
-                RegisteredRead::Http(request) => http_requests.push(request),
+                IORead::Fs(request) => fs_requests.push(request),
+                IORead::Http(request) => http_requests.push(request),
             }
         }
 
@@ -206,13 +326,13 @@ impl IORequester {
     fn withdraw_registered_read(
         &mut self,
         cache_extent: Option<(OpenFile, MissingExtent)>,
-        tracked_read_id: Option<Identifier>,
+        pending_read_id: Option<Identifier>,
     ) {
         if let Some((open_file, block)) = cache_extent {
             block.remove_from_cache(&open_file);
         }
-        if let Some(id) = tracked_read_id {
-            let _ = self.tracker.fail(id);
+        if let Some(id) = pending_read_id {
+            let _ = self.fail_pending_read(id);
         }
     }
 
@@ -227,11 +347,11 @@ impl IORequester {
     ) {
         for request in fs_requests {
             let cache_extent = fs_cache_extent(&request);
-            self.withdraw_registered_read(cache_extent, request.tracked_read_id);
+            self.withdraw_registered_read(cache_extent, request.pending_read_id);
         }
         for request in http_requests {
             let cache_extent = http_cache_extent(&request);
-            self.withdraw_registered_read(cache_extent, request.tracked_read_id);
+            self.withdraw_registered_read(cache_extent, request.pending_read_id);
         }
     }
 
@@ -269,19 +389,161 @@ impl IORequester {
     }
 
     pub(crate) fn take_ready_reads(&mut self) -> Vec<RoutedReadResponse> {
-        self.tracker.take_ready()
+        std::mem::take(&mut self.ready_reads)
     }
 
     /// Discard logical read state for a dataflow that is no longer running.
-    /// Dropping a backlogged read drops its extent's fill owner, which removes
-    /// the extent and wakes any followers, exactly like a cancelled in-flight
-    /// owner.
+    /// Physical reads already submitted are allowed to finish and warm the
+    /// cache; their later completions simply find no waiter. Dropping a
+    /// backlogged read drops its extent's fill owner, which removes the extent
+    /// and wakes any followers, exactly like a cancelled in-flight owner.
     pub fn cancel_dataflow(&mut self, data_flow_id: Identifier) {
-        self.tracker.cancel_dataflow(data_flow_id);
+        let cancelled_slots: Vec<_> = self
+            .pending_reads
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(slot, request)| {
+                (request.as_ref()?.route.data_flow_id == data_flow_id).then_some(slot)
+            })
+            .collect();
+        for slot in &cancelled_slots {
+            if self.pending_reads[*slot].take().is_some() {
+                self.free_pending_reads_slots.push(*slot);
+            }
+        }
+        self.physical_read_ids_to_pending_reads_indexes
+            .retain(|_, slot| !cancelled_slots.contains(slot));
+        self.ready_reads
+            .retain(|ready| ready.route.data_flow_id != data_flow_id);
         self.piggybacked_reads
             .retain(|request| request.data_flow_id() != data_flow_id);
         self.fs_backlog
             .retain(|request| request.data_flow_id != data_flow_id);
+    }
+
+    /// Resolve one logical read through the compressed cache and track it
+    /// until every extent it still needs is filled; returns those fills as
+    /// physical reads to submit.
+    fn register_and_create_io_reads(
+        &mut self,
+        route: RequestRoute,
+        request: PendingReadRequest,
+    ) -> Vec<IORead> {
+        let mut locations = Vec::with_capacity(request.locations.len());
+        let mut physical_reads = Vec::new();
+
+        for location in &request.locations {
+            let lookups = memory_ctx().compressed_cache().get(
+                &request.open_file,
+                location.offset,
+                location.len,
+            );
+            for lookup in &lookups {
+                if let Some(block) = lookup.missing() {
+                    let id = self.next_physical_read_id;
+                    self.next_physical_read_id += 1;
+                    physical_reads.push(match &request.open_file {
+                        OpenFile::Local(file) => IORead::Fs(
+                            DataFlowRequest::new(
+                                route.data_flow_id,
+                                route.operator_idx,
+                                FsRequest::Read(FsReadRequest {
+                                    file: file.clone(),
+                                    block: block.clone(),
+                                }),
+                            )
+                            .with_pending_read_id(id),
+                        ),
+                        OpenFile::Remote(remote) => IORead::Http(
+                            DataFlowRequest::new(
+                                route.data_flow_id,
+                                route.operator_idx,
+                                HttpRequest::Get(HttpGetRequest {
+                                    remote: remote.clone(),
+                                    block: block.clone(),
+                                }),
+                            )
+                            .with_pending_read_id(id),
+                        ),
+                    });
+                }
+            }
+            locations.push(RangeLookups {
+                offset: location.offset,
+                lookups,
+            });
+        }
+
+        let remaining = physical_reads.len();
+        let slot = self.insert_pending_read(PendingRead {
+            route,
+            request,
+            requested_range_lookups: locations,
+            remaining,
+        });
+
+        for read in &mut physical_reads {
+            self.physical_read_ids_to_pending_reads_indexes
+                .insert(read.pending_read_id(), slot);
+        }
+
+        if remaining == 0 {
+            self.finish_pending_read(slot);
+        }
+
+        physical_reads
+    }
+
+    fn insert_pending_read(&mut self, request: PendingRead) -> usize {
+        if let Some(slot) = self.free_pending_reads_slots.pop() {
+            self.pending_reads[slot] = Some(request);
+            slot
+        } else {
+            self.pending_reads.push(Some(request));
+            self.pending_reads.len() - 1
+        }
+    }
+
+    /// One physical read of a tracked read landed; the read becomes ready
+    /// once its last one does.
+    fn complete_pending_read(&mut self, physical_read_id: Identifier) {
+        let Some(slot) = self
+            .physical_read_ids_to_pending_reads_indexes
+            .remove(&physical_read_id)
+        else {
+            // The logical request may have been cancelled while this physical
+            // read was still in flight.
+            return;
+        };
+        let Some(request) = self.pending_reads[slot].as_mut() else {
+            return;
+        };
+        request.remaining -= 1;
+        if request.remaining == 0 {
+            self.finish_pending_read(slot);
+        }
+    }
+
+    /// Fail the logical request owning one physical read. Its other reads may
+    /// still complete and warm the cache, but no longer have a callback target.
+    fn fail_pending_read(&mut self, physical_read_id: Identifier) -> Option<RequestRoute> {
+        let slot = self
+            .physical_read_ids_to_pending_reads_indexes
+            .remove(&physical_read_id)?;
+        let request = self.pending_reads[slot].take()?;
+        self.physical_read_ids_to_pending_reads_indexes
+            .retain(|_, routed_slot| *routed_slot != slot);
+        self.free_pending_reads_slots.push(slot);
+        Some(request.route)
+    }
+
+    fn finish_pending_read(&mut self, slot: usize) {
+        let request = self.pending_reads[slot]
+            .take()
+            .expect("finishing an empty request slot");
+        debug_assert_eq!(request.remaining, 0);
+        self.free_pending_reads_slots.push(slot);
+        self.ready_reads.push(request.into_response());
     }
 
     /// Reserve a slot on the hardware queue the file's device serves this
@@ -353,7 +615,7 @@ impl IORequester {
         permit: InFlightPermit,
     ) -> Result<()> {
         let cache_extent = fs_cache_extent(&request);
-        let tracked_read_id = request.tracked_read_id;
+        let pending_read_id = request.pending_read_id;
         let queued = match &request.request {
             FsRequest::Read(read) => self.backend.submit_read(
                 read.file.as_raw_fd(),
@@ -377,7 +639,7 @@ impl IORequester {
             }
         };
         if let Err(error) = queued {
-            self.withdraw_registered_read(cache_extent, tracked_read_id);
+            self.withdraw_registered_read(cache_extent, pending_read_id);
             return Err(error.into());
         }
         self.pending_io_requests.insert(
@@ -390,7 +652,7 @@ impl IORequester {
         );
         self.next_id += 1;
         if let Err(error) = self.backend.submit() {
-            self.withdraw_registered_read(cache_extent, tracked_read_id);
+            self.withdraw_registered_read(cache_extent, pending_read_id);
             return Err(error.into());
         }
 
@@ -411,7 +673,7 @@ impl IORequester {
             data_flow_id,
             operator_idx,
             request,
-            tracked_read_id,
+            pending_read_id,
             submitted_at,
         } = request;
         let result = match request {
@@ -422,7 +684,7 @@ impl IORequester {
                     data_flow_id,
                     operator_idx,
                     request,
-                    tracked_read_id,
+                    pending_read_id,
                     submitted_at,
                 },
             ),
@@ -435,7 +697,7 @@ impl IORequester {
                             data_flow_id,
                             operator_idx,
                             request,
-                            tracked_read_id,
+                            pending_read_id,
                             submitted_at,
                         },
                     )
@@ -447,7 +709,7 @@ impl IORequester {
             }
         };
         if result.is_err() {
-            self.withdraw_registered_read(cache_extent, tracked_read_id);
+            self.withdraw_registered_read(cache_extent, pending_read_id);
         }
         result
     }
@@ -487,7 +749,7 @@ impl IORequester {
     }
 
     /// Resolve reads following another fill of their extent. A successful fill
-    /// only advances the logical tracker. A failed one is pushed onto `out` as
+    /// only completes the logical read. A failed one is pushed onto `out` as
     /// a failed read, so the caller fails its logical read and the worker
     /// cancels the affected dataflow exactly as for a read this requester
     /// submitted itself.
@@ -498,19 +760,19 @@ impl IORequester {
             if request.missing_extent().failed() {
                 let request = self.piggybacked_reads.swap_remove(index);
                 let (data_flow_id, operator_idx) = match &request {
-                    RegisteredRead::Fs(request) => (request.data_flow_id, request.operator_idx),
-                    RegisteredRead::Http(request) => (request.data_flow_id, request.operator_idx),
+                    IORead::Fs(request) => (request.data_flow_id, request.operator_idx),
+                    IORead::Http(request) => (request.data_flow_id, request.operator_idx),
                 };
                 out.push(Err(FailedIO {
                     data_flow_id,
                     operator_idx,
-                    tracked_read_id: Some(request.tracked_read_id()),
+                    pending_read_id: Some(request.pending_read_id()),
                     error: Error::PiggybackedReadFailed,
                 }));
             } else if request.missing_extent().is_committed() {
                 let request = self.piggybacked_reads.swap_remove(index);
-                let tracked_read_id = request.tracked_read_id();
-                self.tracker.complete(tracked_read_id);
+                let pending_read_id = request.pending_read_id();
+                self.complete_pending_read(pending_read_id);
             } else {
                 index += 1;
             }
@@ -642,7 +904,7 @@ impl IORequester {
                     out.push(Err(FailedIO {
                         data_flow_id,
                         operator_idx,
-                        tracked_read_id: request.tracked_read_id,
+                        pending_read_id: request.pending_read_id,
                         error: error.into(),
                     }));
                 } else {
@@ -650,7 +912,7 @@ impl IORequester {
                         data_flow_id,
                         operator_idx,
                         request: fs_request,
-                        tracked_read_id,
+                        pending_read_id,
                         submitted_at,
                     } = request;
                     let completion = match fs_request {
@@ -663,7 +925,7 @@ impl IORequester {
                                 data_flow_id,
                                 operator_idx,
                                 request: read,
-                                tracked_read_id,
+                                pending_read_id,
                                 submitted_at,
                             })
                         }
@@ -671,7 +933,7 @@ impl IORequester {
                             data_flow_id,
                             operator_idx,
                             request: write,
-                            tracked_read_id,
+                            pending_read_id,
                             submitted_at,
                         }),
                     };
@@ -697,25 +959,25 @@ impl IORequester {
         self.resolve_piggybacked(&mut out);
 
         // Physical transport is complete. Resolve the requester's private
-        // logical routing before the worker sees completions or failures.
+        // logical physical_read_ids_to_pending_reads_indexes before the worker sees completions or failures.
         for completion in &out {
             match completion {
                 Ok(Completion::FsRead(request)) => {
                     request.request.block.wake_subscribers();
-                    if let Some(id) = request.tracked_read_id {
-                        self.tracker.complete(id);
+                    if let Some(id) = request.pending_read_id {
+                        self.complete_pending_read(id);
                     }
                 }
                 Ok(Completion::HttpGet(request, _)) => {
                     request.request.block.wake_subscribers();
-                    if let Some(id) = request.tracked_read_id {
-                        self.tracker.complete(id);
+                    if let Some(id) = request.pending_read_id {
+                        self.complete_pending_read(id);
                     }
                 }
                 Ok(Completion::FsWrite(_) | Completion::HttpUpload(_)) => {}
                 Err(failed) => {
-                    if let Some(id) = failed.tracked_read_id {
-                        let _ = self.tracker.fail(id);
+                    if let Some(id) = failed.pending_read_id {
+                        let _ = self.fail_pending_read(id);
                     }
                 }
             }
@@ -799,12 +1061,14 @@ mod tests {
         FileRange, HttpGetRequest, HttpUploadRequest, LocalFile, OpenFile, PendingReadRequest,
         ReadRequestId, RemoteFile, open_direct_read,
     };
-    use crate::memory::{init_test_free_pool, memory_ctx};
+    use crate::memory::{BlockKey, init_test_free_pool, memory_ctx};
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use tempfile::TempDir;
     use url::Url;
 
     /// Body byte for absolute file offset `off`, so a served range is predictable.
@@ -1956,5 +2220,218 @@ mod tests {
         settle(&mut after);
 
         assert_cached(&loc, 0, 4096);
+    }
+
+    const ROUTE: RequestRoute = RequestRoute {
+        data_flow_id: 7,
+        operator_idx: 3,
+    };
+
+    fn registered_file() -> (OpenFile, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("data");
+        std::fs::write(&path, vec![0u8; 1 << 20]).unwrap();
+        let open_file =
+            OpenFile::Local(LocalFile::new(std::fs::File::open(path).unwrap()).unwrap());
+        memory_ctx()
+            .compressed_cache()
+            .open_entry(open_file.clone());
+        (open_file, dir)
+    }
+
+    fn pending_read(
+        file: OpenFile,
+        locations: impl IntoIterator<Item = FileRange>,
+    ) -> (ReadRequestId, PendingReadRequest) {
+        let id = ReadRequestId(0);
+        let request = PendingReadRequest {
+            id,
+            open_file: file,
+            locations: locations.into_iter().collect(),
+        };
+        (id, request)
+    }
+
+    fn register_local(
+        requester: &mut IORequester,
+        route: RequestRoute,
+        request: PendingReadRequest,
+    ) -> Vec<DataFlowRequest<FsRequest>> {
+        requester
+            .register_and_create_io_reads(route, request)
+            .into_iter()
+            .map(|request| match request {
+                IORead::Fs(request) => request,
+                IORead::Http(_) => panic!("expected a filesystem read"),
+            })
+            .collect()
+    }
+
+    fn physical_id(request: &DataFlowRequest<FsRequest>) -> Identifier {
+        request.pending_read_id.unwrap()
+    }
+
+    fn complete_reads(
+        requester: &mut IORequester,
+        requests: impl IntoIterator<Item = DataFlowRequest<FsRequest>>,
+    ) {
+        for request in requests {
+            let id = physical_id(&request);
+            let FsRequest::Read(read) = request.request else {
+                panic!("expected a read")
+            };
+            read.block.commit();
+            requester.complete_pending_read(id);
+        }
+    }
+
+    fn warm_compressed_cache(requester: &mut IORequester, file: OpenFile, location: FileRange) {
+        let (_, pending) = pending_read(file, [location]);
+        let physical = register_local(requester, ROUTE, pending);
+
+        complete_reads(requester, physical);
+        requester.take_ready_reads();
+    }
+
+    fn cache_decompressed(file: OpenFile, location: FileRange) {
+        let key = BlockKey {
+            open_file: file,
+            offset: location.offset,
+            len: location.len,
+        };
+        let cache = memory_ctx().decompressed_cache();
+        let mut reservation = cache.reserve(&key, 4);
+        reservation.as_mut_slices()[0].copy_from_slice(b"data");
+        cache.insert(
+            key,
+            vec![bytes::Bytes::from_static(b"header")],
+            reservation,
+            Arc::new(AtomicUsize::new(0)),
+        );
+    }
+
+    #[test]
+    fn uncached_request_becomes_ready_after_its_physical_read() {
+        init_test_free_pool(4);
+        let (file, _dir) = registered_file();
+        let (id, pending) = pending_read(file, [FileRange::new(17, 100)]);
+        let mut requester = IORequester::default();
+
+        let physical = register_local(&mut requester, ROUTE, pending);
+        let physical_count = physical.len();
+        complete_reads(&mut requester, physical);
+        let ready = requester.take_ready_reads().pop().unwrap();
+
+        assert_eq!(physical_count, 1);
+        assert_eq!(ready.route, ROUTE);
+        assert_eq!(ready.response.id(), id);
+        assert_eq!(ready.response.into_bytes().len(), 100);
+    }
+
+    #[test]
+    fn compressed_cache_hit_needs_no_transport_io() {
+        init_test_free_pool(4);
+        let (file, _dir) = registered_file();
+        let location = FileRange::new(0, 4096);
+        let mut requester = IORequester::default();
+        warm_compressed_cache(&mut requester, file.clone(), location);
+        let (id, pending) = pending_read(file, [location]);
+
+        let physical = register_local(&mut requester, ROUTE, pending);
+        let ready = requester.take_ready_reads().pop().unwrap();
+
+        assert!(physical.is_empty());
+        assert_eq!(ready.response.id(), id);
+    }
+
+    /// A read is answered from the file's stored bytes alone: a decompressed
+    /// page cached over its range neither spares the read nor replaces its
+    /// bytes (a footer probe spanning a small file's data pages gets the file).
+    #[test]
+    fn a_read_ignores_decompressed_pages_cached_over_its_range() {
+        init_test_free_pool(4);
+        let (file, _dir) = registered_file();
+        cache_decompressed(file.clone(), FileRange::new(0, 4096));
+        let (_, pending) = pending_read(file, [FileRange::new(0, 8192)]);
+        let mut requester = IORequester::default();
+
+        let physical = register_local(&mut requester, ROUTE, pending);
+        let needed_io = !physical.is_empty();
+        complete_reads(&mut requester, physical);
+        let response = requester.take_ready_reads().pop().unwrap().response;
+
+        assert!(needed_io);
+        assert_eq!(response.into_bytes(), vec![0u8; 8192]);
+    }
+
+    #[test]
+    fn identical_requests_use_separate_physical_reads() {
+        init_test_free_pool(4);
+        let (file, _dir) = registered_file();
+        let first_route = RequestRoute {
+            data_flow_id: 1,
+            operator_idx: 2,
+        };
+        let second_route = RequestRoute {
+            data_flow_id: 3,
+            operator_idx: 4,
+        };
+        let (_, first) = pending_read(file.clone(), [FileRange::new(0, 4096)]);
+        let (_, second) = pending_read(file, [FileRange::new(0, 4096)]);
+        let mut requester = IORequester::default();
+
+        let mut physical = register_local(&mut requester, first_route, first);
+        physical.extend(register_local(&mut requester, second_route, second));
+        let physical_count = physical.len();
+        complete_reads(&mut requester, physical);
+        let mut routes: Vec<_> = requester
+            .take_ready_reads()
+            .into_iter()
+            .map(|ready| ready.route)
+            .collect();
+        routes.sort_by_key(|route| route.data_flow_id);
+
+        assert_eq!(physical_count, 2);
+        assert_eq!(routes, vec![first_route, second_route]);
+    }
+
+    #[test]
+    fn failed_physical_read_discards_its_logical_request() {
+        init_test_free_pool(4);
+        let (file, _dir) = registered_file();
+        let (_, pending) =
+            pending_read(file, [FileRange::new(0, 4096), FileRange::new(32768, 4096)]);
+        let mut requester = IORequester::default();
+        let physical = register_local(&mut requester, ROUTE, pending);
+        let ids: Vec<_> = physical.iter().map(physical_id).collect();
+
+        let failed_route = requester.fail_pending_read(ids[0]);
+        requester.complete_pending_read(ids[1]);
+        let ready = requester.take_ready_reads();
+
+        assert_eq!(failed_route, Some(ROUTE));
+        assert!(ready.is_empty());
+    }
+
+    #[test]
+    fn one_logical_request_reads_multiple_locations() {
+        init_test_free_pool(4);
+        let (file, _dir) = registered_file();
+        let (_, pending) =
+            pending_read(file, [FileRange::new(0, 4096), FileRange::new(32768, 4096)]);
+        let mut requester = IORequester::default();
+
+        let physical = register_local(&mut requester, ROUTE, pending);
+        let physical_count = physical.len();
+        complete_reads(&mut requester, physical);
+        let locations = requester
+            .take_ready_reads()
+            .pop()
+            .unwrap()
+            .response
+            .into_locations();
+
+        assert_eq!(physical_count, 2);
+        assert_eq!(locations.len(), 2);
     }
 }

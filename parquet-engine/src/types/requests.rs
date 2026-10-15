@@ -49,8 +49,7 @@ enum ColumnChunkReference {
 ///   ready to read.
 /// - [`Decompressed`](Self::Decompressed): a page served straight from the
 ///   decompressed cache before any IO was issued: its identity (`offset`,
-///   `span`), its header (parsed back out of the hit - see
-///   [`parse_page_header`]), and its decompressed bytes, pinned. The indexer
+///   `span`), its header, and its decompressed bytes, pinned. The indexer
 ///   builds a `CompressedPage` from it directly, no parsing or decompression
 ///   needed.
 pub enum CachedColumnChunk {

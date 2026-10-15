@@ -5,9 +5,8 @@
 //! its projected column chunks — local files via io_uring disk reads, remote
 //! objects via HTTP range reads on the same ring — emitting a
 //! [`RowGroupBuffer`] once a row group's last block lands. The
-//! slot/routing/in-flight bookkeeping lives in the dispatch requester's private
-//! tracker; this type retains only the [`RowGroupRequest`] keyed by the logical
-//! request id.
+//! slot/routing/in-flight bookkeeping lives in the dispatch requester; this
+//! type retains only the [`RowGroupRequest`] keyed by the logical request id.
 //!
 //! Disk and HTTP have very different latencies, so the fetcher bounds logical
 //! row-group reads for each medium independently. Dispatch separately bounds the

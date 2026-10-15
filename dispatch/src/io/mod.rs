@@ -450,9 +450,9 @@ pub struct DataFlowRequest<R> {
     pub data_flow_id: Identifier,
     pub operator_idx: Identifier,
     pub request: R,
-    /// Identity assigned by the requester's logical-read tracker. Writes,
+    /// Identity the requester assigns to each physical read it tracks. Writes,
     /// uploads, and callers using the transport API directly leave this unset.
-    pub(crate) tracked_read_id: Option<Identifier>,
+    pub(crate) pending_read_id: Option<Identifier>,
     /// When the issuing dataflow handed this operation off, stamped only when
     /// the query opted into stats. `None` (no clock read) otherwise.
     pub submitted_at: Option<std::time::Instant>,
@@ -464,13 +464,13 @@ impl<R> DataFlowRequest<R> {
             data_flow_id,
             operator_idx,
             request,
-            tracked_read_id: None,
+            pending_read_id: None,
             submitted_at: None,
         }
     }
 
-    pub(crate) fn with_tracked_read_id(mut self, id: Identifier) -> Self {
-        self.tracked_read_id = Some(id);
+    pub(crate) fn with_pending_read_id(mut self, id: Identifier) -> Self {
+        self.pending_read_id = Some(id);
         self
     }
 
@@ -480,7 +480,7 @@ impl<R> DataFlowRequest<R> {
             data_flow_id: self.data_flow_id,
             operator_idx: self.operator_idx,
             request: f(self.request),
-            tracked_read_id: self.tracked_read_id,
+            pending_read_id: self.pending_read_id,
             submitted_at: self.submitted_at,
         }
     }
@@ -529,7 +529,7 @@ pub enum Completion {
 pub struct FailedIO {
     pub data_flow_id: Identifier,
     pub operator_idx: Identifier,
-    pub(crate) tracked_read_id: Option<Identifier>,
+    pub(crate) pending_read_id: Option<Identifier>,
     pub error: IORequesterError,
 }
 

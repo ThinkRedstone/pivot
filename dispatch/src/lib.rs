@@ -81,7 +81,6 @@ mod numa;
 mod operations;
 #[cfg(feature = "perf")]
 mod profiler;
-mod request_tracker;
 mod scan;
 mod stats;
 

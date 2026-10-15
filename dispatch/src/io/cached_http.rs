@@ -365,14 +365,14 @@ impl CachedHttpEngine {
                 out.push(Err(FailedIO {
                     data_flow_id: request.data_flow_id,
                     operator_idx: request.operator_idx,
-                    tracked_read_id: request.tracked_read_id,
+                    pending_read_id: request.pending_read_id,
                     error: error.into(),
                 }));
             } else if let Some(upload) = self.http_uploads.remove(&id) {
                 out.push(Err(FailedIO {
                     data_flow_id: upload.data_flow_id,
                     operator_idx: upload.operator_idx,
-                    tracked_read_id: upload.tracked_read_id,
+                    pending_read_id: upload.pending_read_id,
                     error: error.into(),
                 }));
             }
@@ -446,7 +446,7 @@ impl CachedHttpEngine {
                 out.push(Err(FailedIO {
                     data_flow_id: request.data_flow_id,
                     operator_idx: request.operator_idx,
-                    tracked_read_id: request.tracked_read_id,
+                    pending_read_id: request.pending_read_id,
                     error: error.into(),
                 }));
             }
@@ -485,7 +485,7 @@ impl CachedHttpEngine {
                 out.push(Err(FailedIO {
                     data_flow_id: request.data_flow_id,
                     operator_idx: request.operator_idx,
-                    tracked_read_id: request.tracked_read_id,
+                    pending_read_id: request.pending_read_id,
                     error: std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "read reaches past the end of the remote object",
