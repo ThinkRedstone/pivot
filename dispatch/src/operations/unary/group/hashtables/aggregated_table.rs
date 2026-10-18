@@ -20,10 +20,9 @@ use crate::RECORD_BATCH_SIZE;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
+use crate::operations::unary::group::hashtables::hash_table::HashTable;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, PersistedKey,
-    StridedScatterRows,
+    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, PersistedKey, StridedScatterRows,
 };
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::output::topk_pruning::{
@@ -161,7 +160,7 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> 
     pub node: usize,
     /// In-place table stack: the full result if the worker never switched,
     /// otherwise its pre-switch tables.
-    pub tables: Vec<MultiSlabTable<K::Persisted, V>>,
+    pub tables: Vec<HashTable<K::Persisted, V>>,
     /// Per-partition scatter buffers, present only after a radix transition.
     pub buffers: Option<PartitionBuffers<K::Persisted, V>>,
     /// Distinct-count sketch over the worker's rows, for sizing the merge targets.
@@ -196,7 +195,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     worker_context: V::WorkerContext,
     allocator: SlabAllocator,
     /// Tables built before a radix transition.
-    tables: Vec<MultiSlabTable<K::Persisted, V>>,
+    tables: Vec<HashTable<K::Persisted, V>>,
     /// Per-partition buffers allocated on the first radix transition.
     buffers: Option<Vec<StridedScatterRows<<K as KeyExtractor>::Persisted, V>>>,
     /// Distinct-count sketch used to size merge targets.
@@ -248,7 +247,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         topk_aggregation_slot: Option<usize>,
     ) -> Self {
         let mut allocator = SlabAllocator::new(true);
-        let table = BaseHashTable::new(&mut allocator, DEFAULT_CAPACITY, 0, &shared_context);
+        let table = HashTable::new(&mut allocator, DEFAULT_CAPACITY, 0, &shared_context);
         Self {
             hash_state,
             shared_context,
@@ -496,7 +495,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         let next_size = self.tables.last().unwrap().capacity() * 4;
         // Hash-only keys have no persisted key to scatter.
         if K::DEDUP_BY_HASH || next_size <= self.radix_config.switch_threshold {
-            self.tables.push(BaseHashTable::new(
+            self.tables.push(HashTable::new(
                 &mut self.allocator,
                 next_size,
                 0,
@@ -679,7 +678,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
 /// for separate stack frames and register allocation.
 struct ProbeWindow<'a, 'b, K: KeyExtractor, V: AggregationValue + ?Sized, const INLINE_PROBE: bool>
 {
-    table: &'a mut MultiSlabTable<K::Persisted, V>,
+    table: &'a mut HashTable<K::Persisted, V>,
     key_arena: &'a mut WorkerArena,
     worker_context: &'a mut V::WorkerContext,
     hashes: &'a [u64; RECORD_BATCH_SIZE],
@@ -750,7 +749,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized, const INLINE_PROBE: bool> Ar
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn probe_rows_outlined<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
-    table: &mut MultiSlabTable<K::Persisted, V>,
+    table: &mut HashTable<K::Persisted, V>,
     key_arena: &mut WorkerArena,
     worker_context: &mut V::WorkerContext,
     hashes: &[u64; RECORD_BATCH_SIZE],
@@ -780,7 +779,7 @@ fn probe_rows_outlined<const N: usize, K: KeyExtractor, V: AggregationValue + ?S
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn probe_rows_body<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
-    table: &mut MultiSlabTable<K::Persisted, V>,
+    table: &mut HashTable<K::Persisted, V>,
     key_arena: &mut WorkerArena,
     worker_context: &mut V::WorkerContext,
     hashes: &[u64; RECORD_BATCH_SIZE],

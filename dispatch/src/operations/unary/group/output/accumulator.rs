@@ -17,13 +17,13 @@ use crate::memory::{
 };
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::arena::SharedArena;
-use crate::operations::unary::group::hashtables::Table;
 use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor};
 use crate::operations::unary::group::output::topk_pruning::{TopKThreshold, TopKWeight};
 use crate::operations::unary::group::values::{
     AggregationValue, ValueColumnBuilder, WorkerContext, cast_value_column,
 };
 
+use crate::operations::unary::group::hashtables::HashTable;
 use crate::operations::unary::group::{GroupLimit, Result};
 
 /// Maximum rows whose widest fixed-width column fits in one slab.
@@ -71,7 +71,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> TopKHeap<K, V> {
 fn offer_all<K, V, A>(
     heap: &mut SlabTopK<V::SortKey, (K::Persisted, V::Owned), A>,
     slot: usize,
-    table: &Table<K::Persisted, V>,
+    table: &HashTable<K::Persisted, V>,
     allocator: &mut SlabAllocator,
     context: &V::SharedContext,
     owned_context: &mut Option<V::WorkerContext>,
@@ -213,7 +213,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
         /// selects the CPU tier at runtime.
         pub(crate) fn extend_from_table(
             &mut self,
-            table: Table<K::Persisted, V>,
+            table: HashTable<K::Persisted, V>,
             allocator: &mut SlabAllocator,
             sender: &mut dyn Sender<RecordBatch>,
         ) -> Result<()> {

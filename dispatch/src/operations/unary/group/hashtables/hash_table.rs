@@ -1,6 +1,6 @@
 //! Open-addressing hash table with linear probing, optimized for GROUP BY.
 //!
-//! See [`BaseHashTable`] for the full design rationale.
+//! See [`HashTable`] for the full design rationale.
 
 use crate::memory::{BUFFER_SIZE, Slab, SlabAllocator};
 use crate::operations::unary::group::arena::SharedArena;
@@ -244,7 +244,7 @@ fn prefetch_l2_line(ptr: *const u8) {
 ///
 /// This lets one merge job scan only its ranges. Storing the full hash also
 /// avoids hashing large keys again during resize and merge.
-pub struct BaseHashTable<K: PersistedKey, V: AggregationValue + ?Sized> {
+pub struct HashTable<K: PersistedKey, V: AggregationValue + ?Sized> {
     slot_mask: usize,
     slot_shift: u32,
     collisions: usize,
@@ -273,9 +273,9 @@ pub struct BaseHashTable<K: PersistedKey, V: AggregationValue + ?Sized> {
     _phantom: PhantomData<(K, *const V)>,
 }
 
-unsafe impl<K: PersistedKey, V: AggregationValue + ?Sized> Send for BaseHashTable<K, V> {}
+unsafe impl<K: PersistedKey, V: AggregationValue + ?Sized> Send for HashTable<K, V> {}
 
-impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
+impl<K: PersistedKey, V: AggregationValue + ?Sized> HashTable<K, V> {
     /// Creates a zeroed table with power-of-two capacity.
     pub fn new(
         allocator: &mut SlabAllocator,
@@ -287,7 +287,7 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
         let layout = entry_layout::<K, V>(storage_metadata);
         let entries_per_slab = BUFFER_SIZE / layout.stride;
         let slabs = allocator.create_strided_slabs(expected_capacity, layout.stride, layout.align);
-        BaseHashTable {
+        HashTable {
             slot_mask: expected_capacity - 1,
             length: 0,
             max_load: max_load_for_len(expected_capacity),
@@ -488,7 +488,7 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
 
 /// Mutable table handle that keeps the probe reader local across many probes.
 pub struct Prober<'t, K: PersistedKey, V: AggregationValue + ?Sized> {
-    table: &'t mut BaseHashTable<K, V>,
+    table: &'t mut HashTable<K, V>,
     reader: TableReader<'t, K, V>,
 }
 
@@ -508,7 +508,7 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
         prefetch_l2_line(self.reader.entry_ptr(self.reader.slot_for(hash)) as *const u8);
     }
 
-    /// See [`BaseHashTable::undersized`].
+    /// See [`HashTable::undersized`].
     #[inline(always)]
     pub fn undersized(&self) -> bool {
         self.table.undersized()
@@ -624,7 +624,7 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
 
 /// An iterator over the non-empty entries in a `BaseHashTable`.
 ///
-/// Created by [`BaseHashTable::iter`]. Yields [`EntryView`]s of entries where
+/// Created by [`HashTable::iter`]. Yields [`EntryView`]s of entries where
 /// `hash != 0` in arbitrary order (based on slot positions, not insertion order).
 pub struct HashTableIterator<'a, K: PersistedKey, V: AggregationValue + ?Sized> {
     reader: TableReader<'a, K, V>,
@@ -730,10 +730,10 @@ mod tests {
         }
     }
 
-    type TestTable = BaseHashTable<u64, Count>;
+    type TestTable = HashTable<u64, Count>;
 
     fn new_table(allocator: &mut SlabAllocator, capacity: usize) -> TestTable {
-        BaseHashTable::new(allocator, capacity, 0, &())
+        HashTable::new(allocator, capacity, 0, &())
     }
 
     #[test]

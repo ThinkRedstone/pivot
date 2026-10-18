@@ -4,7 +4,7 @@ use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, KeyExtractor, MultiSlabTable, PartitionBuffers,
+    AggregationValue, HashTable, KeyExtractor, PartitionBuffers,
 };
 use crate::operations::unary::group::output::accumulator::{OutputAccumulator, emit_count};
 use crate::operations::unary::group::output::merge;
@@ -21,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 /// workers' in-place stacks.
 pub(super) type NodeSources<K, V> = (
     Vec<PartitionBuffers<<K as KeyExtractor>::Persisted, V>>,
-    Vec<MultiSlabTable<<K as KeyExtractor>::Persisted, V>>,
+    Vec<HashTable<<K as KeyExtractor>::Persisted, V>>,
 );
 
 /// Everything the partition jobs of one merge share, built once by
@@ -109,7 +109,7 @@ unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for PartitionJob
 /// and no job ever waits: the mailbox is a lock-free queue and the election
 /// is one atomic countdown.
 pub(super) struct CrossNodeMerge<K: KeyExtractor, V: AggregationValue + ?Sized> {
-    node_tables: Injector<MultiSlabTable<K::Persisted, V>>,
+    node_tables: Injector<HashTable<K::Persisted, V>>,
     /// Sends still outstanding; the sender that decrements this to zero is
     /// the receiver.
     pending_sends: AtomicUsize,
@@ -132,10 +132,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> CrossNodeMerge<K, V> {
     /// decrement observes all of them, so the drain below is guaranteed to
     /// see every node's table (and after the election nobody else touches
     /// the queue).
-    fn send(
-        &self,
-        table: MultiSlabTable<K::Persisted, V>,
-    ) -> Option<Vec<MultiSlabTable<K::Persisted, V>>> {
+    fn send(&self, table: HashTable<K::Persisted, V>) -> Option<Vec<HashTable<K::Persisted, V>>> {
         self.node_tables.push(table);
         if self.pending_sends.fetch_sub(1, Ordering::AcqRel) != 1 {
             return None;

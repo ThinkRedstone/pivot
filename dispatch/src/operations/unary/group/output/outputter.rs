@@ -7,8 +7,8 @@ use crate::operations::unary;
 use crate::operations::unary::group::GroupLimit;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{
-    AggregatedTableOutput, AggregationValue, DEFAULT_CAPACITY, KeyExtractor, MAX_LOAD_FACTOR,
-    MultiSlabTable, PartitionBuffers, entry_stride,
+    AggregatedTableOutput, AggregationValue, DEFAULT_CAPACITY, HashTable, KeyExtractor,
+    MAX_LOAD_FACTOR, PartitionBuffers, entry_stride,
 };
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::output::accumulator::{OutputAccumulator, emit_count};
@@ -141,7 +141,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // We get worker count by outputs.len() since we don't have access here to the topology
         let worker_count = outputs.len();
         let node_count = self.injectors.len();
-        let mut tables_by_node: Vec<Vec<MultiSlabTable<K::Persisted, V>>> =
+        let mut tables_by_node: Vec<Vec<HashTable<K::Persisted, V>>> =
             (0..node_count).map(|_| Vec::new()).collect();
         let mut buffers_by_node: Vec<Vec<PartitionBuffers<K::Persisted, V>>> =
             (0..node_count).map(|_| Vec::new()).collect();
