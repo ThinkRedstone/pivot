@@ -35,6 +35,8 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
+# The worker memory pool a unit test installs to run a filter's row selection off a worker.
+dispatch = { workspace = true, features = ["test-util"] }
 # The Parquet reader, for integration tests that plan over a real on-disk table.
 parquet-engine = { workspace = true }
 # `variant_experimental` so `ArrowWriter` stamps the VARIANT logical type on an
