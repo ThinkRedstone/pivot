@@ -1,6 +1,6 @@
 //! Hash tables used by grouped aggregation.
 //!
-//! [`Table`] stores one key and aggregation value per group.
+//! [`HashTable`] stores one key and aggregation value per group.
 //! [`AggregatedTable`] owns the tables built by a single worker and decides
 //! when to partition them for parallel merging.
 
