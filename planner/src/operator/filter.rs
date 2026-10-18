@@ -141,6 +141,7 @@ impl RowSelector {
     ) -> RowSelection {
         let mut current = batch.clone();
         let mut has_input_row_map = false;
+        let mut selected_count = 0;
         self.condition_mask.reset();
         for (i, (eval, &later_kernels)) in self
             .eval_fns
@@ -151,7 +152,7 @@ impl RowSelector {
             let result = eval(&current);
             let (arr, _) = result.as_datum().get();
             let mask = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
-            let selected_count = self.condition_mask.intersect(mask, current.num_rows());
+            selected_count = self.condition_mask.intersect(mask, current.num_rows());
             if selected_count == 0 {
                 selected_indices.clear();
                 return RowSelection::Indices;
@@ -218,6 +219,12 @@ impl RowSelector {
         // kernels left to run), and every remaining condition
         // reactivates the mask.
         debug_assert!(self.condition_mask.is_active());
+        // Every row passed, so there are no positions to list: the batch goes
+        // through untouched. Only known without a shrink, whose count is of
+        // the compacted rows.
+        if !has_input_row_map && selected_count == batch.num_rows() {
+            return RowSelection::All;
+        }
         // Report the selected rows as positions in the input batch.
         if has_input_row_map {
             self.condition_mask
@@ -453,6 +460,25 @@ mod tests {
     fn batch_of_a(values: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.to_vec()))]).unwrap()
+    }
+
+    #[rstest]
+    fn a_batch_every_row_of_which_passes_is_reported_whole(mut testing_planner: TestingPlanner) {
+        init_test_free_pool(4);
+        let mut selector = selector_of(
+            &mut testing_planner,
+            "SELECT a FROM example_table WHERE a > 0",
+        );
+        let mut positions = Vec::new();
+
+        let selection = selector.select(
+            &batch_of_a(&[1, 2, 3]),
+            &mut SlabAllocator::new(false),
+            &mut positions,
+        );
+
+        assert!(matches!(selection, RowSelection::All));
+        assert!(positions.is_empty());
     }
 
     #[rstest]
