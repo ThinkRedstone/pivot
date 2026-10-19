@@ -210,7 +210,7 @@ To print each statement's execution stats, set `pivot_stats`. See
 [`SET` and `RESET`](/docs/reference/statements/set-reset/).
 
 ```sql
-SET pivot_stats = on;
+SET pivot_stats = true;
 ```
 
 ### Keyboard shortcuts

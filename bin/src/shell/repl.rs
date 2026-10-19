@@ -24,7 +24,7 @@ Shell commands:
   \\h, \\help         show this help
 
 Session settings:
-  SET pivot_stats = on;    print each statement's execution stats
+  SET pivot_stats = true;    print each statement's execution stats
   RESET pivot_stats;       stop printing them
 ";
 
