@@ -23,10 +23,10 @@ use datastore_iceberg::{IcebergCatalogConfig, IcebergDatastore};
 use dispatch::{DataFlowDispatcher, Dispatch};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::spec::{
-    DataFile, DataFileFormat, Datum, FormatVersion, Literal, ManifestList, ManifestListWriter,
-    ManifestWriterBuilder, NestedField, NestedFieldRef, Operation, PartitionKey, PrimitiveLiteral,
-    PrimitiveType, Schema, Snapshot, SnapshotReference, SnapshotRetention, Struct, Summary,
-    Transform, Type, UnboundPartitionSpec,
+    DataFile, DataFileFormat, Datum, FormatVersion, Literal, Manifest, ManifestContentType,
+    ManifestList, ManifestListWriter, ManifestWriterBuilder, NestedField, NestedFieldRef,
+    Operation, PartitionKey, PrimitiveLiteral, PrimitiveType, Schema, Snapshot, SnapshotReference,
+    SnapshotRetention, Struct, Summary, Transform, Type, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -47,7 +47,9 @@ use object_storage::{
 use parquet::file::properties::WriterProperties;
 use planner::Planner;
 use planner::catalog::SchemaQualifiedTableName;
-use testcontainers::core::{ContainerPort, Host, IntoContainerPort, WaitFor};
+use testcontainers::core::{
+    CmdWaitFor, ContainerPort, ExecCommand, Host, IntoContainerPort, Mount, WaitFor,
+};
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, GenericImage, ImageExt};
 
@@ -61,6 +63,13 @@ const WAREHOUSE: &str = "s3://pivot-it/iceberg-warehouse";
 const REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 /// How long a test waits for a refresh to show a change before giving up.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
+/// The Spark that writes what the iceberg crate's writer cannot, and the
+/// Iceberg it loads; the Spark major and Scala version are in the
+/// runtime's name.
+const SPARK_IMAGE_TAG: &str = "3.5.9";
+const ICEBERG_VERSION: &str = "1.10.1";
+/// The Docker volume Spark's Maven downloads are kept in between runs.
+const SPARK_IVY_VOLUME: &str = "pivot-tests-spark-ivy";
 
 /// The REST fixture, the writer's view of it, and the pool the reads run on.
 /// One per test binary. Tests serialize their use of the catalog because a
@@ -403,13 +412,24 @@ impl Harness {
             )
             .build_v2_data();
             for manifest_file in list.entries() {
-                let manifest = manifest_file.load_manifest(file_io).await.unwrap();
+                let manifest_bytes = file_io
+                    .new_input(&manifest_file.manifest_path)
+                    .unwrap()
+                    .read()
+                    .await
+                    .unwrap();
+                let manifest = Manifest::parse_avro(&manifest_bytes).unwrap();
                 for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                    // An added entry inherits the sequence numbers of its manifest.
                     writer
                         .add_delete_file(
                             entry.data_file().clone(),
-                            entry.sequence_number().unwrap(),
-                            entry.file_sequence_number,
+                            entry
+                                .sequence_number()
+                                .unwrap_or(manifest_file.sequence_number),
+                            entry
+                                .file_sequence_number
+                                .or(Some(manifest_file.sequence_number)),
                         )
                         .unwrap();
                 }
@@ -482,6 +502,113 @@ impl Harness {
         .expect("commit the compaction");
     }
 
+    /// The current snapshot's manifest list.
+    fn manifest_list(&self, namespace: &NamespaceIdent, table: &str) -> ManifestList {
+        let loaded = self.load(namespace, table);
+        let metadata = loaded.metadata();
+        let current = metadata
+            .current_snapshot()
+            .expect("a table with data has a snapshot");
+        self.block_on(async {
+            let bytes = loaded
+                .file_io()
+                .new_input(current.manifest_list())
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            ManifestList::parse_with_version(&bytes, metadata.format_version()).unwrap()
+        })
+    }
+
+    /// Run `sql` against the catalog with Spark, the reference Iceberg
+    /// writer, in a container of its own: what an engine writing the table
+    /// does, for the operations the iceberg crate's writer lacks. The catalog
+    /// is registered as `c` and is the default, so `sql` names tables as
+    /// `namespace.table`. Spark fetches the Iceberg runtime from Maven into
+    /// a Docker volume that outlives the container, so only the first run on
+    /// a machine downloads it.
+    fn spark_sql(&self, sql: &str) {
+        let host_port = |uri: &str| {
+            url::Url::parse(uri)
+                .unwrap()
+                .port()
+                .expect("a harness endpoint names its port")
+        };
+        let catalog_port = host_port(&self.catalog_uri);
+        let minio_port = host_port(&std::env::var("AWS_ENDPOINT_URL").unwrap());
+        let spark = GenericImage::new("apache/spark", SPARK_IMAGE_TAG)
+            .with_entrypoint("sleep")
+            .with_cmd(["infinity"])
+            .with_host("host.docker.internal", Host::HostGateway)
+            .with_mount(Mount::volume_mount(SPARK_IVY_VOLUME, "/ivy"))
+            // A new volume is root's; the image's own user could not fill it.
+            .with_user("root")
+            .with_working_dir("/tmp")
+            .start()
+            .expect("start Spark");
+        let catalog = |setting: &str, value: String| {
+            [
+                "--conf".to_string(),
+                format!("spark.sql.catalog.c{setting}={value}"),
+            ]
+        };
+        let mut command = vec![
+            "/opt/spark/bin/spark-sql".to_string(),
+            "--master".to_string(),
+            "local[2]".to_string(),
+            "--packages".to_string(),
+            format!(
+                "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{ICEBERG_VERSION},org.apache.iceberg:iceberg-aws-bundle:{ICEBERG_VERSION}"
+            ),
+            "--conf".to_string(),
+            "spark.jars.ivy=/ivy".to_string(),
+            "--conf".to_string(),
+            "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
+                .to_string(),
+            "--conf".to_string(),
+            "spark.sql.defaultCatalog=c".to_string(),
+            "--conf".to_string(),
+            "spark.eventLog.enabled=false".to_string(),
+        ];
+        for (setting, value) in [
+            ("", "org.apache.iceberg.spark.SparkCatalog".to_string()),
+            (".type", "rest".to_string()),
+            (
+                ".uri",
+                format!("http://host.docker.internal:{catalog_port}"),
+            ),
+            (".io-impl", "org.apache.iceberg.aws.s3.S3FileIO".to_string()),
+            (
+                ".s3.endpoint",
+                format!("http://host.docker.internal:{minio_port}"),
+            ),
+            (".s3.path-style-access", "true".to_string()),
+            (
+                ".s3.access-key-id",
+                std::env::var("AWS_ACCESS_KEY_ID").unwrap(),
+            ),
+            (
+                ".s3.secret-access-key",
+                std::env::var("AWS_SECRET_ACCESS_KEY").unwrap(),
+            ),
+            (".client.region", std::env::var("AWS_REGION").unwrap()),
+        ] {
+            command.extend(catalog(setting, value));
+        }
+        command.extend(["-e".to_string(), sql.to_string()]);
+        let mut run = spark
+            .exec(ExecCommand::new(command).with_cmd_ready_condition(CmdWaitFor::exit()))
+            .expect("run spark-sql");
+        let exit_code = run.exit_code().unwrap();
+        assert_eq!(
+            exit_code,
+            Some(0),
+            "spark-sql failed:\n{}",
+            String::from_utf8_lossy(&run.stderr_to_vec().unwrap())
+        );
+    }
+
     /// Replace `table`'s current schema through the REST protocol, as an
     /// engine's `ALTER TABLE` does: the fixture assigns the new schema its id
     /// and makes it current in one commit.
@@ -549,14 +676,9 @@ impl Harness {
             properties,
             ..IcebergCatalogConfig::default()
         };
-        let datastore = IcebergDatastore::open(
-            DATASTORE,
-            &config,
-            store_factory,
-            self.dispatcher(),
-            REFRESH_INTERVAL,
-        )
-        .expect("open the iceberg datastore");
+        let datastore =
+            IcebergDatastore::open(&config, store_factory, self.dispatcher(), REFRESH_INTERVAL)
+                .expect("open the iceberg datastore");
         let catalog = PivotCatalog::new(
             HashMap::from([(DATASTORE.to_string(), datastore as Arc<dyn Datastore>)]),
             DATASTORE.to_string(),
@@ -801,6 +923,170 @@ fn string_column(batches: &[RecordBatch], column: usize) -> Vec<Option<String>> 
                 .map(|value| value.map(str::to_string))
         })
         .collect()
+}
+
+/// Spark deletes rows of a format version 3 table by deletion vector, a
+/// second delete merging into the first file's vector. The datastore leaves
+/// the deleted rows out of a scan, of the count and bounds it answers from
+/// metadata, and of a late-materialized read; the file holds several row
+/// groups, so the deletes land on more than one.
+#[test]
+fn rows_spark_deleted_by_deletion_vector_are_not_read() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.v3_namespace("dv", "orders", orders_schema());
+    let ids: Vec<i64> = (1..=10).collect();
+    let customers: Vec<String> = ids.iter().map(|id| format!("customer-{id}")).collect();
+    let customer_names: Vec<&str> = customers.iter().map(String::as_str).collect();
+    let amounts: Vec<f64> = ids.iter().map(|id| *id as f64).collect();
+    harness.append_in_row_groups(
+        &namespace,
+        "orders",
+        orders(&ids, &customer_names, &amounts),
+        4,
+    );
+    harness.spark_sql(
+        "ALTER TABLE dv.orders SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read');
+         DELETE FROM dv.orders WHERE id IN (2, 5, 10);
+         DELETE FROM dv.orders WHERE id = 6;",
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    let scanned = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM dv.orders ORDER BY id",
+    );
+    let counted = harness.query(&catalog, &mut planner, "SELECT COUNT(*) FROM dv.orders");
+    let bounded = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT MIN(id), MAX(id) FROM dv.orders",
+    );
+    let limited = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT customer FROM dv.orders LIMIT 3",
+    );
+
+    assert_eq!(
+        int64_column(&scanned, 0),
+        [Some(1), Some(3), Some(4), Some(7), Some(8), Some(9)]
+    );
+    assert_eq!(int64_column(&counted, 0), [Some(6)]);
+    assert_eq!(int64_column(&bounded, 0), [Some(1)]);
+    assert_eq!(int64_column(&bounded, 1), [Some(9)]);
+    let limited = string_column(&limited, 0);
+    assert_eq!(limited.len(), 3);
+    for customer in limited.into_iter().flatten() {
+        assert!(
+            !["customer-2", "customer-5", "customer-6", "customer-10"].contains(&customer.as_str()),
+            "{customer} was deleted"
+        );
+    }
+}
+
+/// Spark compacts a table deleted from by deletion vector: the rewritten
+/// file holds the live rows only and the vector is removed, which leaves a
+/// delete manifest with nothing live in the manifest list. The datastore
+/// reads the rewritten file with no vector applied.
+#[test]
+fn a_table_spark_compacted_after_its_deletion_vectors_reads_the_rewritten_file() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.v3_namespace("rewritten", "orders", orders_schema());
+    let ids: Vec<i64> = (1..=10).collect();
+    let customers: Vec<String> = ids.iter().map(|id| format!("customer-{id}")).collect();
+    let customer_names: Vec<&str> = customers.iter().map(String::as_str).collect();
+    let amounts: Vec<f64> = ids.iter().map(|id| *id as f64).collect();
+    harness.append_in_row_groups(
+        &namespace,
+        "orders",
+        orders(&ids, &customer_names, &amounts),
+        4,
+    );
+    harness.spark_sql(
+        "ALTER TABLE rewritten.orders SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read');
+         DELETE FROM rewritten.orders WHERE id IN (2, 5, 10);
+         CALL c.system.rewrite_data_files(table => 'rewritten.orders', options => map('rewrite-all', 'true'));",
+    );
+    let manifest_list = harness.manifest_list(&namespace, "orders");
+    let delete_manifests: Vec<_> = manifest_list
+        .entries()
+        .iter()
+        .filter(|manifest| manifest.content == ManifestContentType::Deletes)
+        .collect();
+    assert!(
+        !delete_manifests.is_empty()
+            && delete_manifests
+                .iter()
+                .all(|manifest| !manifest.has_added_files() && !manifest.has_existing_files()),
+        "the compaction leaves a delete manifest with nothing live: {delete_manifests:?}"
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    let scanned = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM rewritten.orders ORDER BY id",
+    );
+    let counted = harness.query(
+        &catalog,
+        &mut planner,
+        "SELECT COUNT(*) FROM rewritten.orders",
+    );
+
+    assert_eq!(
+        int64_column(&scanned, 0),
+        [
+            Some(1),
+            Some(3),
+            Some(4),
+            Some(6),
+            Some(7),
+            Some(8),
+            Some(9)
+        ]
+    );
+    assert_eq!(int64_column(&counted, 0), [Some(7)]);
+}
+
+/// Spark deletes from a table of format version 2 by position-delete file,
+/// which is not a deletion vector: the datastore refuses the scan and the
+/// count alike, naming the delete file, rather than reading the deleted row.
+#[test]
+fn a_table_with_a_position_delete_file_is_refused() {
+    let Some(harness) = harness() else { return };
+    let namespace = harness.namespace("legacy", "orders", orders_schema());
+    harness.append(
+        &namespace,
+        "orders",
+        orders(&[1, 2, 3], &["ann", "bob", "cy"], &[1.0, 2.0, 3.0]),
+    );
+    harness.spark_sql(
+        "ALTER TABLE legacy.orders SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read');
+         DELETE FROM legacy.orders WHERE id = 2;",
+    );
+    let (catalog, mut planner) = harness.pivot();
+
+    let scanned = harness.try_query(
+        &catalog,
+        &mut planner,
+        "SELECT id FROM legacy.orders ORDER BY id",
+    );
+    let counted = harness.try_query(&catalog, &mut planner, "SELECT COUNT(*) FROM legacy.orders");
+
+    assert_eq!(
+        harness
+            .load(&namespace, "orders")
+            .metadata()
+            .format_version(),
+        FormatVersion::V2
+    );
+    for error in [scanned.unwrap_err(), counted.unwrap_err()] {
+        assert!(
+            error.contains("is not a deletion vector") && error.contains(".parquet"),
+            "{error}"
+        );
+    }
 }
 
 #[test]

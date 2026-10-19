@@ -14,13 +14,17 @@ use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
 
 use crate::{IcebergCatalogAuth, IcebergCatalogConfig, Result};
 
-/// Build the client for the catalog `config` describes, registered as `name`.
-/// Nothing is sent yet: the client fetches the catalog's own configuration on
-/// its first call, so an unreachable catalog fails there, not here. The
-/// client's own storage layer is never used (every file is read through
-/// Pivot's ring), so it is given an in-memory storage factory that satisfies
-/// the requirement to have one.
-pub(crate) fn build_rest_catalog(name: &str, config: &IcebergCatalogConfig) -> Result<RestCatalog> {
+/// The name the client registers the catalog under: it requires one and
+/// never uses it, so every catalog gets this one.
+const CATALOG_NAME: &str = "pivot_catalog";
+
+/// Build the client for the catalog `config` describes. Nothing is sent yet:
+/// the client fetches the catalog's own configuration on its first call, so
+/// an unreachable catalog fails there, not here. The client's own storage
+/// layer is never used (every file is read through Pivot's ring), so it is
+/// given an in-memory storage factory that satisfies the requirement to have
+/// one.
+pub(crate) fn build_rest_catalog(config: &IcebergCatalogConfig) -> Result<RestCatalog> {
     let mut properties = config.properties.clone();
     properties.insert("uri".to_string(), config.uri.clone());
     // Ask the catalog to vend storage credentials with each table it loads. A
@@ -56,7 +60,7 @@ pub(crate) fn build_rest_catalog(name: &str, config: &IcebergCatalogConfig) -> R
     let catalog = block_on(async {
         RestCatalogBuilder::default()
             .with_storage_factory(Arc::new(MemoryStorageFactory))
-            .load(name, properties)
+            .load(CATALOG_NAME, properties)
             .await
     })
     .map_err(Box::new)?;

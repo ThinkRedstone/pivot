@@ -26,6 +26,7 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 crossbeam-deque = { workspace = true }
 ahash = { workspace = true }
+roaring = { workspace = true }
 snap = { workspace = true }
 # LZ4_RAW page decompression (the fork with scattered decode).
 lz4_flex = { workspace = true }

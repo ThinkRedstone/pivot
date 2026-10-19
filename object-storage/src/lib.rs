@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub mod file_injector;
+mod file_slice_injector;
 mod gcs;
 mod local;
 mod object_fetcher;
@@ -32,7 +33,7 @@ mod s3;
 pub mod test_support;
 pub use gcs::GcsStore;
 pub use local::LocalStore;
-pub use object_fetcher::{LoadedObject, load_objects};
+pub use object_fetcher::{FileSlice, LoadedObject, load_file_slices, load_objects};
 pub use object_path::ObjectPath;
 pub use s3::{S3Credentials, S3Keys, S3Store};
 
@@ -388,7 +389,10 @@ impl StoreScheme {
 /// The filesystem path a [local](StoreScheme::Local) location names: `file://`
 /// is an optional spelling of a plain path, not a backend of its own.
 pub fn local_path(uri: &str) -> &str {
-    uri.strip_prefix("file://").unwrap_or(uri)
+    // Java writes a local URI without the authority, as `file:/path`.
+    uri.strip_prefix("file://")
+        .or_else(|| uri.strip_prefix("file:"))
+        .unwrap_or(uri)
 }
 
 /// A remote backend's own token for one stored version of an object — an S3

@@ -23,10 +23,16 @@ tracing = { workspace = true }
 # from the blocking pool, or on a runtime of this crate's own when there is
 # none; the background refresh is a timer task on the ambient runtime.
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+# The bitmap type a decoded deletion vector hands over to the parquet engine.
+roaring = { workspace = true }
 # Spec metadata and the REST catalog client. Every
 # file is read through Pivot's ring and caches, not the catalog's storage layer.
-iceberg = "0.10.1"
-iceberg-catalog-rest = "0.10.1"
+# Pinned to our fork's branch off the 0.11.x release branch, the first with
+# the format version 3 deletion-vector work, plus the commits making its
+# `delete_vector` module public (apache/iceberg-rust#3461) and handing out a
+# vector's bitmap, until a release carries them.
+iceberg = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector" }
+iceberg-catalog-rest = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector" }
 # The REST client's reqwest carries no TLS backend of its own; a catalog behind
 # https needs one.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
@@ -36,7 +42,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # in Docker, backed by the MinIO the object-storage harness starts, and write
 # tables into it through the iceberg crate's own writer and S3 storage.
 object-storage = { workspace = true, features = ["test-support"] }
-iceberg-storage-opendal = { version = "0.10.1", default-features = false, features = ["opendal-s3"] }
+iceberg-storage-opendal = { git = "https://github.com/pivotlake/iceberg-rust", branch = "pivot/0.11.x-delete-vector", default-features = false, features = ["opendal-s3"] }
 testcontainers = { version = "0.24", features = ["blocking"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 parquet = { workspace = true }

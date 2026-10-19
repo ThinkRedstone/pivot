@@ -322,7 +322,6 @@ impl DiskMetastore {
                         PivotlakeDatastore::from_store(store, dispatcher, Some(maintenance))?
                     }
                     DatastoreConfig::Iceberg(config) => IcebergDatastore::open(
-                        name,
                         &config.catalog_config(name, &self.secrets)?,
                         self.external_store_factory(),
                         dispatcher,

@@ -158,6 +158,6 @@ impl BoundTable for IcebergTableBinding {
     }
 
     fn estimate_row_count(&self) -> Option<u64> {
-        self.table.row_count().map(|rows| rows as u64)
+        self.table.estimated_row_count().map(|rows| rows as u64)
     }
 }

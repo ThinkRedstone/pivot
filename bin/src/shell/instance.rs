@@ -277,7 +277,6 @@ fn open_datastore(
             )?)
         }
         ShellTarget::Iceberg(config) => Ok(IcebergDatastore::open(
-            DEFAULT_DATASTORE_NAME,
             config,
             Arc::new(AmbientExternalStoreFactory),
             dispatcher,

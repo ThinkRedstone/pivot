@@ -19,7 +19,7 @@ use std::sync::Arc;
 pub struct ReadRequestId(pub usize);
 
 /// One byte range requested from a file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileRange {
     pub offset: usize,
     pub len: usize,

@@ -111,7 +111,6 @@ fn refresh_succeeds_after_the_first_token_expires() {
         ..IcebergCatalogConfig::default()
     };
     let datastore = IcebergDatastore::open(
-        "polaris",
         &config,
         Arc::new(NoStoreFactory),
         dispatch.dispatcher(),

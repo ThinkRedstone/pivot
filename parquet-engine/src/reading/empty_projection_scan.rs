@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, RecordBatchOptions};
+use arrow_array::{RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow_schema::Schema;
 use crossbeam_deque::{Injector, Steal};
 use dispatch::{
@@ -22,7 +22,7 @@ use dispatch::{
 };
 
 use crate::RowGroupFilter;
-use crate::reading::record_batch_metadata::with_row_group_metadata;
+use crate::reading::record_batch_metadata::{with_row_group_metadata, with_row_group_positions};
 use crate::types::metadata::{QueryRowGroupMetadata, RowSelection};
 use crate::types::table::ParquetTable;
 
@@ -87,29 +87,110 @@ impl Nullary<RecordBatch> for EmptyProjectionScan {
         {
             return Ok(WorkStatus::Ran);
         }
-        let total = rg.num_rows() as usize;
-        let mut offset = 0;
-        while offset < total {
-            let chunk = (total - offset).min(RECORD_BATCH_SIZE);
-            // Zero data columns + an explicit row count; never fails.
-            let empty = RecordBatch::try_new_with_options(
+        // Zero data columns + an explicit row count; never fails.
+        let empty_rows = |rows: usize| {
+            RecordBatch::try_new_with_options(
                 Arc::new(Schema::empty()),
                 vec![],
-                &RecordBatchOptions::new().with_row_count(Some(chunk)),
+                &RecordBatchOptions::new().with_row_count(Some(rows)),
             )
-            .expect("empty batch");
-            let batch = if self.add_row_group_metadata {
-                with_row_group_metadata(empty, rg.index(), offset)
-            } else {
-                empty
-            };
-            sender.send(batch)?;
-            offset += chunk;
+            .expect("empty batch")
+        };
+        let metadata = rg.get_metadata();
+        match (&metadata.deleted_rows, self.add_row_group_metadata) {
+            // The surviving rows by position, since the deleted ones leave gaps.
+            (Some(_), true) => {
+                let positions: Vec<u32> = (0..metadata.num_rows as u32)
+                    .filter(|row| !metadata.is_deleted(*row))
+                    .collect();
+                for chunk in positions.chunks(RECORD_BATCH_SIZE) {
+                    let batch = with_row_group_positions(
+                        empty_rows(chunk.len()),
+                        rg.index(),
+                        UInt32Array::from(chunk.to_vec()),
+                    );
+                    sender.send(batch)?;
+                }
+            }
+            (deleted, add_row_group_metadata) => {
+                let total = metadata.live_rows() as usize;
+                let mut offset = 0;
+                while offset < total {
+                    let chunk = (total - offset).min(RECORD_BATCH_SIZE);
+                    let empty = empty_rows(chunk);
+                    let batch = if add_row_group_metadata {
+                        debug_assert!(deleted.is_none(), "deleted rows leave no consecutive run");
+                        with_row_group_metadata(empty, rg.index(), offset)
+                    } else {
+                        empty
+                    };
+                    sender.send(batch)?;
+                    offset += chunk;
+                }
+            }
         }
         Ok(WorkStatus::Ran)
     }
 
     fn finish(&mut self, _sender: &mut dyn Sender<RecordBatch>) -> NullaryResult<bool> {
         Ok(self.row_groups.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reading::record_batch_metadata::row_index;
+    use crate::test_utils::{deleted_rows, dummy_row_group};
+    use crate::types::metadata::RowGroupMetadata;
+    use dispatch::Dispatch;
+
+    /// A table of row groups holding `rows` rows each, with the `deleted`
+    /// rows of each marked deleted.
+    fn table_of_row_groups(rows: &[i64], deleted: &[&[u32]]) -> Arc<ParquetTable> {
+        let dummy = dummy_row_group();
+        let row_groups = rows
+            .iter()
+            .zip(deleted)
+            .enumerate()
+            .map(|(index, (rows, deleted))| {
+                Arc::new(RowGroupMetadata {
+                    num_rows: *rows,
+                    deleted_rows: deleted_rows(0, deleted),
+                    file_row_group_idx: index,
+                    ..(*dummy).clone()
+                })
+            })
+            .collect();
+        Arc::new(ParquetTable::new(row_groups))
+    }
+
+    #[test]
+    fn deleted_rows_are_left_out_of_the_count() {
+        let dispatch = Dispatch::spin_up(1, 32, None);
+        let table = table_of_row_groups(&[5, 4], &[&[1, 3], &[]]);
+
+        let batches = empty_projection_scan(dispatch.dispatcher(), &table, None, false)
+            .collect()
+            .unwrap();
+
+        let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(rows, 7);
+    }
+
+    #[test]
+    fn deleted_rows_leave_gaps_in_the_row_indices() {
+        let dispatch = Dispatch::spin_up(1, 32, None);
+        let table = table_of_row_groups(&[5], &[&[1, 3]]);
+
+        let batches = empty_projection_scan(dispatch.dispatcher(), &table, None, true)
+            .collect()
+            .unwrap();
+
+        let positions: Vec<u32> = batches
+            .iter()
+            .flat_map(|batch| row_index(batch).values().to_vec())
+            .collect();
+        assert_eq!(positions, vec![0, 2, 4]);
     }
 }

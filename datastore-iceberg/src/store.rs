@@ -202,6 +202,14 @@ mod tests {
     }
 
     #[test]
+    fn a_local_location_without_an_authority_is_keyed_the_same() {
+        let (root, key) = split_location("file:/tmp/warehouse/f.parquet").unwrap();
+
+        assert_eq!(root, "/");
+        assert_eq!(key.as_str(), "tmp/warehouse/f.parquet");
+    }
+
+    #[test]
     fn an_unknown_scheme_is_refused() {
         let error = split_location("hdfs://namenode/warehouse/f.parquet").unwrap_err();
 

@@ -542,10 +542,12 @@ fn a_manifest_is_pruned_by_the_partition_summaries_of_its_own_spec() {
     let selected = list.select(&before_day_18263).unwrap();
 
     let paths: Vec<_> = selected
+        .data
         .iter()
         .map(|manifest| &manifest.manifest_path)
         .collect();
     let lengths: Vec<_> = selected
+        .data
         .iter()
         .map(|manifest| manifest.manifest_length)
         .collect();
@@ -559,7 +561,43 @@ fn a_manifest_is_pruned_by_the_partition_summaries_of_its_own_spec() {
         ]
     );
     assert_eq!(lengths, [100, 103, 104, 105]);
-    assert_eq!(list.select(&[]).unwrap().len(), 7);
+    assert_eq!(list.select(&[]).unwrap().data.len(), 7);
+}
+
+#[test]
+fn delete_manifests_are_listed_apart_and_pruned_like_data_manifests() {
+    let metadata = evolved_table();
+    let integer = |value: i32| summary(Some(value.to_le_bytes().to_vec()));
+    let mut deletes_of_day_18263 = manifest_entry(1, 1, Some(vec![integer(18_263)]));
+    deletes_of_day_18263.content = ManifestContentType::Deletes;
+    let mut deletes_of_day_18262 = manifest_entry(1, 3, Some(vec![integer(18_262)]));
+    deletes_of_day_18262.content = ManifestContentType::Deletes;
+    let manifests = vec![
+        manifest_entry(3, 0, None),
+        deletes_of_day_18263,
+        deletes_of_day_18262,
+    ];
+    let list = ManifestList::new(&metadata, manifests).unwrap();
+    let before_day_18263 = predicate(
+        CompareType::Less,
+        Arc::new(TimestampMicrosecondArray::from(vec![
+            18_263 * 86_400_000_000_i64,
+        ])),
+    );
+
+    let selected = list.select(&before_day_18263).unwrap();
+
+    let paths = |manifests: &[&ManifestFile]| -> Vec<String> {
+        manifests
+            .iter()
+            .map(|manifest| manifest.manifest_path.clone())
+            .collect()
+    };
+    assert_eq!(paths(&selected.data), ["manifest-0.avro"]);
+    assert_eq!(paths(&selected.deletes), ["manifest-3.avro"]);
+    assert_eq!(list.data_manifests().count(), 1);
+    assert_eq!(list.delete_manifests().count(), 2);
+    assert_eq!(list.row_count(), Some(3));
 }
 
 #[test]
@@ -581,6 +619,26 @@ fn the_row_count_is_known_only_when_every_manifest_counts_its_rows() {
     assert_eq!(row_count(&uncounted), None);
     assert_eq!(row_count(&overflowing), None);
     assert_eq!(row_count(&[]), Some(0));
+}
+
+#[test]
+fn the_estimated_row_count_discounts_the_delete_manifests_row_totals() {
+    let metadata = evolved_table();
+    let mut deletes = manifest_entry(1, 1, None);
+    deletes.content = ManifestContentType::Deletes;
+    let mut too_many_deletes = deletes.clone();
+    too_many_deletes.added_rows_count = Some(100);
+    let data = manifest_entry(1, 6, None);
+
+    let estimate = |manifests: Vec<ManifestFile>| {
+        ManifestList::new(&metadata, manifests)
+            .unwrap()
+            .estimated_row_count()
+    };
+
+    assert_eq!(estimate(vec![data.clone(), deletes]), Some(5));
+    assert_eq!(estimate(vec![data.clone(), too_many_deletes]), Some(0));
+    assert_eq!(estimate(vec![data]), Some(9));
 }
 
 #[test]
@@ -899,6 +957,7 @@ fn a_manifest_of_a_spec_the_table_does_not_list_is_kept() {
     let selected = list.select(&before_day_18263).unwrap();
 
     let paths: Vec<_> = selected
+        .data
         .iter()
         .map(|manifest| &manifest.manifest_path)
         .collect();

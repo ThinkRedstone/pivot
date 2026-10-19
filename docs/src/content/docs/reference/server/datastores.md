@@ -131,6 +131,9 @@ Table files are read from the locations the catalog reports, using the
 credentials the catalog vends, or the [storage secret](#storage-credentials)
 whose scope covers the file when it vends none.
 
+Format version 3 deletion vectors are supported. A table carrying any other
+kind of delete file is refused rather than read with the deleted rows present.
+
 If the catalog becomes unreachable, the datastore keeps serving the tables it
 last loaded and retries on the next [refresh](#refresh).
 

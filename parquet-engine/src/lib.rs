@@ -92,6 +92,7 @@ pub(crate) mod test_utils {
     use crate::types::table::ParquetTable;
     use arrow_schema::Schema;
     use dispatch::io::{LocalFile, OpenFile};
+    use roaring::RoaringTreemap;
     use std::sync::Arc;
 
     pub fn dummy_row_group() -> Arc<RowGroupMetadata> {
@@ -103,8 +104,24 @@ pub(crate) mod test_utils {
             columns: vec![],
             statistics: Arc::default(),
             num_rows: 0,
+            file_row_offset: 0,
+            deleted_rows: None,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    /// The `deleted` rows, by position in the row group starting at the
+    /// file's `file_row_offset`, as the row group's deleted rows; `None` when
+    /// there are none.
+    pub fn deleted_rows(file_row_offset: u64, deleted: &[u32]) -> Option<Arc<RoaringTreemap>> {
+        (!deleted.is_empty()).then(|| {
+            Arc::new(
+                deleted
+                    .iter()
+                    .map(|row| file_row_offset + *row as u64)
+                    .collect(),
+            )
         })
     }
 

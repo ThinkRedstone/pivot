@@ -23,9 +23,10 @@
 //! # Reading through the ring
 //!
 //! Manifest lists and manifests are read as whole objects over the io_uring
-//! ring ([`object_storage::load_objects`]), so they pass through the
-//! compressed cache and the disk cache exactly as data does: a restarted server
-//! finds them on local disk. A filtered query reads only the manifests whose
+//! ring ([`object_storage::load_objects`]), and deletion vectors as their
+//! blob's range of its Puffin file, so they pass through the compressed cache
+//! and the disk cache exactly as data does: a restarted server finds them on
+//! local disk. A filtered query reads only the manifests whose
 //! partition summaries admit its predicates, and only the footers of the files
 //! whose partition values and column bounds do. Data files are Parquet, read
 //! by the same engine that reads every other datastore, with row-group
@@ -57,12 +58,14 @@
 //!
 //! A table is refused, with an error naming the reason, rather than served
 //! partially or wrongly: encryption, a snapshot that carries delete files
-//! (row-level deletes are not applied), data files that are not Parquet, and a
-//! column whose Iceberg type has no Pivot type or whose initial default would
-//! require synthesizing values for older files.
+//! other than deletion vectors (position-delete and equality-delete files are
+//! not applied), data files that are not Parquet, and a column whose Iceberg
+//! type has no Pivot type or whose initial default would require synthesizing
+//! values for older files.
 
 mod binding;
 mod columns;
+mod deletes;
 mod describe;
 pub mod env;
 mod manifests;
@@ -168,9 +171,11 @@ pub enum Error {
         default: String,
     },
     #[error(
-        "table `{table}` carries delete files in its current snapshot (manifest `{manifest}`); row-level deletes are not applied, so the table is not served"
+        "delete file `{file}` is not a deletion vector; only deletion vectors are applied, so the table is not served"
     )]
-    DeleteFiles { table: String, manifest: String },
+    DeleteFile { file: String },
+    #[error("the deletion vector for `{file}` is invalid: {message}")]
+    DeletionVector { file: String, message: String },
     #[error("table `{table}` data file `{file}` is {format}; only Parquet data files are read")]
     NonParquetFile {
         table: String,
@@ -185,9 +190,8 @@ pub enum Error {
         #[source]
         source: Box<iceberg::Error>,
     },
-    #[error("table `{table}` metadata object `{path}` does not parse: {source}")]
+    #[error("metadata object `{path}` does not parse: {source}")]
     MalformedMetadataObject {
-        table: String,
         path: String,
         #[source]
         source: Box<iceberg::Error>,
@@ -220,16 +224,13 @@ impl From<Error> for CatalogError {
 
 /// The tables of one REST catalog, as the catalog last reported them.
 pub struct IcebergDatastore {
-    /// The REST catalog: the source of truth for what exists and where each
-    /// table's current metadata lives, asked at open and at every refresh.
-    /// Its calls are async and are blocked on from the calling thread
-    /// ([`block_on`]).
-    catalog: RestCatalog,
-    /// Whether the catalog is authenticated to with an OAuth2 credential. The
-    /// client caches the token it exchanges the credential for and never
-    /// renews it, so each refresh exchanges the credential again before the
-    /// catalog's tokens can expire.
-    exchanges_credential: bool,
+    /// What the REST catalog client is built from: the catalog is the source
+    /// of truth for what exists and where each table's current metadata
+    /// lives, asked at open and at every refresh, each through a client of
+    /// its own. A client exchanges an OAuth2 credential for a token on its
+    /// first request and never renews it, so none is kept past its refresh,
+    /// and the catalog's tokens never expire on one.
+    config: IcebergCatalogConfig,
     /// The catalog's URI, which stands in for a data path: every file location
     /// a table reports is absolute.
     catalog_uri: String,
@@ -314,23 +315,19 @@ impl std::fmt::Debug for IcebergDatastore {
 impl IcebergDatastore {
     /// Open the datastore over the catalog `config` describes, fetching every
     /// table it holds; a catalog that cannot be reached fails the open, as a
-    /// store that cannot be read fails a pivotlake datastore's. `name` is what the
-    /// REST client registers the catalog as, which it requires;
+    /// store that cannot be read fails a pivotlake datastore's.
     /// `store_factory` opens the object stores the tables' files live in, so
     /// their credentials follow the same policy as every other datastore's;
     /// `refresh_interval` is how often the catalog is asked again once
     /// [`start`](Datastore::start) is called.
     pub fn open(
-        name: &str,
         config: &IcebergCatalogConfig,
         store_factory: Arc<dyn ExternalStoreFactory>,
         dispatcher: &DataFlowDispatcher,
         refresh_interval: Duration,
     ) -> Result<Arc<Self>> {
-        let catalog = build_rest_catalog(name, config)?;
         let datastore = Self {
-            catalog,
-            exchanges_credential: matches!(config.auth, Some(IcebergCatalogAuth::OAuth2 { .. })),
+            config: config.clone(),
             catalog_uri: config.uri.clone(),
             store_factory,
             dispatcher: dispatcher.clone(),
@@ -342,27 +339,25 @@ impl IcebergDatastore {
         Ok(Arc::new(datastore))
     }
 
-    /// Ask the catalog for everything it holds and replace the index with the
-    /// answer, first exchanging the OAuth2 credential for a fresh token when
-    /// there is one. A failure leaves the index (and the token) as it was.
+    /// Ask the catalog, through a client built for the occasion, for
+    /// everything it holds and replace the index with the answer. A failure
+    /// leaves the index as it was.
     pub fn refresh(&self) -> Result<()> {
-        if self.exchanges_credential {
-            block_on(self.catalog.regenerate_token()).map_err(Box::new)?;
-        }
-        let fetched = self.fetch_index()?;
+        let catalog = build_rest_catalog(&self.config)?;
+        let fetched = self.fetch_index(&catalog)?;
         *self.index.write().unwrap() = Arc::new(fetched);
         Ok(())
     }
 
-    /// The index as the catalog would have it now: a schema per top-level
+    /// The index as `catalog` would have it now: a schema per top-level
     /// namespace, and every table of theirs. Namespaces nested below the top
     /// level are not schemas of this datastore and are not listed.
-    fn fetch_index(&self) -> Result<DatastoreIndex> {
+    fn fetch_index(&self, catalog: &RestCatalog) -> Result<DatastoreIndex> {
         let previous = self.index();
         let mut index = DatastoreIndex::default();
-        let namespaces = block_on(self.catalog.list_namespaces(None)).map_err(Box::new)?;
+        let namespaces = block_on(catalog.list_namespaces(None)).map_err(Box::new)?;
         for namespace in namespaces {
-            let listed = block_on(self.catalog.list_tables(&namespace)).map_err(Box::new)?;
+            let listed = block_on(catalog.list_tables(&namespace)).map_err(Box::new)?;
             // Listed under no parent, the namespace is a top-level one: a
             // single identifier, which is its schema name.
             let schema = namespace
@@ -372,7 +367,7 @@ impl IcebergDatastore {
             let mut tables = HashMap::new();
             for ident in listed {
                 let name = SchemaQualifiedTableName::new(schema.clone(), ident.name.clone());
-                let entry = match block_on(self.catalog.load_table(&ident)) {
+                let entry = match block_on(catalog.load_table(&ident)) {
                     Ok(table) => self
                         .build_table_entry(&name, table, previous.table_entry(&name))
                         .map_err(|error| error.to_string()),

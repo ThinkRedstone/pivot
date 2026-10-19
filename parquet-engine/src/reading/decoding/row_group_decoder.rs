@@ -11,13 +11,14 @@ use crate::reading::decoding::ScanEqualityPredicate;
 use crate::reading::decoding::column_decoder::{ColumnDecoder, Error, Result, create_leaf_decoder};
 use crate::reading::decoding::leaf_decoders::LeafDecoder;
 use crate::reading::range_cutter::row_group_pages::{DecodeRange, PageContent, StoredPage};
-use crate::reading::record_batch_metadata::with_row_group_metadata;
+use crate::reading::record_batch_metadata::with_row_index;
 use crate::types::filter_mask::FilterMask;
 use crate::types::leaves::{leaf_fields, plan_leaves, resolve_output_reads};
 use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowSelection};
 use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
 use crate::types::projection::Projection;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_schema::{FieldRef, Fields, Schema, SchemaRef};
 use dispatch::memory::SlabAllocator;
 use std::cmp::min;
@@ -138,6 +139,13 @@ impl DecodePlan {
     }
 }
 
+/// A batch of a row group's rows, and, when the table format deleted any of
+/// them, a bit per row of the batch set for the rows it left live.
+pub struct DecodedBatch {
+    pub batch: RecordBatch,
+    pub live_rows: Option<BooleanBuffer>,
+}
+
 /// Decodes the ranges of a single row group into [`RecordBatch`]es.
 pub struct RowGroupDecoder {
     metadata: QueryRowGroupMetadata,
@@ -151,6 +159,9 @@ pub struct RowGroupDecoder {
     end_row: usize,
     /// The range being decoded.
     range: Option<DecodeRange>,
+    /// One bit per row of the attached range, set for the rows the table
+    /// format left live, when it deleted any of them.
+    live_in_range: Option<BooleanBuffer>,
     /// The row group's ranges still to decode, on any worker.
     ranges_left: Arc<AtomicUsize>,
     /// Per leaf, the index of the next page to hand the leaf decoder.
@@ -191,6 +202,7 @@ impl RowGroupDecoder {
             next_row: 0,
             end_row: 0,
             range: None,
+            live_in_range: None,
             ranges_left: range.ranges_left().clone(),
             add_row_group_metadata,
             filter_batches,
@@ -229,6 +241,7 @@ impl RowGroupDecoder {
         }
         let rows = range.rows();
         let continues = rows.start as usize == self.end_row;
+        self.live_in_range = self.live_rows_of(&rows);
         self.next_row = rows.start as usize;
         self.end_row = rows.end as usize;
         for leaf in 0..self.leaf_decoders.len() {
@@ -308,17 +321,37 @@ impl RowGroupDecoder {
         }
     }
 
+    /// The rows of `rows`, a range of the row group's rows, the table format
+    /// left live, as a bit per row, when it deleted any of them. The
+    /// materializer's index list was drawn from rows that already passed
+    /// here, so an index selection has none deleted.
+    fn live_rows_of(&self, rows: &Range<u32>) -> Option<BooleanBuffer> {
+        let metadata = self.metadata.get_metadata();
+        if metadata.deleted_rows.is_none()
+            || !matches!(self.metadata.selection(), RowSelection::All)
+            || metadata.count_deleted_in(rows.clone()) == 0
+        {
+            return None;
+        }
+        let mut live = BooleanBufferBuilder::new(rows.len());
+        live.append_n(rows.len(), true);
+        for position in metadata.deleted_rows_in(rows.clone()) {
+            live.set_bit((position - rows.start) as usize, false);
+        }
+        Some(live.finish())
+    }
+
     /// Whether every row of the attached range has been emitted.
     pub fn exhausted(&self) -> bool {
         self.next_row == self.end_row
     }
 
-    /// Attempts to produce the next [`RecordBatch`].
+    /// Attempts to produce the next [`DecodedBatch`].
     ///
     /// Returns `Ok(Some(batch))` if every column decoder has enough buffered
     /// rows, `Ok(None)` if more pages are needed, or an error if decoding
     /// fails.
-    pub fn try_read(&mut self, allocator: &mut SlabAllocator) -> Result<Option<RecordBatch>> {
+    pub fn try_read(&mut self, allocator: &mut SlabAllocator) -> Result<Option<DecodedBatch>> {
         let size = min(self.batch_size, self.end_row - self.next_row);
         let available = min(
             self.leaf_decoders
@@ -345,13 +378,22 @@ impl RowGroupDecoder {
                 .map(|decoder| decoder.read(&decoded))
                 .collect::<Result<Vec<_>>>()?;
             let record_batch = RecordBatch::try_new(self.plan.schema.clone(), columns)?;
+            let first_row = self.next_row;
+            self.next_row += available;
+            // The rows the table format deleted are named by the batch's
+            // bits rather than dropped here, for the parent to copy the rest
+            // into full batches.
+            let live_rows = self.live_in_range.as_ref().and_then(|live| {
+                let live = live.slice(live.len() - (self.end_row - first_row), available);
+                (live.count_set_bits() < available).then_some(live)
+            });
             // Give each column carrying a pushed-down equality constant a
             // chance to drop rows that provably fail it, before the batch
             // travels any further. Dictionary encoded string columns filter it
             // with a cheap view comparison; the rest leave it untouched. Never
             // done on the materializer path, which needs every row to stay in
-            // place.
-            let record_batch = if self.filter_batches {
+            // place, nor to a batch whose live rows are named by its bits.
+            let record_batch = if self.filter_batches && live_rows.is_none() {
                 self.plan.prunable.iter().fold(record_batch, |batch, p| {
                     self.leaf_decoders[p.leaf].fast_filter_record_batch(batch, p.output_idx)
                 })
@@ -359,12 +401,11 @@ impl RowGroupDecoder {
                 record_batch
             };
             let batch = if self.add_row_group_metadata {
-                with_row_group_metadata(record_batch, self.row_group_index(), self.next_row)
+                with_row_index(record_batch, first_row)
             } else {
                 record_batch
             };
-            self.next_row += available;
-            Ok(Some(batch))
+            Ok(Some(DecodedBatch { batch, live_rows }))
         } else {
             Ok(None)
         }

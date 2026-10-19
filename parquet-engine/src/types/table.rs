@@ -160,39 +160,48 @@ impl ParquetTable {
         Ok(Self::new(row_groups))
     }
 
-    /// How many rows the table holds, summed over its row groups' footers: the
-    /// exact count with no data pages read.
+    /// How many rows the table holds, summed over its row groups' footers less
+    /// their deleted rows: the exact count with no data pages read.
     pub fn total_rows(&self) -> i64 {
         self.row_groups
             .iter()
-            .map(|row_group| row_group.num_rows)
+            .map(|row_group| row_group.live_rows())
             .sum()
     }
 
     /// The `column`'s lower and upper bound over every row group, folded from
     /// the row-group statistics, or `None` when any row group lacks a bound
     /// (or the table has none): only a complete set of bounds answers a
-    /// query's MIN/MAX without a scan. The scalars carry the column's physical
-    /// storage type.
+    /// query's MIN/MAX without a scan. A bound held by a row group handed
+    /// deleted rows is no bound either, as the rows holding it may be the
+    /// deleted ones; a row group handed none has none. The scalars carry the
+    /// column's physical storage type.
     pub fn column_min_max(&self, column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
         if self.row_groups.is_empty() {
             return None;
         }
-        let mut min: Option<Scalar<ArrayRef>> = None;
-        let mut max: Option<Scalar<ArrayRef>> = None;
+        // Each bound with the row group holding it; a strictly tighter bound
+        // replaces the one held, so an equal one keeps its row group.
+        let mut min: Option<(Scalar<ArrayRef>, &RowGroupMetadata)> = None;
+        let mut max: Option<(Scalar<ArrayRef>, &RowGroupMetadata)> = None;
         for row_group in &self.row_groups {
             let stats = row_group.column_statistics(column)?;
             let (group_min, group_max) = (stats.min()?, stats.max()?);
             min = Some(match min {
-                Some(held) if scalar_lt(&held, &group_min) => held,
-                _ => group_min,
+                Some(held) if !scalar_lt(&group_min, &held.0) => held,
+                _ => (group_min, row_group),
             });
             max = Some(match max {
-                Some(held) if scalar_lt(&group_max, &held) => held,
-                _ => group_max,
+                Some(held) if !scalar_lt(&held.0, &group_max) => held,
+                _ => (group_max, row_group),
             });
         }
-        Some((min?, max?))
+        let (min, min_row_group) = min?;
+        let (max, max_row_group) = max?;
+        if min_row_group.deleted_rows.is_some() || max_row_group.deleted_rows.is_some() {
+            return None;
+        }
+        Some((min, max))
     }
 
     /// Returns the table's Arrow schema. Preserved across pruning, so a table
@@ -251,10 +260,15 @@ pub(crate) fn row_groups_from_metadata(
         leaf_sources,
     } = resolve_column_layout(file_schema, &file_field_ids, table_columns)?;
     let schema = Arc::new(schema);
-    let layout_is_identity = leaf_sources
-        .iter()
-        .enumerate()
-        .all(|(leaf, source)| *source == LeafSource::File(leaf));
+    // A row group lists one chunk per table leaf, in leaf order. The file's
+    // own chunk list is that already when its leaves are exactly the table's,
+    // in order; a file with leaves past the table's would add chunks no table
+    // leaf addresses.
+    let layout_is_identity = leaf_sources.len() == file_leaf_count
+        && leaf_sources
+            .iter()
+            .enumerate()
+            .all(|(leaf, source)| *source == LeafSource::File(leaf));
     // Statistics belong to leaf chunks, not top-level columns.
     let leaves = super::leaves::leaf_fields(schema.fields());
 
@@ -338,17 +352,24 @@ pub(crate) fn row_groups_from_metadata(
             .collect::<Vec<_>>(),
     );
 
+    let mut file_row_offset = 0u64;
     Ok(row_groups
         .into_iter()
         .enumerate()
-        .map(|(i, (num_rows, columns))| RowGroupMetadata {
-            open_file: open_file.clone(),
-            schema: schema.clone(),
-            columns,
-            statistics: statistics.clone(),
-            num_rows,
-            file_row_group_idx: i,
-            live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
+        .map(|(i, (num_rows, columns))| {
+            let row_group = RowGroupMetadata {
+                open_file: open_file.clone(),
+                schema: schema.clone(),
+                columns,
+                statistics: statistics.clone(),
+                num_rows,
+                file_row_offset,
+                deleted_rows: None,
+                file_row_group_idx: i,
+                live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
+            };
+            file_row_offset += num_rows as u64;
+            row_group
         })
         .collect())
 }
@@ -965,6 +986,7 @@ pub fn is_variant_field(field: &Field) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::deleted_rows;
     use crate::types::metadata::ColumnStatistics;
     use arrow_array::{
         BinaryViewArray, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, Scalar,
@@ -1012,6 +1034,57 @@ mod tests {
     /// The single-value array behind one of a row group's bounds.
     fn bound(bound: Option<Scalar<ArrayRef>>) -> ArrayRef {
         bound.expect("bound should be present").into_inner()
+    }
+
+    /// A table of two row groups, `[1, 9, 9]` and `[2, 9, 9]`, with the rows
+    /// `deleted` of each row group marked deleted.
+    fn two_row_groups_with_deleted(deleted: [&[u32]; 2]) -> (TempDir, ParquetTable) {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 9, 9, 2, 9, 9]));
+        let batch = RecordBatch::try_from_iter([("v", values)]).unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("data.parquet");
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(3))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props))
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let mut table = ParquetTable::from_files(test_dispatcher(), &[path], &[]).unwrap();
+        for (row_group, rows) in table.row_groups_mut().iter_mut().zip(deleted) {
+            let row_group = Arc::get_mut(row_group).unwrap();
+            row_group.deleted_rows = deleted_rows(row_group.file_row_offset, rows);
+        }
+        (dir, table)
+    }
+
+    fn int64_bound(bound: Scalar<ArrayRef>) -> i64 {
+        bound
+            .into_inner()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    #[test]
+    fn a_bound_held_by_a_row_group_with_deleted_rows_is_no_bound() {
+        let (_dir, deleted_in_second) = two_row_groups_with_deleted([&[], &[0]]);
+        let (_dir, deleted_in_first) = two_row_groups_with_deleted([&[0], &[]]);
+
+        let (min, max) = deleted_in_second
+            .column_min_max(0)
+            .expect("the first row group holds both bounds");
+        assert_eq!((int64_bound(min), int64_bound(max)), (1, 9));
+        assert!(deleted_in_first.column_min_max(0).is_none());
+    }
+
+    #[test]
+    fn total_rows_leaves_out_deleted_rows() {
+        let (_dir, table) = two_row_groups_with_deleted([&[0, 2], &[1]]);
+
+        assert_eq!(table.total_rows(), 3);
     }
 
     #[test]
@@ -1547,6 +1620,43 @@ mod tests {
             layout.leaf_sources,
             [LeafSource::File(0), LeafSource::Absent]
         );
+    }
+
+    #[test]
+    fn a_file_column_past_the_declared_ones_has_no_chunk_in_the_row_group() {
+        let field_id = |id: &str| {
+            std::collections::HashMap::from([("PARQUET:field_id".to_string(), id.to_string())])
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false).with_metadata(field_id("1")),
+            Field::new("lineage", DataType::Int64, true).with_metadata(field_id("9")),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("data.parquet");
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let file = DataFile::local(path.clone(), fs::metadata(&path).unwrap().len());
+
+        let loaded = crate::metadata::load_file_row_groups(
+            test_dispatcher(),
+            &[file],
+            declared_by_field_id(vec![("a", Type::Int32, 1)]),
+        )
+        .unwrap();
+
+        let row_group = &loaded[0].row_groups[0];
+        assert_eq!(field_names(&row_group.schema), ["a"]);
+        assert_eq!(row_group.columns.len(), 1);
     }
 
     #[test]

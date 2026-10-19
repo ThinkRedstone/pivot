@@ -34,7 +34,9 @@ use dispatch::{
 use fetcher::FileRowGroupsFetcher;
 use object_storage::file_injector::FileInjectorFactory;
 use object_storage::{DataFile, DataFileLocation, FileRef, ObjectPath};
+use roaring::RoaringTreemap;
 use std::collections::HashMap;
+use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use writer::FileRowGroupsSinkFactory;
@@ -45,6 +47,42 @@ use writer::FileRowGroupsSinkFactory;
 pub struct FileRowGroups {
     pub file: FileRef,
     pub row_groups: Vec<Arc<RowGroupMetadata>>,
+}
+
+impl FileRowGroups {
+    /// Record the rows the file's row-level deletes removed, `deleted` by
+    /// position in the file, on the row groups that may hold them, so a scan
+    /// drops them. Each shares the bitmap as decoded, so no position is
+    /// visited. Only for row groups fresh from the footer read, which nothing
+    /// shares yet.
+    pub fn mark_deleted_rows(&mut self, deleted: RoaringTreemap) {
+        let deleted = Arc::new(deleted);
+        for row_group in &mut self.row_groups {
+            if deleted.range_cardinality(containers_covering(&row_group.file_positions())) == 0 {
+                continue;
+            }
+            Arc::get_mut(row_group)
+                .expect("row groups fresh from the footer read are not shared")
+                .deleted_rows = Some(deleted.clone());
+        }
+    }
+}
+
+/// The range to count the bitmap over to learn whether any of `positions`
+/// MIGHT be deleted: a roaring bitmap keeps a container per block of
+/// `1 << 16` positions, each with its cardinality, and a count whose bounds
+/// sit on container boundaries sums those cardinalities and reads no bits,
+/// where a bound inside a container has its bits up to the bound counted.
+/// The containers at the edges are shared with the neighbouring row groups,
+/// whose deleted rows count too, so only a zero is exact; a row group handed
+/// deleted rows may have none. The range ends on the first position of the
+/// container past the last, inclusive, as the bitmap takes an exclusive end
+/// as the last position inside a container.
+fn containers_covering(positions: &Range<u64>) -> RangeInclusive<u64> {
+    const CONTAINER_POSITIONS: u64 = 1 << 16;
+    let first = positions.start / CONTAINER_POSITIONS * CONTAINER_POSITIONS;
+    let past_last = positions.end.div_ceil(CONTAINER_POSITIONS) * CONTAINER_POSITIONS;
+    first..=past_last
 }
 
 /// Builds each worker's [`FileRowGroupsFetcher`], carrying the table's
@@ -177,4 +215,77 @@ where
     RecordBatchOperatorSpec::from_spec(
         fetch.chain(fan_in::<FileRowGroups>(worker_count, target), sinks),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::dummy_row_group;
+
+    /// A file of row groups holding `rows` rows each.
+    fn file_of_row_groups(rows: &[i64]) -> FileRowGroups {
+        let dummy = dummy_row_group();
+        let mut file_row_offset = 0;
+        FileRowGroups {
+            file: FileRef {
+                path: ObjectPath::new("data.parquet"),
+                size: 0,
+            },
+            row_groups: rows
+                .iter()
+                .enumerate()
+                .map(|(index, rows)| {
+                    let row_group = Arc::new(RowGroupMetadata {
+                        num_rows: *rows,
+                        file_row_offset,
+                        file_row_group_idx: index,
+                        ..(*dummy).clone()
+                    });
+                    file_row_offset += *rows as u64;
+                    row_group
+                })
+                .collect(),
+        }
+    }
+
+    /// The deleted rows of each of `file`'s row groups, by position in the
+    /// row group; `None` for a row group handed none.
+    fn deleted_per_row_group(file: &FileRowGroups) -> Vec<Option<Vec<u32>>> {
+        file.row_groups
+            .iter()
+            .map(|row_group| {
+                row_group.deleted_rows.as_ref().map(|_| {
+                    row_group
+                        .deleted_rows_in(0..row_group.num_rows as u32)
+                        .collect()
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_row_group_sees_the_deleted_rows_among_its_own() {
+        let container = 1 << 16;
+        let mut file = file_of_row_groups(&[container, container, container]);
+
+        file.mark_deleted_rows([1, 2 * container as u64 + 3].into_iter().collect());
+
+        assert_eq!(
+            deleted_per_row_group(&file),
+            vec![Some(vec![1]), None, Some(vec![3])]
+        );
+    }
+
+    #[test]
+    fn a_row_group_sharing_a_container_with_a_deleted_row_is_handed_none_of_its_own() {
+        let container = 1 << 16;
+        let mut file = file_of_row_groups(&[container + 10, container]);
+
+        file.mark_deleted_rows([container as u64 + 5].into_iter().collect());
+
+        assert_eq!(
+            deleted_per_row_group(&file),
+            vec![Some(vec![container as u32 + 5]), Some(vec![])]
+        );
+    }
 }

@@ -14,7 +14,8 @@ use planner::catalog::{Column, SchemaQualifiedTableName, TableRevision};
 use planner::types::physical_arrow_type;
 
 use crate::columns::table_columns;
-use crate::manifests::{DataFiles, FileDescriptor, ManifestList};
+use crate::deletes::{count_deleted_rows, read_deletion_vectors};
+use crate::manifests::{DataFiles, FileDescriptor, ManifestList, read_manifests};
 use crate::store::{TableStore, read_vended_s3_credentials};
 use crate::{Error, Result};
 
@@ -96,12 +97,14 @@ impl LoadedTable {
         })
     }
 
-    /// Select files using metadata bounds, then fetch their row groups.
-    /// Manifest order, then file-local row-group order, makes the same filters
-    /// yield the same row-group positions for scanning and materialization.
+    /// Select files using metadata bounds, then fetch their row groups, with
+    /// the rows their deletion vectors delete marked on them. Manifest order,
+    /// then file-local row-group order, makes the same filters yield the same
+    /// row-group positions for scanning and materialization.
     pub(crate) fn load_parquet(&self, filters: &[Expression]) -> Result<ParquetTable> {
+        let table_name = self.name.to_string();
         let invalid_partition_metadata = |source| Error::InvalidPartitionMetadata {
-            table: self.name.to_string(),
+            table: table_name.clone(),
             source: Box::new(source),
         };
         let selected = self
@@ -109,12 +112,20 @@ impl LoadedTable {
             .select(filters)
             .map_err(invalid_partition_metadata)?;
         let files = self
-            .load_data_files(selected.iter().copied())?
+            .load_data_files(selected.data.iter().copied())?
             .select(filters)
             .map_err(invalid_partition_metadata)?;
-        tracing::debug!(table = %self.name, manifests = selected.len(), files = files.len(), "selected Iceberg files");
-        let row_groups: Vec<_> = self
-            .read_footers(&files)?
+        tracing::debug!(table = %self.name, manifests = selected.data.len(), files = files.len(), "selected Iceberg files");
+        let delete_manifests = read_manifests(selected.deletes, &self.store, &self.dispatcher)?;
+        let deletion_vectors =
+            read_deletion_vectors(delete_manifests, &files, &self.store, &self.dispatcher)?;
+        let mut footers = self.read_footers(&files)?;
+        for (footer, deleted) in footers.iter_mut().zip(deletion_vectors) {
+            if let Some(deleted) = deleted {
+                footer.mark_deleted_rows(deleted);
+            }
+        }
+        let row_groups: Vec<_> = footers
             .into_iter()
             .flat_map(|footer| footer.row_groups)
             .collect();
@@ -140,7 +151,7 @@ impl LoadedTable {
     }
 
     pub(super) fn load_all_data_files(&self) -> Result<DataFiles> {
-        self.load_data_files(self.manifest_list.manifests())
+        self.load_data_files(self.manifest_list.data_manifests())
     }
 
     /// Read file metadata in parallel and return it in request order.
@@ -193,10 +204,28 @@ impl LoadedTable {
         }
     }
 
-    /// Exact for snapshots without delete files. Older writers may omit counts;
-    /// in that case planning has no statistic and COUNT uses the ordinary scan.
+    /// The rows of the data files less the rows their deletion vectors
+    /// delete, read from the manifests alone. Older writers may omit counts,
+    /// and a delete manifest may fail to read or hold a delete file that is
+    /// not applied; planning then has no statistic and COUNT uses the
+    /// ordinary scan, which reports what is wrong.
     pub(crate) fn row_count(&self) -> Option<i64> {
-        self.manifest_list.row_count()
+        let rows = self.manifest_list.row_count()?;
+        let delete_manifests = read_manifests(
+            self.manifest_list.delete_manifests(),
+            &self.store,
+            &self.dispatcher,
+        )
+        .ok()?;
+        let deleted = count_deleted_rows(delete_manifests).ok()?;
+        rows.checked_sub(i64::try_from(deleted).ok()?)
+    }
+
+    /// The row count as the manifest list alone has it, with nothing read:
+    /// exact when every delete file is a deletion vector, an estimate
+    /// otherwise.
+    pub(crate) fn estimated_row_count(&self) -> Option<i64> {
+        self.manifest_list.estimated_row_count()
     }
 }
 

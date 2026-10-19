@@ -9,6 +9,11 @@
 #     image serves no XML API, which is what Delta Kernel's client speaks.
 #   - iceberg-rest-fixture: the tag in datastore-iceberg/tests/rest_catalog.rs,
 #     the REST catalog the Iceberg datastore's tests write to and read from.
+#   - spark: the tag in datastore-iceberg/tests/rest_catalog.rs, the Spark that
+#     writes to the catalog what the iceberg crate's writer cannot (a delete).
+#     It fetches the Iceberg runtime from Maven into a Docker volume of its
+#     own, kept between runs.
 minio/minio:RELEASE.2025-02-28T09-55-16Z
 tustvold/fake-gcs-server:latest
 apache/iceberg-rest-fixture:1.9.1
+apache/spark:3.5.9

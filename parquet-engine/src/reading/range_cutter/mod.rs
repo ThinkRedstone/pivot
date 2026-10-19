@@ -277,6 +277,8 @@ mod tests {
             }],
             statistics: Arc::default(),
             num_rows,
+            file_row_offset: 0,
+            deleted_rows: None,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
         })]))

@@ -13,6 +13,8 @@ use crate::types::table::ParquetTable;
 use arrow_array::{Array, ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
 use dispatch::io::OpenFile;
+use roaring::RoaringTreemap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -145,8 +147,18 @@ pub struct RowGroupMetadata {
     /// The whole file's statistics, shared by every row group in it and read at
     /// this row group's `file_row_group_idx`.
     pub(crate) statistics: Arc<FileStatistics>,
-    /// Total number of rows in this row group.
+    /// Total number of rows in this row group, deleted ones included.
     pub num_rows: i64,
+    /// The position in the file of this row group's first row: how many rows
+    /// the row groups before it hold.
+    pub file_row_offset: u64,
+    /// The rows a table format's row-level deletes removed from the file, by
+    /// position in the file, shared as decoded by every row group of the
+    /// file that may hold any; `None` for a row group holding none. The file
+    /// still holds them: the scan decodes them and drops them before a batch
+    /// leaves the decoder, and a count or bound read from the footer
+    /// discounts them.
+    pub deleted_rows: Option<Arc<RoaringTreemap>>,
     /// Index of this row group within its Parquet file. Note that this should
     /// not be conflated with the row group's *global* index, which is simply
     /// its position in the table's flat `row_groups` list.
@@ -161,6 +173,59 @@ pub struct RowGroupMetadata {
 }
 
 impl RowGroupMetadata {
+    /// How many of this row group's rows a scan returns: those not deleted.
+    pub fn live_rows(&self) -> i64 {
+        self.num_rows - self.count_deleted_in(0..self.num_rows as u32) as i64
+    }
+
+    /// This row group's rows as positions in the file.
+    pub fn file_positions(&self) -> Range<u64> {
+        self.file_row_offset..self.file_row_offset + self.num_rows as u64
+    }
+
+    /// How many of this row group's `rows` are deleted.
+    pub fn count_deleted_in(&self, rows: Range<u32>) -> u64 {
+        self.deleted_rows.as_ref().map_or(0, |deleted| {
+            deleted.range_cardinality(self.file_positions_of(rows))
+        })
+    }
+
+    /// The deleted rows among this row group's `rows`, ascending. The treemap
+    /// keeps a 32-bit bitmap per block of `1 << 32` positions, so the rows
+    /// are walked block by block.
+    pub fn deleted_rows_in(&self, rows: Range<u32>) -> impl Iterator<Item = u32> + '_ {
+        const BLOCK: u64 = 1 << 32;
+        let file_row_offset = self.file_row_offset;
+        let positions = self.file_positions_of(rows);
+        let (start, end) = (positions.start, positions.end);
+        self.deleted_rows
+            .iter()
+            .flat_map(|deleted| deleted.bitmaps())
+            .map(|(block, bitmap)| (block as u64 * BLOCK, bitmap))
+            .filter(move |(block, _)| *block < end && block + BLOCK > start)
+            .flat_map(move |(block, bitmap)| {
+                let first = start.max(block) - block;
+                let last = end.min(block + BLOCK) - 1 - block;
+                bitmap
+                    .range(first as u32..=last as u32)
+                    .map(move |position| (block + position as u64 - file_row_offset) as u32)
+            })
+    }
+
+    /// Whether this row group's `row` is deleted.
+    pub fn is_deleted(&self, row: u32) -> bool {
+        debug_assert!((row as i64) < self.num_rows);
+        self.deleted_rows
+            .as_ref()
+            .is_some_and(|deleted| deleted.contains(self.file_row_offset + row as u64))
+    }
+
+    /// This row group's `rows` as positions in the file.
+    fn file_positions_of(&self, rows: Range<u32>) -> Range<u64> {
+        debug_assert!(rows.end as i64 <= self.num_rows);
+        self.file_row_offset + rows.start as u64..self.file_row_offset + rows.end as u64
+    }
+
     /// This row group's statistics for the top-level column `column`, if the
     /// file recorded any for it. Chunks are per leaf, so the column is resolved
     /// to its first leaf. Callers that need a nested field's statistics resolve
@@ -281,5 +346,32 @@ impl QueryRowGroupMetadata {
 
     pub fn index(&self) -> usize {
         self.row_group_index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_row_group_straddling_a_treemap_block_sees_its_rows_from_both_sides() {
+        const BLOCK: u64 = 1 << 32;
+        let row_group = RowGroupMetadata {
+            num_rows: 6,
+            file_row_offset: BLOCK - 2,
+            deleted_rows: Some(Arc::new(RoaringTreemap::from_iter([
+                BLOCK - 1,
+                BLOCK + 1,
+                BLOCK + 5,
+            ]))),
+            ..(*crate::test_utils::dummy_row_group()).clone()
+        };
+
+        let deleted: Vec<u32> = row_group.deleted_rows_in(0..6).collect();
+
+        assert_eq!(deleted, vec![1, 3]);
+        assert_eq!(row_group.live_rows(), 4);
+        assert_eq!(row_group.count_deleted_in(2..6), 1);
+        assert!(row_group.is_deleted(3) && !row_group.is_deleted(2));
     }
 }

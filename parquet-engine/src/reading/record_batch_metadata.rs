@@ -38,37 +38,73 @@ pub fn row_index(batch: &RecordBatch) -> &UInt32Array {
 }
 
 /// Add row group metadata to the record batch, receiving a new RecordBatch with a column for global
-/// row group, and another for index within the group.
+/// row group, and another for index within the group: the batch's rows are
+/// the row group's consecutive rows from `offset` on.
 ///
 /// Note that the global row group column is NOT the row_group within a parquet file, but across
 /// the entire table
 pub fn with_row_group_metadata(batch: RecordBatch, group: usize, offset: usize) -> RecordBatch {
+    with_row_group(with_row_index(batch, offset), group)
+}
+
+/// [`with_row_group_metadata`] for a batch whose rows are not consecutive in
+/// the row group: `positions` is each row's position in it.
+pub fn with_row_group_positions(
+    batch: RecordBatch,
+    group: usize,
+    positions: UInt32Array,
+) -> RecordBatch {
+    with_row_group(with_row_positions(batch, positions), group)
+}
+
+/// `batch` with the row index column appended: its rows are the row group's
+/// consecutive rows from `offset` on.
+pub fn with_row_index(batch: RecordBatch, offset: usize) -> RecordBatch {
+    let positions =
+        UInt32Array::from_iter_values(offset as u32..offset as u32 + batch.num_rows() as u32);
+    with_row_positions(batch, positions)
+}
+
+/// `batch` with the row index column appended: `positions` is each row's
+/// position in its row group.
+pub fn with_row_positions(batch: RecordBatch, positions: UInt32Array) -> RecordBatch {
+    let (schema, mut columns, row_count) = batch.into_parts();
+    debug_assert_eq!(positions.len(), row_count);
+    columns.push(Arc::new(positions));
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .cloned()
+        .chain([Arc::clone(&ROW_IDX_FIELD)])
+        .collect();
+    unsafe { RecordBatch::new_unchecked(Arc::new(Schema::new(fields)), columns, row_count) }
+}
+
+/// `batch`, carrying its row index column, with the global row group column
+/// added before it: every row is of `group`.
+pub fn with_row_group(batch: RecordBatch, group: usize) -> RecordBatch {
     let (schema, mut columns, row_count) = batch.into_parts();
 
-    // We create the row group as a single repeated value for the entire group
-    let run_ends = Int32Array::from(vec![row_count as i32]);
-    let values = UInt32Array::from(vec![group as u32]);
+    // We create the row group as a single repeated value for the entire group;
+    // a run must end past its start, so a batch with no rows gets no run.
+    let (run_ends, values) = if row_count == 0 {
+        (
+            Int32Array::from(Vec::<i32>::new()),
+            UInt32Array::from(Vec::<u32>::new()),
+        )
+    } else {
+        (
+            Int32Array::from(vec![row_count as i32]),
+            UInt32Array::from(vec![group as u32]),
+        )
+    };
     let run_array =
         RunArray::<Int32Type>::try_new(&run_ends, &values).expect("Failed to create RunArray");
 
-    // These are the indexes of the rows- they are unique across the entire RowGroup (this is why
-    // offset must be supplied)
-    let row_idxs = UInt32Array::from_iter_values(offset as u32..offset as u32 + row_count as u32);
+    let group_column = columns.len() - ROW_OFFSET_FROM_END;
+    columns.insert(group_column, Arc::new(run_array));
+    let mut fields = schema.fields().to_vec();
+    fields.insert(group_column, Arc::clone(&GLOBAL_ROW_GROUP_FIELD));
 
-    columns.push(Arc::new(run_array));
-    columns.push(Arc::new(row_idxs));
-
-    let new_schema = Arc::new(Schema::new(
-        schema
-            .fields()
-            .to_vec()
-            .into_iter()
-            .chain(vec![
-                Arc::clone(&GLOBAL_ROW_GROUP_FIELD),
-                Arc::clone(&ROW_IDX_FIELD),
-            ])
-            .collect::<Vec<_>>(),
-    ));
-
-    unsafe { RecordBatch::new_unchecked(new_schema, columns, row_count) }
+    unsafe { RecordBatch::new_unchecked(Arc::new(Schema::new(fields)), columns, row_count) }
 }
