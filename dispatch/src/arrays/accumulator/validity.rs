@@ -66,6 +66,27 @@ impl ValidityMask {
         }
     }
 
+    /// Record validity for the rows `mask` selects of one batch, landing at
+    /// accumulated position `at` onward in row order.
+    pub(super) fn append_mask(
+        &mut self,
+        nulls: Option<&NullBuffer>,
+        mask: &BooleanBuffer,
+        at: usize,
+    ) {
+        let Some(nulls) = nulls else {
+            return;
+        };
+        if nulls.null_count() == 0 {
+            return;
+        }
+        let mut at = at;
+        for (start, end) in mask.set_slices() {
+            self.append_range(Some(nulls), start, end - start, at);
+            at += end - start;
+        }
+    }
+
     /// Record the validity of rows gathered by encoded id: id
     /// `batch << shift | row` reads the validity `batch_nulls(batch)` returns,
     /// landing at accumulated position `at` onward in id order.

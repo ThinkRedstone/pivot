@@ -8,6 +8,7 @@
 
 use arrow::array::ArrayData;
 use arrow_array::{ArrayRef, make_array};
+use arrow_buffer::BooleanBuffer;
 use arrow_schema::{ArrowError, DataType};
 
 use super::column::{ChunkedColumn, ColumnAccumulator, EncodedRowIds, split_encoded_id};
@@ -88,6 +89,31 @@ impl ColumnAccumulator for FixedWidthColumn {
                 .add((data.offset() + start) * width);
             let dst = (self.slab.ptr_at_index(0) as *mut u8).add(destination_start * width);
             std::ptr::copy_nonoverlapping(src, dst, len * width);
+        }
+    }
+
+    fn append_from_mask(
+        &mut self,
+        column: &ArrayRef,
+        mask: &BooleanBuffer,
+        _selected_count: usize,
+        destination_start: usize,
+        _allocator: &mut SlabAllocator,
+    ) {
+        let data = column.to_data();
+        self.validity
+            .append_mask(data.nulls(), mask, destination_start);
+        let width = self.width;
+        // SAFETY: the mask is as long as the column and the slab has capacity
+        // for the appended rows (checked by the caller).
+        unsafe {
+            let src = data.buffers()[0].as_ptr().add(data.offset() * width);
+            let mut dst = (self.slab.ptr_at_index(0) as *mut u8).add(destination_start * width);
+            for (start, end) in mask.set_slices() {
+                let bytes = (end - start) * width;
+                std::ptr::copy_nonoverlapping(src.add(start * width), dst, bytes);
+                dst = dst.add(bytes);
+            }
         }
     }
 

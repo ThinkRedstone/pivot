@@ -26,7 +26,7 @@ fn panic_in_filter_returns_error() {
         .filter(|| {
             move |_: &RecordBatch,
                   _: &mut dispatch::memory::SlabAllocator,
-                  _: &mut Vec<u32>|
+                  _: &mut dispatch::SelectionScratch|
                   -> dispatch::RowSelection { panic!("intentional panic in filter") }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(
@@ -72,14 +72,14 @@ fn cancelled_query_returns_without_hanging() {
         .filter(|| {
             move |batch: &RecordBatch,
                   _: &mut dispatch::memory::SlabAllocator,
-                  indices: &mut Vec<u32>| {
+                  scratch: &mut dispatch::SelectionScratch| {
                 let col = batch
                     .column(1)
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .unwrap();
                 let mask = BooleanArray::from(BooleanBuffer::collect_bool(col.len(), |_| true));
-                dispatch::collect_selected_indices(&mask, indices);
+                dispatch::collect_selected_indices(&mask, &mut scratch.positions);
                 dispatch::RowSelection::Indices
             }
         })

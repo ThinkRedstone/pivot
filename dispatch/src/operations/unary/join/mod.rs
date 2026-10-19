@@ -858,7 +858,9 @@ mod tests {
     /// garbage values.
     #[test]
     fn oversized_join_output_through_a_filter_keeps_values() {
-        use crate::operations::unary::filter::{FilterFactory, RowDelivery, RowSelection};
+        use crate::operations::unary::filter::{
+            FilterFactory, RowDelivery, RowSelection, SelectionScratch,
+        };
         use crate::operations::unary::test_utils::run_unary_to_completion;
 
         let repeated = 3_000usize;
@@ -886,9 +888,9 @@ mod tests {
         // would be forwarded untouched, and only partial selections coalesce
         // through the accumulator.
         let drop_first = FilterFactory(
-            |b: &RecordBatch, _: &mut _, indices: &mut Vec<u32>| {
-                indices.clear();
-                indices.extend(1..b.num_rows() as u32);
+            |b: &RecordBatch, _: &mut _, scratch: &mut SelectionScratch| {
+                scratch.positions.clear();
+                scratch.positions.extend(1..b.num_rows() as u32);
                 RowSelection::Indices
             },
             RowDelivery::Coalesced,

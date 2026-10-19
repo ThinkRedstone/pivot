@@ -129,13 +129,13 @@ impl Input {
                 let slot = std::sync::Arc::clone(&slot);
                 move |batch: &arrow_array::RecordBatch,
                       _slab: &mut dispatch::memory::SlabAllocator,
-                      survivors: &mut Vec<u32>| {
+                      scratch: &mut dispatch::SelectionScratch| {
                     match slot.get() {
                         None => dispatch::RowSelection::All,
                         Some(bitset) => {
-                            survivors.clear();
-                            bitset.select(batch.column(position), survivors);
-                            if survivors.len() == batch.num_rows() {
+                            scratch.positions.clear();
+                            bitset.select(batch.column(position), &mut scratch.positions);
+                            if scratch.positions.len() == batch.num_rows() {
                                 dispatch::RowSelection::All
                             } else {
                                 dispatch::RowSelection::Indices

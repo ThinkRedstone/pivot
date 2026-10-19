@@ -4,6 +4,7 @@
 
 use arrow::array::ArrayData;
 use arrow_array::ArrayRef;
+use arrow_buffer::BooleanBuffer;
 use arrow_schema::{ArrowError, DataType};
 
 use crate::memory::SlabAllocator;
@@ -99,6 +100,20 @@ pub(super) trait ColumnAccumulator {
         column: &ArrayRef,
         start: usize,
         len: usize,
+        destination_start: usize,
+        allocator: &mut SlabAllocator,
+    );
+
+    /// Append the rows `mask` selects from one batch's column, `selected_count` in
+    /// number, walking the mask as runs of consecutive selected rows. A run
+    /// is contiguous in the source and lands contiguously in the
+    /// accumulation, so it copies as one piece however long it is. The mask
+    /// must be as long as the column.
+    fn append_from_mask(
+        &mut self,
+        column: &ArrayRef,
+        mask: &BooleanBuffer,
+        selected_count: usize,
         destination_start: usize,
         allocator: &mut SlabAllocator,
     );

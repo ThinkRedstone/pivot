@@ -402,7 +402,7 @@ impl RecordBatchOperatorSpec {
         F: FnMut(
                 &RecordBatch,
                 &mut crate::memory::SlabAllocator,
-                &mut Vec<u32>,
+                &mut crate::SelectionScratch,
             ) -> crate::RowSelection
             + Send
             + 'static,
@@ -423,7 +423,7 @@ impl RecordBatchOperatorSpec {
         F: FnMut(
                 &RecordBatch,
                 &mut crate::memory::SlabAllocator,
-                &mut Vec<u32>,
+                &mut crate::SelectionScratch,
             ) -> crate::RowSelection
             + Send
             + 'static,

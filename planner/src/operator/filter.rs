@@ -2,11 +2,12 @@
 
 use crate::compile::{Error, ExprEvalFn, ExprFn};
 use crate::expression::Expression;
+use arrow::buffer::BooleanBuffer;
 use arrow_array::{Array, ArrayRef, BooleanArray, NullArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dispatch::arrays::take;
 use dispatch::memory::SlabAllocator;
-use dispatch::{RecordBatchOperatorSpec, RowDelivery, RowSelection};
+use dispatch::{RecordBatchOperatorSpec, RowDelivery, RowSelection, SelectionScratch};
 use std::fmt;
 use std::sync::Arc;
 
@@ -44,8 +45,8 @@ impl Filter {
                 let mut selector = plan.selector();
                 move |batch: &RecordBatch,
                       allocator: &mut SlabAllocator,
-                      selected_indices: &mut Vec<u32>| {
-                    selector.select(batch, allocator, selected_indices)
+                      scratch: &mut SelectionScratch| {
+                    selector.select(batch, allocator, scratch)
                 }
             },
             delivery,
@@ -107,7 +108,6 @@ impl ConditionPlan {
         RowSelector {
             eval_fns: self.filters.iter().map(|f| f()).collect(),
             plan: self.clone(),
-            condition_mask: ConditionMask::new(),
             selection_scratch: Vec::new(),
             remap_scratch: Vec::new(),
             mini_schemas: vec![None; self.filters.len()],
@@ -121,7 +121,6 @@ impl ConditionPlan {
 struct RowSelector {
     plan: Arc<ConditionPlan>,
     eval_fns: Vec<ExprEvalFn>,
-    condition_mask: ConditionMask,
     selection_scratch: Vec<u32>,
     remap_scratch: Vec<u32>,
     mini_schemas: Vec<Option<SchemaRef>>,
@@ -131,18 +130,20 @@ struct RowSelector {
 }
 
 impl RowSelector {
-    /// The rows of `batch` passing every condition: every row, or the
-    /// ascending positions written into `selected_indices`.
+    /// The rows of `batch` passing every condition: every row, the rows of
+    /// the mask built in the scratch's words, or, once a shrink compacted the
+    /// batch so the mask is of the compacted rows, their ascending positions
+    /// in the input batch written into the scratch's positions.
     fn select(
         &mut self,
         batch: &RecordBatch,
         allocator: &mut SlabAllocator,
-        selected_indices: &mut Vec<u32>,
+        scratch: &mut SelectionScratch,
     ) -> RowSelection {
         let mut current = batch.clone();
         let mut has_input_row_map = false;
         let mut selected_count = 0;
-        self.condition_mask.reset();
+        let mut condition_mask = ConditionMask::over(&mut scratch.mask_words);
         for (i, (eval, &later_kernels)) in self
             .eval_fns
             .iter_mut()
@@ -152,9 +153,9 @@ impl RowSelector {
             let result = eval(&current);
             let (arr, _) = result.as_datum().get();
             let mask = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
-            selected_count = self.condition_mask.intersect(mask, current.num_rows());
+            selected_count = condition_mask.intersect(mask, current.num_rows());
             if selected_count == 0 {
-                selected_indices.clear();
+                scratch.positions.clear();
                 return RowSelection::Indices;
             }
             // Shrink or carry the mask? Arrow kernels cannot skip
@@ -191,8 +192,7 @@ impl RowSelector {
             if later_kernels as f64 * (1.0 - selected_fraction)
                 > GATHER_COST_IN_KERNEL_PASSES * compacted_column_count as f64 * selected_fraction
             {
-                self.condition_mask
-                    .collect_indices(&mut self.selection_scratch);
+                condition_mask.collect_indices(&mut self.selection_scratch);
                 current = if prune {
                     compact_columns_for_later_conditions(
                         allocator,
@@ -211,14 +211,14 @@ impl RowSelector {
                     &mut self.remap_scratch,
                 );
                 has_input_row_map = true;
-                self.condition_mask.reset();
+                condition_mask.reset();
             }
         }
         // The mask is always active here: a shrink only pays off
         // while conditions remain (its cost model multiplies the
         // kernels left to run), and every remaining condition
         // reactivates the mask.
-        debug_assert!(self.condition_mask.is_active());
+        debug_assert!(condition_mask.is_active());
         // Every row passed, so there are no positions to list: the batch goes
         // through untouched. Only known without a shrink, whose count is of
         // the compacted rows.
@@ -227,35 +227,34 @@ impl RowSelector {
         }
         // Report the selected rows as positions in the input batch.
         if has_input_row_map {
-            self.condition_mask
-                .collect_indices(&mut self.selection_scratch);
-            selected_indices.clear();
-            selected_indices.extend(
+            condition_mask.collect_indices(&mut self.selection_scratch);
+            scratch.positions.clear();
+            scratch.positions.extend(
                 self.selection_scratch
                     .iter()
                     .map(|&pos| self.input_row_map[pos as usize]),
             );
-        } else {
-            self.condition_mask.collect_indices(selected_indices);
+            return RowSelection::Indices;
         }
-        RowSelection::Indices
+        RowSelection::Mask
     }
 }
 
 /// The conjunction of the condition results evaluated since the last row
-/// compaction, one bit per row of the current batch. Kept as raw words in a
-/// reused buffer so intersecting the next condition's mask, counting the
-/// selected rows, and collecting their positions each cost one pass and no
-/// allocation. A null condition result always excludes its row.
-struct ConditionMask {
-    selected_row_bits: Vec<u64>,
+/// compaction, one bit per row of the current batch, built in the words the
+/// operator lent for the batch's selection. Kept as raw words so intersecting
+/// the next condition's mask, counting the selected rows, and collecting
+/// their positions each cost one pass, and the words are the batch's mask as
+/// they lie. A null condition result always excludes its row.
+struct ConditionMask<'a> {
+    selected_row_bits: &'a mut Vec<u64>,
     active: bool,
 }
 
-impl ConditionMask {
-    fn new() -> Self {
+impl<'a> ConditionMask<'a> {
+    fn over(selected_row_bits: &'a mut Vec<u64>) -> Self {
         Self {
-            selected_row_bits: Vec::new(),
+            selected_row_bits,
             active: false,
         }
     }
@@ -281,18 +280,10 @@ impl ConditionMask {
             self.active = true;
         }
         let mut selected_count = 0;
-        intersect_and_count_words(
-            &mut self.selected_row_bits,
-            mask.values(),
-            &mut selected_count,
-        );
+        intersect_and_count_words(self.selected_row_bits, mask.values(), &mut selected_count);
         if let Some(nulls) = mask.nulls() {
             selected_count = 0;
-            intersect_and_count_words(
-                &mut self.selected_row_bits,
-                nulls.inner(),
-                &mut selected_count,
-            );
+            intersect_and_count_words(self.selected_row_bits, nulls.inner(), &mut selected_count);
         }
         selected_count
     }
@@ -327,11 +318,7 @@ impl ConditionMask {
 /// AND a boolean buffer into the selection words, accumulating the selected
 /// popcount. Bit-offset buffers (never produced by the compare kernels) take
 /// a per-bit path.
-fn intersect_and_count_words(
-    words: &mut [u64],
-    bits: &arrow::buffer::BooleanBuffer,
-    selected_count: &mut usize,
-) {
+fn intersect_and_count_words(words: &mut [u64], bits: &BooleanBuffer, selected_count: &mut usize) {
     if bits.offset() == 0 {
         let bytes = bits.values();
         for (word_idx, word) in words.iter_mut().enumerate() {
@@ -444,6 +431,7 @@ mod tests {
     use super::*;
     use crate::operator::Operator;
     use crate::test_support::*;
+    use arrow::buffer::Buffer;
     use arrow_array::Int32Array;
     use dispatch::memory::init_test_free_pool;
     use rstest::rstest;
@@ -469,34 +457,68 @@ mod tests {
             &mut testing_planner,
             "SELECT a FROM example_table WHERE a > 0",
         );
-        let mut positions = Vec::new();
+        let mut scratch = SelectionScratch::default();
 
         let selection = selector.select(
             &batch_of_a(&[1, 2, 3]),
             &mut SlabAllocator::new(false),
-            &mut positions,
+            &mut scratch,
         );
 
         assert!(matches!(selection, RowSelection::All));
-        assert!(positions.is_empty());
+        assert!(scratch.positions.is_empty());
     }
 
     #[rstest]
-    fn a_batch_a_row_of_which_fails_is_reported_by_positions(mut testing_planner: TestingPlanner) {
+    fn a_batch_a_row_of_which_fails_is_reported_by_mask(mut testing_planner: TestingPlanner) {
         init_test_free_pool(4);
         let mut selector = selector_of(
             &mut testing_planner,
             "SELECT a FROM example_table WHERE a > 0",
         );
-        let mut positions = Vec::new();
+        let mut scratch = SelectionScratch::default();
 
         let selection = selector.select(
             &batch_of_a(&[1, 0, 3]),
             &mut SlabAllocator::new(false),
-            &mut positions,
+            &mut scratch,
         );
 
+        assert!(matches!(selection, RowSelection::Mask));
+        let mask = BooleanBuffer::new(Buffer::from_slice_ref(&scratch.mask_words), 0, 3);
+        assert_eq!(mask.set_indices().collect::<Vec<_>>(), vec![0, 2]);
+        assert!(scratch.positions.is_empty());
+    }
+
+    /// A first condition few rows pass makes the selector compact the batch
+    /// before the second, so the rows it selects are of the compacted batch
+    /// and reach the caller as their positions in the input batch.
+    #[rstest]
+    fn a_selection_after_a_shrink_is_reported_by_input_positions(
+        mut testing_planner: TestingPlanner,
+    ) {
+        init_test_free_pool(4);
+        let mut selector = selector_of(
+            &mut testing_planner,
+            "SELECT a FROM example_table WHERE a > 8 AND b > 0",
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)),
+                Arc::new(Int32Array::from_iter_values((0..10).map(|row| row % 2))),
+            ],
+        )
+        .unwrap();
+        let mut scratch = SelectionScratch::default();
+
+        let selection = selector.select(&batch, &mut SlabAllocator::new(false), &mut scratch);
+
         assert!(matches!(selection, RowSelection::Indices));
-        assert_eq!(positions, vec![0, 2]);
+        assert_eq!(scratch.positions, vec![9]);
     }
 }

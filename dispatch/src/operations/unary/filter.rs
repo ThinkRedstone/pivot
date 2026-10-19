@@ -1,8 +1,8 @@
 //! Filter operator: keeps rows the filter closure selects.
 //!
-//! The filter closure receives the input batch and writes the positions of
-//! the surviving rows into a scratch vec, or reports that every row survives
-//! ([`RowSelection`]). The closure may evaluate several conditions
+//! The filter closure receives the input batch and hands back the surviving
+//! rows as a mask, writes their positions into a scratch vec, or reports that
+//! every row survives ([`RowSelection`]). The closure may evaluate several conditions
 //! progressively, shrinking a working copy of the batch after each one so
 //! later (often costlier) conditions only see rows the earlier ones kept; the
 //! operator's [`SlabAllocator`] is passed in for that, see
@@ -17,13 +17,13 @@
 
 use crate::RECORD_BATCH_SIZE;
 use crate::arrays::accumulator::BatchAccumulator;
-use crate::arrays::take;
+use crate::arrays::{collect_set_positions, take};
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::{Unary, UnaryFactory};
 use arrow_array::{Array, BooleanArray, RecordBatch};
-use arrow_buffer::BooleanBuffer;
+use arrow_buffer::{BooleanBuffer, Buffer};
 
 /// The row positions a filter mask keeps: true bits, with a null mask entry
 /// dropping the row (Arrow's filter semantics).
@@ -35,37 +35,37 @@ fn kept_bits(mask: &BooleanArray) -> BooleanBuffer {
 }
 
 /// Collect the ascending kept-row positions of `mask` into `out`.
-///
-/// Extending a `Vec` straight from the bit iterator pays a capacity check
-/// per element (the iterator has no usable size hint); reserving the exact
-/// popcount up front and writing raw skips that.
 pub fn collect_selected_indices(mask: &BooleanArray, out: &mut Vec<u32>) {
-    let bits = kept_bits(mask);
-    out.clear();
-    let kept = bits.count_set_bits();
-    out.reserve(kept);
-    // SAFETY: `reserve(kept)` guarantees capacity for every set bit, and the
-    // iterator yields exactly `kept` indices.
-    unsafe {
-        let ptr = out.as_mut_ptr();
-        let mut len = 0;
-        for index in bits.set_indices_u32() {
-            ptr.add(len).write(index);
-            len += 1;
-        }
-        out.set_len(len);
-    }
+    collect_set_positions(&kept_bits(mask), out);
 }
 
-/// How a filter closure describes the surviving rows of the input batch.
-/// `Indices` refers to the ascending row positions the closure wrote into
-/// the scratch vec it was handed. A closure holding a boolean mask converts
-/// it with [`collect_selected_indices`].
+/// The scratch a filter closure writes its selection into. The operator owns
+/// one and lends it for every batch, so no selection costs an allocation.
+#[derive(Default)]
+pub struct SelectionScratch {
+    /// The ascending positions of the surviving rows, for
+    /// [`RowSelection::Indices`].
+    pub positions: Vec<u32>,
+    /// The surviving rows as a bitmask, one bit per row of the batch in
+    /// `rows.div_ceil(64)` little-endian words, for [`RowSelection::Mask`].
+    pub mask_words: Vec<u64>,
+}
+
+/// How a filter closure describes the surviving rows of the input batch:
+/// every row, the positions it wrote into the scratch, or the mask it wrote
+/// there. A closure that evaluated its conditions to a mask hands the mask
+/// over as it is: the operator copies the rows it names in runs where they
+/// come in runs, which listing their positions would hide (see
+/// [`BatchAccumulator::append_batch_by_mask`]). A closure holding a boolean
+/// array with nulls, which the mask form has no room for, converts it with
+/// [`collect_selected_indices`].
 pub enum RowSelection {
     /// Every row survives; the batch is passed through untouched.
     All,
-    /// The rows at the scratch indices survive.
+    /// The rows at the scratch's `positions` survive.
     Indices,
+    /// The rows whose bit of the scratch's `mask_words` is set survive.
+    Mask,
 }
 
 /// When a filter hands its surviving rows to the operator below it.
@@ -94,7 +94,9 @@ pub struct FilterFactory<F>(pub F, pub RowDelivery);
 
 impl<F> UnaryFactory<RecordBatch, RecordBatch> for FilterFactory<F>
 where
-    F: FnMut(&RecordBatch, &mut SlabAllocator, &mut Vec<u32>) -> RowSelection + Send + 'static,
+    F: FnMut(&RecordBatch, &mut SlabAllocator, &mut SelectionScratch) -> RowSelection
+        + Send
+        + 'static,
 {
     type Unary = Filter<F>;
 
@@ -104,14 +106,14 @@ where
             delivery: self.1,
             allocator: SlabAllocator::new(false),
             accumulator: None,
-            selection: Vec::new(),
+            scratch: SelectionScratch::default(),
         }
     }
 }
 
 pub struct Filter<F>
 where
-    F: FnMut(&RecordBatch, &mut SlabAllocator, &mut Vec<u32>) -> RowSelection + Send,
+    F: FnMut(&RecordBatch, &mut SlabAllocator, &mut SelectionScratch) -> RowSelection + Send,
 {
     func: F,
     /// Whether surviving rows wait for a full batch or go downstream at once.
@@ -122,15 +124,15 @@ where
     /// schema-agnostic by design (batches carry their schema; specs carry
     /// none), so the factory has nothing to construct this from.
     accumulator: Option<BatchAccumulator>,
-    /// Scratch handed to the closure for the selected row positions.
-    selection: Vec<u32>,
+    /// Lent to the closure for the selection of each batch.
+    scratch: SelectionScratch,
 }
 
 impl<F> Filter<F>
 where
-    F: FnMut(&RecordBatch, &mut SlabAllocator, &mut Vec<u32>) -> RowSelection + Send,
+    F: FnMut(&RecordBatch, &mut SlabAllocator, &mut SelectionScratch) -> RowSelection + Send,
 {
-    /// Apply the selection sitting in `self.selection` to `batch`: send whole
+    /// Apply the positions sitting in the scratch to `batch`: send whole
     /// surviving batches directly, gather partial ones out of the batch when
     /// delivery is immediate, and coalesce them through the accumulator
     /// otherwise.
@@ -139,7 +141,7 @@ where
         batch: RecordBatch,
         output: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
-        let kept = self.selection.len();
+        let kept = self.scratch.positions.len();
         if kept == 0 {
             return Ok(());
         }
@@ -166,7 +168,7 @@ where
             let columns = batch
                 .columns()
                 .iter()
-                .map(|column| take(&mut self.allocator, column, &self.selection))
+                .map(|column| take(&mut self.allocator, column, &self.scratch.positions))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(unary::Error::from)?;
             let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(kept));
@@ -175,11 +177,82 @@ where
             output.send(selected)?;
             return Ok(());
         }
-        // The accumulator coalesces into a fixed schema, but consecutive batches
-        // need not share one: a variant column shredded differently file to file
-        // arrives as a different struct type each time. When the schema changes,
-        // flush what is held and start a fresh accumulator, so unlike batches are
-        // emitted separately rather than concatenated into a type mismatch.
+        self.flush_on_schema_change(&batch, output)?;
+        let accumulator = self
+            .accumulator
+            .get_or_insert_with(|| BatchAccumulator::new(batch.schema(), &mut self.allocator));
+        accumulator.append_batch_by_indices_flushing::<unary::Error>(
+            &batch,
+            &self.scratch.positions,
+            &mut self.allocator,
+            &mut |full| output.send(full).map_err(Into::into),
+        )?;
+        Ok(())
+    }
+
+    /// Apply the mask sitting in the scratch to `batch`. The words are lent
+    /// to a buffer for the delivery and taken back after it, since nothing
+    /// downstream keeps the mask.
+    fn deliver_masked_rows(
+        &mut self,
+        batch: RecordBatch,
+        output: &mut dyn Sender<RecordBatch>,
+    ) -> unary::Result<()> {
+        let words = std::mem::take(&mut self.scratch.mask_words);
+        let mask = BooleanBuffer::new(Buffer::from_vec(words), 0, batch.num_rows());
+        let result = self.apply_mask(batch, &mask, output);
+        self.scratch.mask_words = mask
+            .into_inner()
+            .into_vec()
+            .expect("the mask is only read during the delivery");
+        result
+    }
+
+    /// Apply `mask` to `batch`, as [`deliver_selected_rows`](Self::deliver_selected_rows)
+    /// applies a selection: a whole surviving batch goes out as it is, a
+    /// gathered-at-once delivery goes by the mask's positions, and a coalesced
+    /// one is appended by mask, so rows that come in runs are copied in runs.
+    fn apply_mask(
+        &mut self,
+        batch: RecordBatch,
+        mask: &BooleanBuffer,
+        output: &mut dyn Sender<RecordBatch>,
+    ) -> unary::Result<()> {
+        let kept = mask.count_set_bits();
+        if kept == 0 {
+            return Ok(());
+        }
+        if kept == batch.num_rows() && batch.num_rows() >= RECORD_BATCH_SIZE / 2 {
+            output.send(batch)?;
+            return Ok(());
+        }
+        if batch.num_columns() == 0 || self.delivery == RowDelivery::Immediate {
+            collect_set_positions(mask, &mut self.scratch.positions);
+            return self.deliver_selected_rows(batch, output);
+        }
+        self.flush_on_schema_change(&batch, output)?;
+        let accumulator = self
+            .accumulator
+            .get_or_insert_with(|| BatchAccumulator::new(batch.schema(), &mut self.allocator));
+        accumulator.append_batch_by_mask_flushing::<unary::Error>(
+            &batch,
+            mask,
+            &mut self.allocator,
+            &mut |full| output.send(full).map_err(Into::into),
+        )?;
+        Ok(())
+    }
+
+    /// The accumulator coalesces into a fixed schema, but consecutive batches
+    /// need not share one: a variant column shredded differently file to file
+    /// arrives as a different struct type each time. When the schema changes,
+    /// flush what is held and drop the accumulator, so unlike batches are
+    /// emitted separately rather than concatenated into a type mismatch.
+    fn flush_on_schema_change(
+        &mut self,
+        batch: &RecordBatch,
+        output: &mut dyn Sender<RecordBatch>,
+    ) -> unary::Result<()> {
         if let Some(accumulator) = &mut self.accumulator
             && accumulator.schema() != &batch.schema()
         {
@@ -188,22 +261,13 @@ where
             }
             self.accumulator = None;
         }
-        let accumulator = self
-            .accumulator
-            .get_or_insert_with(|| BatchAccumulator::new(batch.schema(), &mut self.allocator));
-        accumulator.append_batch_by_indices_flushing::<unary::Error>(
-            &batch,
-            &self.selection,
-            &mut self.allocator,
-            &mut |full| output.send(full).map_err(Into::into),
-        )?;
         Ok(())
     }
 }
 
 impl<F> Unary<RecordBatch, RecordBatch> for Filter<F>
 where
-    F: FnMut(&RecordBatch, &mut SlabAllocator, &mut Vec<u32>) -> RowSelection + Send,
+    F: FnMut(&RecordBatch, &mut SlabAllocator, &mut SelectionScratch) -> RowSelection + Send,
 {
     fn consume(
         &mut self,
@@ -211,8 +275,8 @@ where
         output: &mut dyn Sender<RecordBatch>,
         _io: &mut crate::io::OperatorIO,
     ) -> unary::Result<()> {
-        self.selection.clear();
-        let selection = (self.func)(&batch, &mut self.allocator, &mut self.selection);
+        self.scratch.positions.clear();
+        let selection = (self.func)(&batch, &mut self.allocator, &mut self.scratch);
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -222,6 +286,7 @@ where
             // as it exists.
             RowSelection::All => output.send(batch)?,
             RowSelection::Indices => self.deliver_selected_rows(batch, output)?,
+            RowSelection::Mask => self.deliver_masked_rows(batch, output)?,
         }
         Ok(())
     }
@@ -247,7 +312,9 @@ mod tests {
 
     fn filter_operator<F>(func: F) -> Filter<F>
     where
-        F: FnMut(&RecordBatch, &mut SlabAllocator, &mut Vec<u32>) -> RowSelection + Send + 'static,
+        F: FnMut(&RecordBatch, &mut SlabAllocator, &mut SelectionScratch) -> RowSelection
+            + Send
+            + 'static,
     {
         FilterFactory(func, RowDelivery::Coalesced).build_unary()
     }
@@ -255,11 +322,25 @@ mod tests {
     fn keep_first_row(
         _: &RecordBatch,
         _: &mut SlabAllocator,
-        indices: &mut Vec<u32>,
+        scratch: &mut SelectionScratch,
     ) -> RowSelection {
-        indices.clear();
-        indices.push(0);
+        scratch.positions.clear();
+        scratch.positions.push(0);
         RowSelection::Indices
+    }
+
+    /// Write the mask keeping the rows `keep` names of `rows` into the scratch.
+    fn select_by_mask(
+        scratch: &mut SelectionScratch,
+        rows: usize,
+        keep: impl Fn(usize) -> bool,
+    ) -> RowSelection {
+        scratch.mask_words.clear();
+        scratch.mask_words.resize(rows.div_ceil(64), 0);
+        for row in (0..rows).filter(|&row| keep(row)) {
+            scratch.mask_words[row / 64] |= 1 << (row % 64);
+        }
+        RowSelection::Mask
     }
 
     fn batch(values: &[i32]) -> RecordBatch {
@@ -288,11 +369,13 @@ mod tests {
         let n = 40_000i32;
         let values: Vec<i32> = (0..n).collect();
         let filter = filter_operator(
-            |b: &RecordBatch, _: &mut SlabAllocator, indices: &mut Vec<u32>| {
-                indices.clear();
+            |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                scratch.positions.clear();
                 // Keep all but every 1000th row, so the survivors are a
                 // gathered (indices) selection rather than a pass-through.
-                indices.extend((0..b.num_rows() as u32).filter(|i| i % 1000 != 0));
+                scratch
+                    .positions
+                    .extend((0..b.num_rows() as u32).filter(|i| i % 1000 != 0));
                 RowSelection::Indices
             },
         );
@@ -308,10 +391,10 @@ mod tests {
     fn keeps_matching_rows() {
         init_test_free_pool(4);
         let filter = filter_operator(
-            |b: &RecordBatch, _: &mut SlabAllocator, indices: &mut Vec<u32>| {
+            |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
                 let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
                 let mask = BooleanArray::from_iter(col.values().iter().map(|v| Some(*v > 3)));
-                collect_selected_indices(&mask, indices);
+                collect_selected_indices(&mask, &mut scratch.positions);
                 RowSelection::Indices
             },
         );
@@ -323,11 +406,57 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_rows_a_mask_names() {
+        init_test_free_pool(4);
+        let filter = filter_operator(
+            |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                select_by_mask(scratch, b.num_rows(), |row| col.value(row) != 3)
+            },
+        );
+
+        let out = run_unary_to_completion(filter, vec![batch(&[1, 2, 3, 4, 5]), batch(&[3, 6])]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(i32_col(&out[0]), vec![1, 2, 4, 5, 6]);
+    }
+
+    #[test]
+    fn a_mask_naming_no_row_produces_no_output() {
+        init_test_free_pool(4);
+        let filter = filter_operator(
+            |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                select_by_mask(scratch, b.num_rows(), |_| false)
+            },
+        );
+
+        let out = run_unary_to_completion(filter, vec![batch(&[1, 2, 3])]);
+
+        assert_eq!(out.len(), 0);
+    }
+
+    #[test]
+    fn immediate_delivery_emits_a_masked_batch_at_once() {
+        init_test_free_pool(4);
+        let keep_but_the_first =
+            |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                select_by_mask(scratch, b.num_rows(), |row| row != 0)
+            };
+        let filter = FilterFactory(keep_but_the_first, RowDelivery::Immediate).build_unary();
+
+        let out = run_unary_to_completion(filter, vec![batch(&[1, 2, 3]), batch(&[4, 5, 6])]);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(i32_col(&out[0]), vec![2, 3]);
+        assert_eq!(i32_col(&out[1]), vec![5, 6]);
+    }
+
+    #[test]
     fn no_matches_produces_no_output() {
         init_test_free_pool(4);
         let filter = filter_operator(
-            |_: &RecordBatch, _: &mut SlabAllocator, out: &mut Vec<u32>| {
-                out.clear();
+            |_: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                scratch.positions.clear();
                 RowSelection::Indices
             },
         );
@@ -340,9 +469,9 @@ mod tests {
     #[test]
     fn all_match() {
         init_test_free_pool(4);
-        let filter = filter_operator(|_: &RecordBatch, _: &mut SlabAllocator, _: &mut Vec<u32>| {
-            RowSelection::All
-        });
+        let filter = filter_operator(
+            |_: &RecordBatch, _: &mut SlabAllocator, _: &mut SelectionScratch| RowSelection::All,
+        );
 
         let out = run_unary_to_completion(filter, vec![batch(&[10, 20, 30])]);
 
@@ -386,9 +515,9 @@ mod tests {
         // Keep one row from each, so both take the coalescing (accumulator) path
         // rather than passing through whole.
         let filter = filter_operator(
-            |_: &RecordBatch, _: &mut SlabAllocator, indices: &mut Vec<u32>| {
-                indices.clear();
-                indices.push(0);
+            |_: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                scratch.positions.clear();
+                scratch.positions.push(0);
                 RowSelection::Indices
             },
         );
@@ -405,10 +534,10 @@ mod tests {
     fn multiple_batches() {
         init_test_free_pool(4);
         let filter = filter_operator(
-            |b: &RecordBatch, _: &mut SlabAllocator, indices: &mut Vec<u32>| {
+            |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
                 let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
                 let mask = BooleanArray::from_iter(col.values().iter().map(|v| Some(*v % 2 == 0)));
-                collect_selected_indices(&mask, indices);
+                collect_selected_indices(&mask, &mut scratch.positions);
                 RowSelection::Indices
             },
         );
@@ -536,9 +665,9 @@ mod tests {
     #[test]
     fn empty_batch() {
         init_test_free_pool(4);
-        let filter = filter_operator(|_: &RecordBatch, _: &mut SlabAllocator, _: &mut Vec<u32>| {
-            RowSelection::All
-        });
+        let filter = filter_operator(
+            |_: &RecordBatch, _: &mut SlabAllocator, _: &mut SelectionScratch| RowSelection::All,
+        );
 
         let out = run_unary_to_completion(filter, vec![batch(&[])]);
 

@@ -53,7 +53,7 @@ fn filter_string_contains() {
             let mut c = Contains::new("alice");
             move |batch: &RecordBatch,
                   _: &mut dispatch::memory::SlabAllocator,
-                  indices: &mut Vec<u32>| {
+                  scratch: &mut dispatch::SelectionScratch| {
                 let mask = c.run(
                     batch
                         .column(0)
@@ -61,7 +61,7 @@ fn filter_string_contains() {
                         .downcast_ref::<StringViewArray>()
                         .unwrap(),
                 );
-                dispatch::collect_selected_indices(&mask, indices);
+                dispatch::collect_selected_indices(&mask, &mut scratch.positions);
                 dispatch::RowSelection::Indices
             }
         })
@@ -87,7 +87,7 @@ fn filter_no_matches_returns_zero() {
             let mut c = Contains::new("zzz_no_match");
             move |batch: &RecordBatch,
                   _: &mut dispatch::memory::SlabAllocator,
-                  indices: &mut Vec<u32>| {
+                  scratch: &mut dispatch::SelectionScratch| {
                 let mask = c.run(
                     batch
                         .column(0)
@@ -95,7 +95,7 @@ fn filter_no_matches_returns_zero() {
                         .downcast_ref::<StringViewArray>()
                         .unwrap(),
                 );
-                dispatch::collect_selected_indices(&mask, indices);
+                dispatch::collect_selected_indices(&mask, &mut scratch.positions);
                 dispatch::RowSelection::Indices
             }
         })
@@ -120,7 +120,7 @@ fn filter_integer_column() {
         .filter(|| {
             move |batch: &RecordBatch,
                   _: &mut dispatch::memory::SlabAllocator,
-                  indices: &mut Vec<u32>| {
+                  scratch: &mut dispatch::SelectionScratch| {
                 let col = batch
                     .column(1)
                     .as_any()
@@ -129,7 +129,7 @@ fn filter_integer_column() {
                 let mask = BooleanArray::from(BooleanBuffer::collect_bool(col.len(), |i| {
                     col.value(i) > 20
                 }));
-                dispatch::collect_selected_indices(&mask, indices);
+                dispatch::collect_selected_indices(&mask, &mut scratch.positions);
                 dispatch::RowSelection::Indices
             }
         })
@@ -393,7 +393,9 @@ fn limit_abandons_upstream_after_reaching_count() {
         .record_batches()
         .filter(move || {
             let counter = counter.clone();
-            move |_: &RecordBatch, _: &mut dispatch::memory::SlabAllocator, _: &mut Vec<u32>| {
+            move |_: &RecordBatch,
+                  _: &mut dispatch::memory::SlabAllocator,
+                  _: &mut dispatch::SelectionScratch| {
                 counter.fetch_add(1, Ordering::Relaxed);
                 dispatch::RowSelection::All
             }

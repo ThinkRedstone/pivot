@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, StructArray};
+use arrow_buffer::BooleanBuffer;
 use arrow_schema::{ArrowError, Fields};
 
 use super::column::{ChunkedColumn, ColumnAccumulator, EncodedRowIds};
@@ -69,6 +70,22 @@ impl ColumnAccumulator for StructColumn {
             .append_range(column.nulls(), start, len, destination_start);
         for (child, values) in self.children.iter_mut().zip(column.columns()) {
             child.append_from_range(values, start, len, destination_start, allocator);
+        }
+    }
+
+    fn append_from_mask(
+        &mut self,
+        column: &ArrayRef,
+        mask: &BooleanBuffer,
+        selected_count: usize,
+        destination_start: usize,
+        allocator: &mut SlabAllocator,
+    ) {
+        let column = column.as_struct();
+        self.validity
+            .append_mask(column.nulls(), mask, destination_start);
+        for (child, values) in self.children.iter_mut().zip(column.columns()) {
+            child.append_from_mask(values, mask, selected_count, destination_start, allocator);
         }
     }
 

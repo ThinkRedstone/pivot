@@ -39,6 +39,29 @@ pub use builders::{ArrayBuilder, PrimitiveBuilder, ValidityBuilder, ViewBuilder}
 pub use int_bits::IntBits;
 pub use slab_column::SlabColumn;
 
+/// Collect the ascending positions of the set bits of `bits` into `out`,
+/// replacing its contents.
+///
+/// Extending a `Vec` straight from the bit iterator pays a capacity check
+/// per element (the iterator has no usable size hint); reserving the exact
+/// popcount up front and writing raw skips that.
+pub fn collect_set_positions(bits: &BooleanBuffer, out: &mut Vec<u32>) {
+    out.clear();
+    let set = bits.count_set_bits();
+    out.reserve(set);
+    // SAFETY: `reserve(set)` guarantees capacity for every set bit, and the
+    // iterator yields exactly `set` positions.
+    unsafe {
+        let ptr = out.as_mut_ptr();
+        let mut len = 0;
+        for position in bits.set_indices_u32() {
+            ptr.add(len).write(position);
+            len += 1;
+        }
+        out.set_len(len);
+    }
+}
+
 /// Take the rows of `column` at `indices` (ascending) into a new array.
 ///
 /// Fixed-width columns gather raw values into a slab buffer, the same

@@ -15,6 +15,7 @@
 
 use arrow::compute::kernels::concat::concat;
 use arrow_array::{Array, ArrayRef};
+use arrow_buffer::BooleanBuffer;
 use arrow_schema::ArrowError;
 
 use arrow_array::make_array;
@@ -97,6 +98,19 @@ impl ColumnAccumulator for ConcatenatedColumn {
         _allocator: &mut SlabAllocator,
     ) {
         self.arrays.push(column.slice(start, len));
+    }
+
+    fn append_from_mask(
+        &mut self,
+        column: &ArrayRef,
+        mask: &BooleanBuffer,
+        _selected_count: usize,
+        _destination_start: usize,
+        _allocator: &mut SlabAllocator,
+    ) {
+        for (start, end) in mask.set_slices() {
+            self.arrays.push(column.slice(start, end - start));
+        }
     }
 
     fn append_from_batches(

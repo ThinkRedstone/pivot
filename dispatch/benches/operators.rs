@@ -81,7 +81,8 @@ use dispatch::{
     AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, DataFlowDispatcher, Dispatch,
     Distinct, Dynamic, GroupLimit, IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor,
     OrderBy, RecordBatchOperatorSpec, RowKeyExtractor, RowKeySchema, RowSelection,
-    StringKeyExtractor, SumSlot, collect_selected_indices, memory_ctx, values_input,
+    SelectionScratch, StringKeyExtractor, SumSlot, collect_selected_indices, memory_ctx,
+    values_input,
 };
 
 // ---------------------------------------------------------------------------
@@ -460,8 +461,8 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         |s| {
             s.filter(|| {
-                move |b: &RecordBatch, _: &mut SlabAllocator, ix: &mut Vec<u32>| {
-                    keep_i16_nonzero(b, 0, ix)
+                move |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                    keep_i16_nonzero(b, 0, &mut scratch.positions)
                 }
             })
             .group_by_aggregate::<IntKeyExtractor<Int16Type>, Compiled<(CountSlot,)>>(
@@ -565,8 +566,8 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         |s| {
             s.filter(|| {
-                move |b: &RecordBatch, _: &mut SlabAllocator, ix: &mut Vec<u32>| {
-                    keep_nonempty(b, 0, ix)
+                move |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                    keep_nonempty(b, 0, &mut scratch.positions)
                 }
             })
             .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(
@@ -611,10 +612,10 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         |s| {
             s.filter(|| {
-                move |b: &RecordBatch, _: &mut SlabAllocator, ix: &mut Vec<u32>| {
+                move |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
                     let a = b.column(0).as_any().downcast_ref::<Int16Array>().unwrap();
                     let mask: BooleanArray = (0..a.len()).map(|i| Some(a.value(i) == 62)).collect();
-                    collect_selected_indices(&mask, ix);
+                    collect_selected_indices(&mask, &mut scratch.positions);
                     RowSelection::Indices
                 }
             })
@@ -740,7 +741,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                     .collect()
             },
             move |s| {
-                s.filter(|| move |b: &RecordBatch, _: &mut SlabAllocator, ix: &mut Vec<u32>| keep_nonempty(b, 4, ix))
+                s.filter(|| move |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| keep_nonempty(b, 4, &mut scratch.positions))
                     .group_by_aggregate::<IntPairKeyExtractor<Int16Type, Int32Type>, Dynamic<i64, true>>(
                         vec![0, 1],
                         slots.clone(),
@@ -911,14 +912,14 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
         |s| {
             s.filter(|| {
                 let mut contains = Contains::new("google");
-                move |b: &RecordBatch, _: &mut SlabAllocator, ix: &mut Vec<u32>| {
+                move |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
                     let col = b
                         .column(0)
                         .as_any()
                         .downcast_ref::<StringViewArray>()
                         .unwrap();
                     let mask = contains.run(col);
-                    collect_selected_indices(&mask, ix);
+                    collect_selected_indices(&mask, &mut scratch.positions);
                     RowSelection::Indices
                 }
             })
@@ -947,8 +948,8 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         |s| {
             s.filter(|| {
-                move |b: &RecordBatch, _: &mut SlabAllocator, ix: &mut Vec<u32>| {
-                    keep_nonempty(b, 0, ix)
+                move |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                    keep_nonempty(b, 0, &mut scratch.positions)
                 }
             })
             .aggregate::<i64>(vec![AggregationSlot::new(
@@ -979,8 +980,8 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
             },
             move |s| {
                 s.filter(move || {
-                    move |b: &RecordBatch, _: &mut SlabAllocator, ix: &mut Vec<u32>| {
-                        keep_i64_eq(b, 0, target, ix)
+                    move |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                        keep_i64_eq(b, 0, target, &mut scratch.positions)
                     }
                 })
                 .aggregate::<i64>(vec![AggregationSlot::new(
@@ -1029,8 +1030,8 @@ fn bench_order_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         |s| {
             s.filter(|| {
-                move |b: &RecordBatch, _: &mut SlabAllocator, ix: &mut Vec<u32>| {
-                    keep_nonempty(b, 1, ix)
+                move |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                    keep_nonempty(b, 1, &mut scratch.positions)
                 }
             })
             .order_by_limit(vec![OrderBy::new(0, false, false)], 10)
@@ -1055,8 +1056,8 @@ fn bench_order_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         |s| {
             s.filter(|| {
-                move |b: &RecordBatch, _: &mut SlabAllocator, ix: &mut Vec<u32>| {
-                    keep_nonempty(b, 0, ix)
+                move |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                    keep_nonempty(b, 0, &mut scratch.positions)
                 }
             })
             .order_by_limit(vec![OrderBy::new(0, false, false)], 10)
@@ -1091,8 +1092,8 @@ fn bench_order_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         |s| {
             s.filter(|| {
-                move |b: &RecordBatch, _: &mut SlabAllocator, ix: &mut Vec<u32>| {
-                    keep_nonempty(b, 1, ix)
+                move |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                    keep_nonempty(b, 1, &mut scratch.positions)
                 }
             })
             .order_by_limit(

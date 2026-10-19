@@ -29,7 +29,7 @@ use arrow::array::ArrayData;
 use arrow_array::builder::make_view;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, make_array};
-use arrow_buffer::{Buffer, NullBuffer};
+use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_schema::{ArrowError, DataType};
 
 /// Bytes a view column takes for copied values at a time. Well under a slab, so
@@ -388,6 +388,39 @@ impl ColumnAccumulator for ViewColumn {
                 views,
                 source_buffers,
                 start..start + len,
+                destination_start,
+                allocator,
+            ),
+        }
+    }
+
+    fn append_from_mask(
+        &mut self,
+        column: &ArrayRef,
+        mask: &BooleanBuffer,
+        selected_count: usize,
+        destination_start: usize,
+        allocator: &mut SlabAllocator,
+    ) {
+        if selected_count == 0 {
+            return;
+        }
+        let (views, source_buffers, nulls) = source_parts(column);
+        self.validity.append_mask(nulls, mask, destination_start);
+        // One placement for the whole selection: the share the append takes
+        // of the source is what decides it, not the length of any one run.
+        match self.place_source_buffer(source_buffers, selected_count, column.len()) {
+            Placement::Rebase(base) => {
+                let mut destination = destination_start;
+                for (start, end) in mask.set_slices() {
+                    self.append_rebasing_range(base, views, start, end - start, destination);
+                    destination += end - start;
+                }
+            }
+            Placement::Copy => self.append_copying_values(
+                views,
+                source_buffers,
+                mask.set_slices().flat_map(|(start, end)| start..end),
                 destination_start,
                 allocator,
             ),

@@ -36,9 +36,11 @@ mod view;
 pub(in crate::arrays) use view::{DataBlock, INLINE_VIEW_LEN, copy_value};
 
 use arrow_array::{ArrayRef, RecordBatch};
+use arrow_buffer::BooleanBuffer;
 use arrow_schema::{ArrowError, DataType, SchemaRef};
 
 use crate::RECORD_BATCH_SIZE;
+use crate::arrays::collect_set_positions;
 use crate::memory::{BUFFER_SIZE, SlabAllocator};
 use column::ColumnAccumulator;
 pub use column::{ChunkedColumn, EncodedRowIds};
@@ -50,9 +52,22 @@ use view::ViewColumn;
 /// room for an input batch that lands on top of an almost-full accumulator.
 const COALESCING_CAPACITY: usize = 2 * RECORD_BATCH_SIZE;
 
+/// The share of its rows a mask must keep for the mask to be appended run by
+/// run rather than row by row (see
+/// [`append_batch_by_mask`](BatchAccumulator::append_batch_by_mask)).
+///
+/// A run copies as one piece, so its cost is a call plus its bytes, while a
+/// row copied on its own costs about an element's load and store. The calls
+/// pay for themselves once runs average about 8 rows. The runs are never
+/// counted: a selection is taken to keep each row independently, so a run
+/// ends at every dropped row and the mean run is `1 / (1 - kept share)`,
+/// 8 at this share.
+const RUN_COPY_MIN_KEPT_SHARE: f64 = 0.875;
+
 /// Accumulates rows of many batches and hands them out as one batch (see the
 /// module docs). Rows arrive via
 /// [`append_batch_by_indices`](Self::append_batch_by_indices),
+/// [`append_batch_by_mask`](Self::append_batch_by_mask),
 /// [`append_from_batches`](Self::append_from_batches), or
 /// [`append_range`](Self::append_range); [`take_batch`](Self::take_batch) hands
 /// out the accumulated rows and resets.
@@ -60,6 +75,10 @@ pub struct BatchAccumulator {
     schema: SchemaRef,
     columns: Vec<Box<dyn ColumnAccumulator>>,
     len: usize,
+    /// The positions a mask append gathers by when it keeps too few rows to
+    /// copy in runs. Kept between appends so that a selective filter, whose
+    /// every batch takes this path, does not allocate a position list per batch.
+    gather_positions: Vec<u32>,
 }
 
 impl BatchAccumulator {
@@ -75,6 +94,7 @@ impl BatchAccumulator {
             schema,
             columns,
             len: 0,
+            gather_positions: Vec::new(),
         }
     }
 
@@ -129,6 +149,47 @@ impl BatchAccumulator {
             accumulator.append_from_indices(column, indices, self.len, allocator);
         }
         self.len += indices.len();
+    }
+
+    /// Append the rows of `batch` whose bit of `mask` is set, one bit per row
+    /// of the batch. The selected rows must be no more than the remaining
+    /// [`capacity`](Self::capacity), and the batch must match the
+    /// accumulator's schema.
+    ///
+    /// The share of rows the mask keeps decides how they are copied. A mask
+    /// keeping most of them, as under a filter most rows pass or a sparse
+    /// set of deletions, has its rows in long runs, and they are copied a run
+    /// at a time, each run one contiguous piece per column. A mask keeping
+    /// fewer has them scattered, and they are gathered one by one, the same
+    /// as [`append_batch_by_indices`](Self::append_batch_by_indices) does,
+    /// since detecting runs of one or two rows only adds branches. The
+    /// boundary is [`RUN_COPY_MIN_KEPT_SHARE`].
+    pub fn append_batch_by_mask(
+        &mut self,
+        batch: &RecordBatch,
+        mask: &BooleanBuffer,
+        allocator: &mut SlabAllocator,
+    ) {
+        let selected_count = mask.count_set_bits();
+        if selected_count == 0 {
+            return;
+        }
+        if selected_count as f64 >= mask.len() as f64 * RUN_COPY_MIN_KEPT_SHARE {
+            for (accumulator, column) in self.columns.iter_mut().zip(batch.columns()) {
+                accumulator.append_from_mask(column, mask, selected_count, self.len, allocator);
+            }
+        } else {
+            collect_set_positions(mask, &mut self.gather_positions);
+            for (accumulator, column) in self.columns.iter_mut().zip(batch.columns()) {
+                accumulator.append_from_indices(
+                    column,
+                    &self.gather_positions,
+                    self.len,
+                    allocator,
+                );
+            }
+        }
+        self.len += selected_count;
     }
 
     /// Append rows stored across many batches at the encoded `ids`
@@ -191,6 +252,44 @@ impl BatchAccumulator {
                 flush(full)?;
             }
             remaining = rest;
+        }
+        Ok(())
+    }
+
+    /// The mask form of
+    /// [`append_batch_by_indices_flushing`](Self::append_batch_by_indices_flushing):
+    /// append the rows `mask` selects, handing a full batch to `flush`
+    /// whenever one accumulates. A batch no longer than the room goes in
+    /// whole; a longer one, which only an input larger than a batch
+    /// produces, goes in as room-sized windows of itself and its mask.
+    pub fn append_batch_by_mask_flushing<E: From<ArrowError>>(
+        &mut self,
+        batch: &RecordBatch,
+        mask: &BooleanBuffer,
+        allocator: &mut SlabAllocator,
+        flush: &mut dyn FnMut(RecordBatch) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if batch.num_rows() <= COALESCING_CAPACITY - self.len {
+            self.append_batch_by_mask(batch, mask, allocator);
+            if self.has_full_batch() {
+                let full = self.take_batch(allocator)?;
+                flush(full)?;
+            }
+            return Ok(());
+        }
+        let mut offset = 0;
+        while offset < batch.num_rows() {
+            let len = (batch.num_rows() - offset).min(COALESCING_CAPACITY - self.len);
+            self.append_batch_by_mask(
+                &batch.slice(offset, len),
+                &mask.slice(offset, len),
+                allocator,
+            );
+            if self.has_full_batch() {
+                let full = self.take_batch(allocator)?;
+                flush(full)?;
+            }
+            offset += len;
         }
         Ok(())
     }
@@ -293,6 +392,114 @@ mod tests {
         .unwrap();
         assert_eq!(emitted, expected);
         assert!(accumulator.is_empty());
+    }
+
+    /// A batch of `rows` rows, with an id and a short and a long string per row.
+    fn tall_batch(rows: usize) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8View, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..rows as i64)),
+                Arc::new(StringViewArray::from_iter((0..rows).map(|row| {
+                    match row % 3 {
+                        0 => Some(format!("row {row} with a value too long to inline")),
+                        1 => Some(format!("r{row}")),
+                        _ => None,
+                    }
+                }))),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn mask_where(rows: usize, selected: impl Fn(usize) -> bool) -> BooleanBuffer {
+        BooleanBuffer::from_iter((0..rows).map(selected))
+    }
+
+    #[test]
+    fn appends_the_long_runs_of_a_mask() {
+        init_test_free_pool(4);
+        let batch = tall_batch(500);
+        let mask = mask_where(500, |row| row % 100 != 50);
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
+
+        accumulator.append_batch_by_mask(&batch, &mask, &mut allocator);
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        let expected = filter_record_batch(&batch, &BooleanArray::new(mask, None)).unwrap();
+        assert_eq!(emitted, expected);
+    }
+
+    #[test]
+    fn appends_the_scattered_rows_of_a_mask() {
+        init_test_free_pool(4);
+        let batch = tall_batch(500);
+        let mask = mask_where(500, |row| row % 2 == 1);
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
+
+        accumulator.append_batch_by_mask(&batch, &mask, &mut allocator);
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        let expected = filter_record_batch(&batch, &BooleanArray::new(mask, None)).unwrap();
+        assert_eq!(emitted, expected);
+    }
+
+    #[test]
+    fn a_mask_append_coalesces_with_other_appends() {
+        init_test_free_pool(4);
+        let batch = tall_batch(300);
+        let mask = mask_where(300, |row| row >= 10);
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
+
+        accumulator.append_batch_by_indices(&batch, &[3, 7], &mut allocator);
+        accumulator.append_batch_by_mask(&batch, &mask, &mut allocator);
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        let expected = concat_batches(
+            &batch.schema(),
+            &[batch.slice(3, 1), batch.slice(7, 1), batch.slice(10, 290)],
+        )
+        .unwrap();
+        assert_eq!(emitted, expected);
+    }
+
+    #[test]
+    fn a_mask_selecting_more_than_the_room_flushes_full_batches() {
+        init_test_free_pool(16);
+        let rows = 3 * COALESCING_CAPACITY;
+        let batch = tall_batch(rows);
+        let mask = mask_where(rows, |row| row % 1000 != 0);
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(batch.schema(), &mut allocator);
+        let mut flushed = Vec::new();
+
+        accumulator
+            .append_batch_by_mask_flushing::<ArrowError>(
+                &batch,
+                &mask,
+                &mut allocator,
+                &mut |full| {
+                    flushed.push(full);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        flushed.push(accumulator.take_batch(&mut allocator).unwrap());
+
+        let expected = filter_record_batch(&batch, &BooleanArray::new(mask, None)).unwrap();
+        assert!(flushed.len() > 1);
+        assert!(
+            flushed[..flushed.len() - 1]
+                .iter()
+                .all(|full| full.num_rows() >= RECORD_BATCH_SIZE)
+        );
+        assert_eq!(concat_batches(&batch.schema(), &flushed).unwrap(), expected);
     }
 
     #[test]

@@ -25,7 +25,7 @@ fn filter_then_project() {
             let mut c = Contains::new("alice");
             move |batch: &RecordBatch,
                   _: &mut dispatch::memory::SlabAllocator,
-                  indices: &mut Vec<u32>| {
+                  scratch: &mut dispatch::SelectionScratch| {
                 let mask = c.run(
                     batch
                         .column(0)
@@ -33,7 +33,7 @@ fn filter_then_project() {
                         .downcast_ref::<StringViewArray>()
                         .unwrap(),
                 );
-                dispatch::collect_selected_indices(&mask, indices);
+                dispatch::collect_selected_indices(&mask, &mut scratch.positions);
                 dispatch::RowSelection::Indices
             }
         })
@@ -63,7 +63,7 @@ fn filter_then_count() {
             let mut c = Contains::new("alice");
             move |batch: &RecordBatch,
                   _: &mut dispatch::memory::SlabAllocator,
-                  indices: &mut Vec<u32>| {
+                  scratch: &mut dispatch::SelectionScratch| {
                 let mask = c.run(
                     batch
                         .column(0)
@@ -71,7 +71,7 @@ fn filter_then_count() {
                         .downcast_ref::<StringViewArray>()
                         .unwrap(),
                 );
-                dispatch::collect_selected_indices(&mask, indices);
+                dispatch::collect_selected_indices(&mask, &mut scratch.positions);
                 dispatch::RowSelection::Indices
             }
         })
@@ -109,7 +109,7 @@ fn filter_then_group_by_then_order_by() {
         .filter(|| {
             move |batch: &RecordBatch,
                   _: &mut dispatch::memory::SlabAllocator,
-                  indices: &mut Vec<u32>| {
+                  scratch: &mut dispatch::SelectionScratch| {
                 let col = batch
                     .column(0)
                     .as_any()
@@ -118,7 +118,7 @@ fn filter_then_group_by_then_order_by() {
                 let mask = BooleanArray::from(BooleanBuffer::collect_bool(col.len(), |i| {
                     col.value(i) != "other.com"
                 }));
-                dispatch::collect_selected_indices(&mask, indices);
+                dispatch::collect_selected_indices(&mask, &mut scratch.positions);
                 dispatch::RowSelection::Indices
             }
         })

@@ -108,3 +108,9 @@ harness = false
 name = "http_range"
 harness = false
 required-features = ["test-util"]
+
+# `test-util` for `init_test_free_pool`, which backs the accumulator's slabs.
+[[bench]]
+name = "accumulator"
+harness = false
+required-features = ["test-util"]
