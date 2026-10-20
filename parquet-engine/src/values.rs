@@ -74,7 +74,9 @@ pub fn pivot_scalar(array: &ArrayRef, row: usize) -> Scalar<ArrayRef> {
                 .as_any()
                 .downcast_ref::<StringViewArray>()
                 .expect("Utf8View array has StringViewArray representation");
-            Arc::new(strings.slice(row, 1).gc())
+            Arc::new(StringViewArray::from(vec![
+                (!strings.is_null(row)).then(|| strings.value(row)),
+            ]))
         }
         _ => take(array, &UInt32Array::from(vec![row as u32]), None)
             .expect("one-row take supports every physical column type"),
