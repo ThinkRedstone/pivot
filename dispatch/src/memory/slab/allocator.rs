@@ -40,9 +40,14 @@ impl SlabAllocator {
     }
 
     /// Bytes remaining in the current working buffer.
+    ///
+    /// Rounding the offset up to an alignment can move it past the end of the buffer. In
+    /// that case there is no room left, so this returns zero. A plain subtraction would
+    /// wrap around to a huge number instead, every "does it fit" check would pass, and the
+    /// slab would be handed out from memory that belongs to the next ring slot.
     #[inline(always)]
     fn remaining_in_buffer(&self) -> usize {
-        BUFFER_SIZE - self.offset
+        BUFFER_SIZE.saturating_sub(self.offset)
     }
 
     /// Carves a slab of `size` bytes from the current buffer without checking capacity.
@@ -95,27 +100,42 @@ impl SlabAllocator {
         }
     }
 
-    /// Allocates a single slab of exactly `size` bytes.
+    /// Moves `self.offset` to where the next allocation of `bytes` bytes starts: a multiple
+    /// of `align`, with the whole allocation inside one buffer. Three steps, in this order:
+    /// rewind to the start of the buffer if nothing else holds it, round the offset up to
+    /// the alignment, and take a fresh buffer if the rounded offset leaves fewer than
+    /// `bytes` bytes.
     ///
-    /// Panics if `size >= BUFFER_SIZE` (2MB) — use [`get_slabs_of_size`](Self::get_slabs_of_size)
-    /// for larger allocations. Advances to a new buffer if the current one doesn't have enough room.
-    pub fn get_slab_of_size(&mut self, size: usize, zeroed: bool) -> Slab {
-        assert!(size <= BUFFER_SIZE, "Size was {:?}", size);
+    /// Rounding is needed because a previous odd-sized allocation (e.g. `SlabBuffer<u8>`)
+    /// leaves the offset misaligned for types with stricter requirements (e.g.
+    /// `SlabBuffer<u128>` needs 16-byte alignment), which would be UB in
+    /// `slice::from_raw_parts_mut`.
+    ///
+    /// Rounding must happen before the "does it fit" check, not after. The rounding uses up
+    /// some bytes of the buffer, so a check done before it counts bytes that are no longer
+    /// available. The allocation would then run past the end of the buffer: into a second
+    /// slab that the caller does not expect, or, when the rounding itself goes past the
+    /// end, into the next ring slot.
+    fn advance_offset_for_allocation(&mut self, bytes: usize, align: usize, zeroed: bool) {
+        debug_assert!(
+            align.is_power_of_two(),
+            "alignment {align} is not a power of two"
+        );
         self.rewind_if_unshared(zeroed);
-
-        if self.remaining_in_buffer() < size {
+        self.offset = (self.offset + align - 1) & !(align - 1);
+        if self.remaining_in_buffer() < bytes {
             self.advance_to_new_buffer(zeroed);
         }
-
-        self.get_slab_from_current_buffer(size, zeroed)
     }
 
     /// Allocates `size` bytes across one or more slabs, each at most 2MB.
     ///
     /// Returns the slabs in order — the caller is responsible for treating them as a
     /// contiguous logical buffer (see [`MultiSlabBuffer`]).
-    pub fn get_slabs_of_size(&mut self, size: usize, zeroed: bool) -> Vec<Slab> {
-        self.rewind_if_unshared(zeroed);
+    ///
+    /// Starts at the current offset as is. The caller positions it first with
+    /// [`advance_offset_for_allocation`](Self::advance_offset_for_allocation).
+    fn get_slabs_of_size(&mut self, size: usize, zeroed: bool) -> Vec<Slab> {
         let mut slabs = vec![];
         let mut remaining = size;
         while remaining > 0 {
@@ -126,17 +146,25 @@ impl SlabAllocator {
                 self.advance_to_new_buffer(zeroed);
             }
         }
-
         slabs
     }
 
-    /// Rounds `self.offset` up so that the next allocation starts at an address satisfying
-    /// `align_of::<T>()`. Without this, a prior odd-sized allocation (e.g. `SlabBuffer<u8>`)
-    /// would leave the bump pointer misaligned for types with stricter requirements (e.g.
-    /// `SlabBuffer<u128>` needs 16-byte alignment), causing UB in `slice::from_raw_parts_mut`.
-    fn align_offset<T>(&mut self) {
-        let align = std::mem::align_of::<T>();
-        self.offset = (self.offset + align - 1) & !(align - 1);
+    /// Allocates a single slab of exactly `size` bytes.
+    ///
+    /// Panics if `size > BUFFER_SIZE` (2MB) — use
+    /// [`create_multi_slab_buffer`](Self::create_multi_slab_buffer) for larger allocations.
+    /// Advances to a new buffer if the current one doesn't have enough room.
+    pub fn get_slab_of_size(&mut self, size: usize, zeroed: bool) -> Slab {
+        self.get_aligned_slab(size, 1, zeroed)
+    }
+
+    /// Allocates one slab at an explicitly aligned address.
+    ///
+    /// `size` must fit in one backing buffer (panics otherwise).
+    pub fn get_aligned_slab(&mut self, size: usize, align: usize, zeroed: bool) -> Slab {
+        assert!(size <= BUFFER_SIZE, "Size was {:?}", size);
+        self.advance_offset_for_allocation(size, align, zeroed);
+        self.get_slab_from_current_buffer(size, zeroed)
     }
 
     /// Allocates a [`MultiSlabBuffer<T>`] that can hold `size` elements of type `T`.
@@ -159,13 +187,9 @@ impl SlabAllocator {
         } else {
             size.div_ceil(elems_per_slab) * BUFFER_SIZE
         };
-        self.rewind_if_unshared(zeroed);
         // For MultiSlabBuffer to work properly (with indexing), if the allocation doesn't fit
         // in the remaining space we must start a new buffer so each slab begins at offset 0.
-        if self.remaining_in_buffer() < bytes {
-            self.advance_to_new_buffer(zeroed);
-        }
-        self.align_offset::<T>();
+        self.advance_offset_for_allocation(bytes, align_of::<T>(), zeroed);
         MultiSlabBuffer::new(self.get_slabs_of_size(bytes, zeroed))
     }
 
@@ -180,34 +204,16 @@ impl SlabAllocator {
         } else {
             count.div_ceil(entries_per_slab) * BUFFER_SIZE
         };
-        self.rewind_if_unshared(true);
-        if self.remaining_in_buffer() < bytes {
-            self.advance_to_new_buffer(true);
-        }
-        self.offset = (self.offset + align - 1) & !(align - 1);
+        self.advance_offset_for_allocation(bytes, align, true);
         self.get_slabs_of_size(bytes, true)
-    }
-
-    /// Allocates one slab at an explicitly aligned address.
-    ///
-    /// `size + align` must fit in one backing buffer.
-    pub fn get_aligned_slab(&mut self, size: usize, align: usize, zeroed: bool) -> Slab {
-        self.rewind_if_unshared(zeroed);
-        if self.remaining_in_buffer() < size + align {
-            self.advance_to_new_buffer(zeroed);
-        }
-        self.offset = (self.offset + align - 1) & !(align - 1);
-        self.get_slab_from_current_buffer(size, zeroed)
     }
 
     /// Allocates a [`SlabBuffer<T>`] that can hold `size` elements of type `T`.
     ///
     /// The total byte size (`size * size_of::<T>()`) must be < 2MB since `SlabBuffer` is
-    /// backed by a single slab. The resulting buffer is zeroed.
+    /// backed by a single slab. The slab starts at an address aligned for `T`.
     pub fn create_slab_buffer<T>(&mut self, size: usize, zeroed: bool) -> SlabBuffer<T> {
-        self.align_offset::<T>();
-        let bytes = size * size_of::<T>();
-        let slab = self.get_slab_of_size(bytes, zeroed);
+        let slab = self.get_aligned_slab(size * size_of::<T>(), align_of::<T>(), zeroed);
         SlabBuffer::new(slab)
     }
 }
@@ -285,6 +291,79 @@ mod tests {
         let second = alloc.get_slab_of_size(1024, false);
 
         assert_eq!(unsafe { second.ptr.offset_from(first.ptr) }, 1024);
+    }
+
+    #[test]
+    fn strided_slabs_move_to_a_fresh_buffer_when_alignment_padding_eats_the_slack() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        // Seven 24-byte entries need 168 bytes, not a multiple of the 16-byte
+        // alignment. The filler leaves 172 bytes, enough before aligning the
+        // offset and too little after, so the padding alone decides the fit.
+        let _filler = alloc.get_slab_of_size(BUFFER_SIZE - 172, false);
+
+        let slabs = alloc.create_strided_slabs(7, 24, 16);
+
+        assert_eq!(
+            slabs.len(),
+            1,
+            "a single-buffer table must not be split across buffers"
+        );
+        assert_eq!(slabs[0].size(), 168);
+        assert_eq!(slabs[0].ptr as usize % 16, 0);
+    }
+
+    #[test]
+    fn aligning_an_offset_past_the_buffer_end_moves_strided_slabs_to_a_fresh_buffer() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        // Four bytes short of the end: rounding the offset up to 16 lands past it.
+        let filler = alloc.get_slab_of_size(BUFFER_SIZE - 4, false);
+
+        let slabs = alloc.create_strided_slabs(8, 32, 16);
+
+        assert_eq!(slabs.len(), 1);
+        assert_eq!(slabs[0].size(), 256);
+        let filler_buffer = filler.ptr as usize..filler.ptr as usize + BUFFER_SIZE;
+        let start = slabs[0].ptr as usize;
+        assert!(
+            !filler_buffer.contains(&start) && !filler_buffer.contains(&(start + 255)),
+            "the slab must lie in another buffer, not past this one's end"
+        );
+    }
+
+    #[test]
+    fn aligning_an_offset_past_the_buffer_end_moves_a_slab_buffer_to_a_fresh_buffer() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let filler = alloc.get_slab_of_size(BUFFER_SIZE - 4, false);
+
+        let buffer: SlabBuffer<u128> = alloc.create_slab_buffer(16, false);
+
+        let filler_buffer = filler.ptr as usize..filler.ptr as usize + BUFFER_SIZE;
+        let start = buffer.ptr_at_index(0) as usize;
+        assert_eq!(start % 16, 0);
+        assert!(
+            !filler_buffer.contains(&start) && !filler_buffer.contains(&(start + 16 * 16 - 1)),
+            "the slab must lie in another buffer, not past this one's end"
+        );
+    }
+
+    #[test]
+    fn strided_slabs_use_the_remaining_room_when_they_fit_after_alignment() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let filler = alloc.get_slab_of_size(BUFFER_SIZE - 4096 - 8, false);
+
+        let slabs = alloc.create_strided_slabs(128, 32, 16);
+
+        assert_eq!(slabs.len(), 1);
+        assert_eq!(slabs[0].size(), 4096);
+        assert_eq!(
+            slabs[0].ptr as usize,
+            filler.ptr as usize + BUFFER_SIZE - 4096,
+            "an allocation that fits once aligned stays in the current buffer"
+        );
     }
 
     #[test]
