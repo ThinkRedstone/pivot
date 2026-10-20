@@ -14,7 +14,7 @@ import {
 } from "./api";
 import { SummaryView } from "./components/SummaryView";
 import { buildCategories, Timeline } from "./components/Timeline";
-import { FlameGraph } from "./components/FlameGraph";
+import { FlameGraph } from "./components/Flamegraph";
 import {
   CodePanel,
   ModeToggle,
