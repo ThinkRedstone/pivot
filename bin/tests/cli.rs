@@ -91,6 +91,147 @@ fn open_rejects_zero_workers() {
     assert!(stderr.contains("--workers"), "{stderr}");
 }
 
+/// `pivot open` on a small instance over `datastore`, with `arguments` after it.
+fn open_command(datastore: &std::path::Path, arguments: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pivot"));
+    command
+        .arg("open")
+        .arg(datastore)
+        .args(["--memory", "64m", "--workers", "1"])
+        .args(arguments);
+    command
+}
+
+#[test]
+fn open_runs_commands_in_order() {
+    let directory = tempfile::tempdir().unwrap();
+
+    let output = open_command(
+        directory.path(),
+        &[
+            "-c",
+            "CREATE TABLE t (a BIGINT)",
+            "-c",
+            "INSERT INTO t VALUES (7)",
+            "-c",
+            "SELECT a FROM t",
+        ],
+    )
+    .output()
+    .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(stdout.ends_with(" a \n---\n 7\n(1 row)\n\n"), "{stdout}");
+}
+
+#[test]
+fn open_runs_a_file_and_its_unterminated_last_statement() {
+    let directory = tempfile::tempdir().unwrap();
+    let script = directory.path().join("script.sql");
+    fs::write(
+        &script,
+        "SELECT\n  41 AS first;\n\\timing on\nSELECT 42 AS last",
+    )
+    .unwrap();
+
+    let output = open_command(
+        &directory.path().join("db"),
+        &["-f", script.to_str().unwrap()],
+    )
+    .output()
+    .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(stdout.contains("    41\n"), "{stdout}");
+    assert!(stdout.contains("Timing is on."), "{stdout}");
+    assert!(stdout.contains("   42\n"), "{stdout}");
+}
+
+#[test]
+fn open_reads_a_script_from_stdin_with_dash() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut child = open_command(directory.path(), &["-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), b"SELECT 42 AS answer;").unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(stdout.contains("     42\n"), "{stdout}");
+}
+
+#[test]
+fn open_interleaves_commands_and_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let insert = directory.path().join("insert.sql");
+    fs::write(&insert, "INSERT INTO t VALUES (7);").unwrap();
+
+    let output = open_command(
+        &directory.path().join("db"),
+        &[
+            "-c",
+            "CREATE TABLE t (a BIGINT)",
+            "-f",
+            insert.to_str().unwrap(),
+            "-c",
+            "SELECT a FROM t",
+        ],
+    )
+    .output()
+    .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(stdout.ends_with(" 7\n(1 row)\n\n"), "{stdout}");
+}
+
+#[test]
+fn open_stops_at_the_first_failed_statement() {
+    let directory = tempfile::tempdir().unwrap();
+
+    let failed = open_command(
+        directory.path(),
+        &[
+            "-c",
+            "SELECT * FROM missing",
+            "-c",
+            "CREATE TABLE t (a BIGINT)",
+        ],
+    )
+    .output()
+    .unwrap();
+    let probe = open_command(directory.path(), &["-c", "SELECT * FROM t"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(!failed.status.success(), "{failed:?}");
+    assert!(stderr.contains("ERROR:"), "{stderr}");
+    assert!(!probe.status.success(), "the command after the failure ran");
+}
+
+#[test]
+fn open_rejects_a_missing_script_file() {
+    let directory = tempfile::tempdir().unwrap();
+
+    let output = open_command(directory.path(), &["-f", "/nonexistent/script.sql"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr.contains("pivot: /nonexistent/script.sql: No such file"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn server_command_runs_until_terminated() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

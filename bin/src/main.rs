@@ -1,11 +1,12 @@
 //! Pivot command-line entry point.
 
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use bin::memory::MemoryBudget;
-use bin::shell::ShellTarget;
-use clap::{Parser, Subcommand, ValueEnum};
+use bin::shell::{ShellExit, ShellScript, ShellTarget};
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(name = "pivot", about = "Pivot command-line tools", version)]
@@ -75,28 +76,80 @@ enum PivotCommand {
         /// Number of dispatch worker threads. Defaults to all available cores.
         #[arg(long, value_name = "COUNT")]
         workers: Option<NonZeroUsize>,
+
+        /// Run COMMAND (SQL or a backslash command) and exit instead of
+        /// starting the prompt. Repeatable; runs in order with every -f.
+        #[arg(short = 'c', long = "command", value_name = "COMMAND")]
+        commands: Vec<String>,
+
+        /// Run the SQL and backslash commands in FILE ("-" for stdin) and exit
+        /// instead of starting the prompt. Repeatable; runs in order with
+        /// every -c. The first failure stops every script.
+        #[arg(short = 'f', long = "file", value_name = "FILE")]
+        files: Vec<PathBuf>,
     },
     /// Run the Pivot database server in the foreground.
     Server(bin::server::ServerOptions),
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    match Args::parse().command {
+fn run() -> Result<ShellExit, Box<dyn std::error::Error>> {
+    let matches = Args::command().get_matches();
+    let args = Args::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    match args.command {
         PivotCommand::Open {
             datastore_location,
             kind,
             warehouse,
             memory,
             workers,
-        } => bin::shell::run_with_limits(
-            build_shell_target(kind, datastore_location, warehouse)?,
-            bin::shell::ShellLimits {
-                memory,
-                workers: workers.map(NonZeroUsize::get),
-            },
-        ),
-        PivotCommand::Server(options) => bin::server::run(options).map_err(Into::into),
+            commands,
+            files,
+        } => {
+            let (_, open_matches) = matches
+                .subcommand()
+                .expect("clap parsed the open subcommand");
+            bin::shell::run_with_limits(
+                build_shell_target(kind, datastore_location, warehouse)?,
+                bin::shell::ShellLimits {
+                    memory,
+                    workers: workers.map(NonZeroUsize::get),
+                },
+                order_scripts(open_matches, commands, files),
+            )
+        }
+        PivotCommand::Server(options) => {
+            bin::server::run(options)?;
+            Ok(ShellExit::Success)
+        }
     }
+}
+
+/// Interleave `-c` and `-f` in command-line order. clap keeps each flag's
+/// values in order but stores the two flags separately, so their relative
+/// order comes from the positions it recorded for each value.
+fn order_scripts(
+    open_matches: &ArgMatches,
+    commands: Vec<String>,
+    files: Vec<PathBuf>,
+) -> Vec<ShellScript> {
+    let indices_of = |id: &str| {
+        open_matches
+            .indices_of(id)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+    };
+    let mut scripts: Vec<(usize, ShellScript)> = indices_of("commands")
+        .into_iter()
+        .zip(commands.into_iter().map(ShellScript::Command))
+        .chain(
+            indices_of("files")
+                .into_iter()
+                .zip(files.into_iter().map(ShellScript::File)),
+        )
+        .collect();
+    scripts.sort_by_key(|(index, _)| *index);
+    scripts.into_iter().map(|(_, script)| script).collect()
 }
 
 /// What `pivot open` opens, from its arguments. A pivotlake datastore has no
@@ -119,7 +172,8 @@ fn build_shell_target(
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(ShellExit::Success) => ExitCode::SUCCESS,
+        Ok(ShellExit::ScriptFailed) => ExitCode::FAILURE,
         Err(error) => {
             eprintln!("pivot: {error}");
             ExitCode::FAILURE
@@ -129,9 +183,9 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
-
-    use super::{Args, DatastoreKind, PivotCommand};
+    use super::{Args, DatastoreKind, PivotCommand, order_scripts};
+    use bin::shell::ShellScript;
+    use clap::{CommandFactory, FromArgMatches, Parser};
 
     fn parse_open(arguments: &[&str]) -> (String, DatastoreKind, Option<String>) {
         let args = Args::try_parse_from([&["pivot", "open"], arguments].concat()).unwrap();
@@ -200,6 +254,31 @@ mod tests {
     fn open_rejects_an_unknown_kind() {
         assert!(
             Args::try_parse_from(["pivot", "open", "--kind", "delta", "/var/lib/pivot"]).is_err()
+        );
+    }
+
+    #[test]
+    fn open_orders_commands_and_files_as_given() {
+        let matches = Args::command()
+            .try_get_matches_from(["pivot", "open", "/d", "-c", "x", "-f", "y", "-c", "z"])
+            .unwrap();
+        let args = Args::from_arg_matches(&matches).unwrap();
+        let PivotCommand::Open {
+            commands, files, ..
+        } = args.command
+        else {
+            panic!("open did not parse as the open command");
+        };
+
+        let scripts = order_scripts(matches.subcommand().unwrap().1, commands, files);
+
+        assert_eq!(
+            scripts,
+            [
+                ShellScript::Command("x".into()),
+                ShellScript::File("y".into()),
+                ShellScript::Command("z".into()),
+            ]
         );
     }
 
