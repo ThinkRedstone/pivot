@@ -475,8 +475,8 @@ impl PivotlakeDatastore {
     }
 
     /// Open a transaction, typed: freeze the current table set into a
-    /// [`PivotlakeSnapshot`] and create the injectors that receive completed INSERT
-    /// files and table creations. Cheap: clones the map (the row-group metadata
+    /// [`PivotlakeSnapshot`] and create the queue its statements stage their
+    /// commit actions on. Cheap: clones the map (the row-group metadata
     /// inside is `Arc`-shared), no I/O. The [`Datastore::begin_transaction`]
     /// trait impl delegates here.
     pub fn begin_transaction(self: Arc<Self>) -> Arc<PivotlakeTransaction> {
@@ -485,10 +485,7 @@ impl PivotlakeDatastore {
         });
         Arc::new(PivotlakeTransaction {
             snapshot,
-            uploaded_files: Arc::new(Injector::new()),
-            pending_table_creations: Arc::new(Injector::new()),
-            pending_schema_creations: Arc::new(Injector::new()),
-            pending_table_drops: Arc::new(Injector::new()),
+            commit_actions: Arc::new(Injector::new()),
             datastore: self,
             committed: std::sync::atomic::AtomicBool::new(false),
         })
@@ -957,7 +954,7 @@ impl PivotlakeTransaction {
         let files = self.adopted_data_files(&request)?;
 
         Ok(PivotlakeTableCreation {
-            pending_table_creations: self.pending_table_creations.clone(),
+            commit_actions: self.commit_actions.clone(),
             files,
             name,
             id,
@@ -980,7 +977,7 @@ impl PivotlakeTransaction {
             }
         }
         Ok(PivotlakeTableDrop {
-            pending_table_drops: self.pending_table_drops.clone(),
+            commit_actions: self.commit_actions.clone(),
             drop: PendingTableDrop {
                 name,
                 if_exists: request.if_exists,
@@ -1006,7 +1003,7 @@ impl PivotlakeTransaction {
             return Err(Error::SchemaExists(request.name));
         }
         Ok(PivotlakeSchemaCreation {
-            pending_schema_creations: self.pending_schema_creations.clone(),
+            commit_actions: self.commit_actions.clone(),
             creation: PendingSchemaCreation {
                 name: request.name,
                 if_not_exists: request.if_not_exists,
@@ -1118,84 +1115,68 @@ impl PivotlakeTransaction {
     }
 }
 
-/// Commit the schema creations drained from a transaction. Each one records
-/// itself in the database manifest and publishes into the live schema set.
-/// Blocking store I/O, so [`PivotlakeTransaction::commit`] runs this on the blocking
-/// pool.
-fn commit_schema_creations(
-    datastore: &PivotlakeDatastore,
-    pending_schema_creations: Vec<PendingSchemaCreation>,
-) -> CatalogResult<()> {
-    for pending in pending_schema_creations {
-        datastore.finalize_schema_creation(pending)?;
-    }
-    Ok(())
+/// One durable effect a statement staged on its transaction: a schema or table
+/// creation, a table drop, or the files an INSERT uploaded. The transaction's
+/// commit applies its actions in the order the statements ran, so a statement
+/// sees what the ones before it did; a failure stops the commit and the effects
+/// applied before it stay. Blocking store I/O, so [`PivotlakeTransaction::commit`]
+/// applies them on the blocking pool.
+pub(crate) trait CommitAction: Send {
+    fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> Result<()>;
 }
 
-/// Commit the table creations drained from a transaction. Each one initializes
-/// its Delta log, registers itself in the database manifest, and publishes into
-/// the live table set. Blocking store I/O, so [`PivotlakeTransaction::commit`] runs
-/// this on the blocking pool.
-fn commit_table_creations(
-    datastore: &PivotlakeDatastore,
-    pending_table_creations: Vec<PendingTableCreation>,
-) -> CatalogResult<()> {
-    for pending in pending_table_creations {
-        datastore.finalize_table_creation(pending)?;
+impl CommitAction for PendingSchemaCreation {
+    /// Record the schema in the database manifest and publish it into the live
+    /// schema set.
+    fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> Result<()> {
+        datastore.finalize_schema_creation(*self)
     }
-    Ok(())
 }
 
-/// Commit the table drops drained from a transaction. Each one unregisters
-/// itself from the database manifest and the live table set. Blocking store
-/// I/O, so [`PivotlakeTransaction::commit`] runs this on the blocking pool.
-fn commit_table_drops(
-    datastore: &PivotlakeDatastore,
-    pending_table_drops: Vec<PendingTableDrop>,
-) -> CatalogResult<()> {
-    for pending in pending_table_drops {
-        datastore.finalize_table_drop(pending)?;
+impl CommitAction for PendingTableCreation {
+    /// Initialize the table's Delta log, register it in the database manifest
+    /// and publish it into the live table set.
+    fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> Result<()> {
+        datastore.finalize_table_creation(*self)
     }
-    Ok(())
 }
 
-/// Commit the files an INSERT drained from its transaction: group them by the
-/// table they were written for and append each group through
-/// [`PivotlakeDatastore::commit_to_table`]. The transaction's frozen snapshot is not
-/// the commit base -- it is a read view, and a table it froze versions ago would
-/// lose the compare-and-swap against every INSERT that committed since.
-/// Blocking store I/O, so [`PivotlakeTransaction::commit`] runs it on the blocking
-/// pool.
-fn commit_uploaded_files(
-    datastore: &PivotlakeDatastore,
-    drained: Vec<insert_sink::UploadedFile>,
-) -> CatalogResult<()> {
-    let mut files_by_table = HashMap::<Uuid, Vec<TableFile>>::new();
-    for uploaded in drained {
-        let insert_sink::UploadedFile {
-            table_id,
-            file,
-            partition,
-            row_groups,
-        } = uploaded;
-        let stats = Some(std::sync::Arc::new(parquet_engine::aggregate_file_stats(
-            &row_groups,
-        )));
-        let entry = DeltaFileEntry {
-            file,
-            partition,
-            stats,
-        };
-        files_by_table
-            .entry(table_id)
-            .or_default()
-            .push(TableFile::new(entry, row_groups));
+impl CommitAction for PendingTableDrop {
+    /// Unregister the table from the database manifest and the live table set.
+    fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> Result<()> {
+        datastore.finalize_table_drop(*self)
     }
+}
 
-    for (table_id, files) in files_by_table {
-        datastore.commit_to_table(table_id, &[], files, true)?;
+impl CommitAction for PendingInsert {
+    /// Append every file the INSERT uploaded to its table as one version,
+    /// through [`PivotlakeDatastore::commit_to_table`]. The transaction's frozen
+    /// snapshot is not the commit base -- it is a read view, and a table it
+    /// froze versions ago would lose the compare-and-swap against every INSERT
+    /// that committed since.
+    fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> Result<()> {
+        let files: Vec<TableFile> = drain_injector(&self.uploaded_files)
+            .into_iter()
+            .map(|uploaded| {
+                let insert_sink::UploadedFile {
+                    file,
+                    partition,
+                    row_groups,
+                } = uploaded;
+                let stats = Some(Arc::new(parquet_engine::aggregate_file_stats(&row_groups)));
+                let entry = DeltaFileEntry {
+                    file,
+                    partition,
+                    stats,
+                };
+                TableFile::new(entry, row_groups)
+            })
+            .collect();
+        if files.is_empty() {
+            return Ok(());
+        }
+        datastore.commit_to_table(self.table_id, &[], files, true)
     }
-    Ok(())
 }
 
 fn drain_injector<T>(injector: &Injector<T>) -> Vec<T> {
@@ -1372,7 +1353,7 @@ struct PendingTableDrop {
 
 /// One table creation whose footer metadata has been loaded successfully and is
 /// waiting for its transaction to commit it.
-struct PendingTableCreation {
+pub(crate) struct PendingTableCreation {
     name: SchemaQualifiedTableName,
     id: Uuid,
     location: ObjectPath,
@@ -1383,15 +1364,22 @@ struct PendingTableCreation {
     loaded: Vec<parquet_engine::FileRowGroups>,
 }
 
+/// The files one INSERT uploaded, waiting for its transaction to append them to
+/// the table in one version. Staged when the statement's sink is built; the
+/// files arrive on `uploaded_files` as the dataflow runs, so a sink that wrote
+/// no rows appends nothing. Carries the table's durable id, not its name, so
+/// the commit resolves the live table regardless of a rename.
+pub(crate) struct PendingInsert {
+    pub(crate) table_id: Uuid,
+    pub(crate) uploaded_files: Arc<Injector<insert_sink::UploadedFile>>,
+}
+
 /// The [`DatastoreTransaction`] a [`PivotlakeDatastore`] opens: one query's frozen
-/// [`PivotlakeSnapshot`] plus injectors of uploaded files and completed table
-/// creations awaiting commit.
+/// [`PivotlakeSnapshot`] plus the commit actions its statements staged,
+/// awaiting commit in the order they were staged.
 pub struct PivotlakeTransaction {
     pub(crate) snapshot: Arc<PivotlakeSnapshot>,
-    pub(crate) uploaded_files: Arc<Injector<insert_sink::UploadedFile>>,
-    pending_table_creations: Arc<Injector<PendingTableCreation>>,
-    pending_schema_creations: Arc<Injector<PendingSchemaCreation>>,
-    pending_table_drops: Arc<Injector<PendingTableDrop>>,
+    commit_actions: Arc<Injector<Box<dyn CommitAction>>>,
     /// The datastore this transaction reads and writes back to. CREATE commits
     /// publish through it so DDL is visible to the next transaction without
     /// waiting for a refresh.
@@ -1419,8 +1407,8 @@ impl PivotlakeTransaction {
     /// resolution path; the trait impl below only boxes its result (the planner
     /// needs a `Box<dyn BoundTable>`, while a concrete caller wants the
     /// `TableBinding`, and one function cannot return both). The binding captures
-    /// the snapshot's copy of the table and shares this transaction's
-    /// uploaded-files injector, so it is self-contained.
+    /// the snapshot's copy of the table and shares this transaction's staging
+    /// queue, so it is self-contained.
     pub fn table(&self, datastore: &str, name: &SchemaQualifiedTableName) -> Option<TableBinding> {
         Some(TableBinding::new(
             planner::catalog::TableReference {
@@ -1429,7 +1417,7 @@ impl PivotlakeTransaction {
                 table: name.table.clone(),
             },
             self.snapshot.catalog_table_by_name(name)?,
-            self.uploaded_files.clone(),
+            self.commit_actions.clone(),
         ))
     }
 }
@@ -1517,36 +1505,23 @@ impl DatastoreTransaction for PivotlakeTransaction {
         // A read-only transaction staged nothing: an in-memory no-op, run inline
         // rather than pay a blocking-pool round trip. Only a commit that writes
         // durable state hops off the runtime.
-        if self.uploaded_files.is_empty()
-            && self.pending_table_creations.is_empty()
-            && self.pending_schema_creations.is_empty()
-            && self.pending_table_drops.is_empty()
-        {
+        if self.commit_actions.is_empty() {
             return Ok(());
         }
         let datastore = self.datastore.clone();
-        let pending_schema_creations = drain_injector(&self.pending_schema_creations);
-        let pending_table_creations = drain_injector(&self.pending_table_creations);
-        let pending_table_drops = drain_injector(&self.pending_table_drops);
-        let uploaded_files = drain_injector(&self.uploaded_files);
-        tokio::task::spawn_blocking(move || {
-            // Schemas first: a table is registered into its schema, so the
-            // schema has to be in the manifest before any table write looks for
-            // it.
-            commit_schema_creations(&datastore, pending_schema_creations)?;
-            commit_table_creations(&datastore, pending_table_creations)?;
-            commit_table_drops(&datastore, pending_table_drops)?;
-            commit_uploaded_files(&datastore, uploaded_files)
+        let commit_actions = drain_injector(&self.commit_actions);
+        tokio::task::spawn_blocking(move || -> CatalogResult<()> {
+            for action in commit_actions {
+                action.apply(&datastore)?;
+            }
+            Ok(())
         })
         .await
         .map_err(|e| CatalogError::Other(format!("commit thread panicked: {e}").into()))?
     }
 
     fn rollback(&self) {
-        drain_injector(&self.pending_schema_creations);
-        drain_injector(&self.pending_table_creations);
-        drain_injector(&self.pending_table_drops);
-        drain_injector(&self.uploaded_files);
+        drain_injector(&self.commit_actions);
     }
 }
 
@@ -1562,11 +1537,7 @@ impl Drop for PivotlakeTransaction {
         }
         // An explicitly rolled-back transaction already drained everything,
         // so the staged-writes check below keeps it out of the net too.
-        let staged_writes = !self.uploaded_files.is_empty()
-            || !self.pending_table_creations.is_empty()
-            || !self.pending_schema_creations.is_empty()
-            || !self.pending_table_drops.is_empty();
-        if staged_writes {
+        if !self.commit_actions.is_empty() {
             tracing::warn!(
                 "transaction dropped with staged writes and no resolution; rolling back"
             );
@@ -1580,7 +1551,7 @@ impl Drop for PivotlakeTransaction {
 /// a dataflow that stages the creation and emits no rows, so the schema appears
 /// on the transaction only once that dataflow runs.
 struct PivotlakeSchemaCreation {
-    pending_schema_creations: Arc<Injector<PendingSchemaCreation>>,
+    commit_actions: Arc<Injector<Box<dyn CommitAction>>>,
     creation: PendingSchemaCreation,
 }
 
@@ -1592,11 +1563,11 @@ impl SchemaCreation for PivotlakeSchemaCreation {
         let mut creation = Some(self.creation.clone());
         let factories: Vec<_> = (0..dispatcher.worker_count())
             .map(|_| {
-                let staged = creation.take();
-                let pending_schema_creations = self.pending_schema_creations.clone();
+                let carried = creation.take();
+                let commit_actions = self.commit_actions.clone();
                 OneShotNullaryFactory::new(move || {
-                    if let Some(creation) = staged {
-                        pending_schema_creations.push(creation);
+                    if let Some(creation) = carried {
+                        commit_actions.push(Box::new(creation));
                     }
                     None
                 })
@@ -1611,7 +1582,7 @@ impl SchemaCreation for PivotlakeSchemaCreation {
 /// dataflow that stages the drop and emits no rows, so the drop lands on the
 /// transaction only once that dataflow runs.
 struct PivotlakeTableDrop {
-    pending_table_drops: Arc<Injector<PendingTableDrop>>,
+    commit_actions: Arc<Injector<Box<dyn CommitAction>>>,
     drop: PendingTableDrop,
 }
 
@@ -1622,11 +1593,11 @@ impl TableDrop for PivotlakeTableDrop {
         let mut drop = Some(self.drop.clone());
         let factories: Vec<_> = (0..dispatcher.worker_count())
             .map(|_| {
-                let staged = drop.take();
-                let pending_table_drops = self.pending_table_drops.clone();
+                let carried = drop.take();
+                let commit_actions = self.commit_actions.clone();
                 OneShotNullaryFactory::new(move || {
-                    if let Some(drop) = staged {
-                        pending_table_drops.push(drop);
+                    if let Some(drop) = carried {
+                        commit_actions.push(Box::new(drop));
                     }
                     None
                 })
@@ -1636,13 +1607,13 @@ impl TableDrop for PivotlakeTableDrop {
     }
 }
 
-/// A resolved `CREATE TABLE` for a [`PivotlakeDatastore`]: the validated request, a
-/// transaction-owned staging injector, and the located data files, captured at
+/// A resolved `CREATE TABLE` for a [`PivotlakeDatastore`]: the validated request, the
+/// transaction-owned staging queue, and the located data files, captured at
 /// resolution by [`PivotlakeTransaction::bind_create`]. Compiling it builds the
 /// dataflow that fetches the files' footers and stages the completed creation
 /// for transaction commit.
 struct PivotlakeTableCreation {
-    pending_table_creations: Arc<Injector<PendingTableCreation>>,
+    commit_actions: Arc<Injector<Box<dyn CommitAction>>>,
     files: Vec<DataFile>,
     name: SchemaQualifiedTableName,
     id: Uuid,
@@ -1659,7 +1630,7 @@ impl TableCreation for PivotlakeTableCreation {
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
         // The terminal worker only stages the completed creation. Durable writes
         // and live publication happen later in the transaction's blocking commit.
-        let pending_table_creations = self.pending_table_creations.clone();
+        let commit_actions = self.commit_actions.clone();
         let name = self.name.clone();
         let id = self.id;
         let location = self.location.clone();
@@ -1673,7 +1644,7 @@ impl TableCreation for PivotlakeTableCreation {
             &self.files,
             declared_columns,
             move |loaded: Vec<parquet_engine::FileRowGroups>| {
-                pending_table_creations.push(PendingTableCreation {
+                commit_actions.push(Box::new(PendingTableCreation {
                     name,
                     id,
                     location,
@@ -1682,7 +1653,7 @@ impl TableCreation for PivotlakeTableCreation {
                     sort_by,
                     if_not_exists,
                     loaded,
-                });
+                }));
             },
         ))
     }

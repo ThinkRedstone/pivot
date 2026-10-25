@@ -858,7 +858,6 @@ impl CatalogTable {
         let spec = super::insert_sink::upload_files_spec(
             self.store(),
             self.location.clone(),
-            self.id(),
             self.declared_columns(),
             uploaded_files.clone(),
             encoded,
@@ -871,12 +870,10 @@ impl CatalogTable {
         loop {
             match uploaded_files.steal() {
                 Steal::Success(uploaded) => {
-                    // table_id is ignored: this table is the commit target.
                     let super::insert_sink::UploadedFile {
                         file,
                         partition,
                         row_groups,
-                        ..
                     } = uploaded;
                     let stats = Some(std::sync::Arc::new(parquet_engine::aggregate_file_stats(
                         &row_groups,

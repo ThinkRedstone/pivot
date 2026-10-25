@@ -18,8 +18,8 @@ use planner::catalog::{
 };
 use planner::expression::{CompareType, Expression};
 
-use super::CatalogTable;
-use super::insert_sink::{UploadedFile, build_insert_spec};
+use super::insert_sink::build_insert_spec;
+use super::{CatalogTable, CommitAction, PendingInsert};
 
 /// A catalog table resolved from one transaction: it captures the snapshot's own
 /// copy of the [`CatalogTable`] (schema, files, and their row groups), this
@@ -47,11 +47,12 @@ pub struct TableBinding {
     /// because the `BoundTable` trait gives no channel from `pushdown_filter` to
     /// `compile`); applied as a filter when the scan is compiled.
     predicates: Vec<PushedPredicate>,
-    /// The transaction's shared queue of finished INSERT files. Shared (`Arc`)
-    /// with the [`PivotlakeTransaction`](super::PivotlakeTransaction) that produced this
-    /// binding, so a file this binding's [`compile_insert`](BoundTable::compile_insert)
-    /// pushes is drained by that transaction's commit.
-    uploaded_files: Arc<Injector<UploadedFile>>,
+    /// The transaction's staging queue, shared (`Arc`) with the
+    /// [`PivotlakeTransaction`](super::PivotlakeTransaction) that produced this
+    /// binding, so the append this binding's
+    /// [`compile_insert`](BoundTable::compile_insert) stages is applied by that
+    /// transaction's commit.
+    commit_actions: Arc<Injector<Box<dyn CommitAction>>>,
 }
 
 impl std::fmt::Debug for TableBinding {
@@ -66,11 +67,11 @@ impl std::fmt::Debug for TableBinding {
 
 impl TableBinding {
     /// A binding over the snapshot's `table` copy, sharing the transaction's
-    /// `uploaded_files` injector, with no predicates pushed yet.
+    /// staging queue, with no predicates pushed yet.
     pub(super) fn new(
         reference: TableReference,
         table: CatalogTable,
-        uploaded_files: Arc<Injector<UploadedFile>>,
+        commit_actions: Arc<Injector<Box<dyn CommitAction>>>,
     ) -> Self {
         let columns = table.columns();
         let nullability = table.nullability();
@@ -80,7 +81,7 @@ impl TableBinding {
             columns,
             nullability,
             predicates: Vec::new(),
-            uploaded_files,
+            commit_actions,
         }
     }
 
@@ -192,15 +193,18 @@ impl BoundTable for TableBinding {
         input: RecordBatchOperatorSpec,
         _dispatcher: &DataFlowDispatcher,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
-        // The captured snapshot copy stamps the durable schema and target table
-        // id onto every written file; the shared injector hands each finished
-        // file to the transaction's commit, which resolves the live table by
-        // that id (surviving a concurrent rename).
-        Ok(build_insert_spec(
-            &self.table,
-            self.uploaded_files.clone(),
-            input,
-        )?)
+        // The captured snapshot copy stamps the durable schema onto every
+        // written file. The files land on this statement's own queue as the
+        // dataflow runs; the append staged here hands that queue to the
+        // transaction's commit, which resolves the live table by its durable id
+        // (surviving a concurrent rename).
+        let uploaded_files = Arc::new(Injector::new());
+        let spec = build_insert_spec(&self.table, uploaded_files.clone(), input)?;
+        self.commit_actions.push(Box::new(PendingInsert {
+            table_id: self.table.id(),
+            uploaded_files,
+        }));
+        Ok(spec)
     }
 
     fn columns(&self) -> Vec<Column> {

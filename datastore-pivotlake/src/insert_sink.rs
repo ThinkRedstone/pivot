@@ -16,7 +16,6 @@ use dispatch::{
     OperatorFactory, OperatorSpec, RecordBatchOperatorSpec, Sender, Unary, UnaryFactory, stealable,
 };
 use planner::catalog::Column;
-use uuid::Uuid;
 
 use crate::CatalogTable;
 use object_storage::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
@@ -25,7 +24,7 @@ use parquet_engine::writing::{AssembledFile, encode_record_batches_spec, unshred
 
 /// Build the dataflow that writes `input`'s rows into `table` as Parquet and
 /// emits the inserted-row count. Each finished file is pushed onto `uploaded_files`
-/// for the statement's transaction to commit (by the table's durable id). This is
+/// for the statement's transaction to commit. This is
 /// the write mirror of the scan's
 /// [`table_input_with_filter_and_eq_predicates`](parquet_engine::table_input_with_filter_and_eq_predicates):
 /// it wires the encode pipeline into this module's upload operators. Driven by
@@ -106,7 +105,6 @@ pub(super) fn build_insert_spec(
     Ok(upload_files_spec(
         store,
         table.object_location().clone(),
-        table.id(),
         table.columns().into(),
         uploaded_files,
         encoded,
@@ -119,7 +117,6 @@ pub(super) fn build_insert_spec(
 pub(super) fn upload_files_spec<OF>(
     store: Arc<dyn ObjectStore>,
     location: ObjectPath,
-    table_id: Uuid,
     declared_columns: Arc<[Column]>,
     uploaded_files: Arc<Injector<UploadedFile>>,
     encoded: OperatorSpec<AssembledFile, OF>,
@@ -141,7 +138,6 @@ where
                 UploadFactory::new(
                     store.clone(),
                     location.clone(),
-                    table_id,
                     declared_columns.clone(),
                     uploaded_files.clone(),
                     rows.clone(),
@@ -156,10 +152,8 @@ where
 /// One finished upload waiting to be committed, drained from `uploaded_files` by
 /// whoever owns it (a statement's transaction, or compaction). Its consumer
 /// builds the `DeltaFileEntry` (from `file`/`partition`) and
-/// `TableFile` (from `file`/`row_groups`) it commits. Carries the table's durable
-/// id, not its name, so the commit resolves the live table regardless of a rename.
+/// `TableFile` (from `file`/`row_groups`) it commits.
 pub(crate) struct UploadedFile {
-    pub table_id: Uuid,
     pub file: FileRef,
     pub partition: Option<crate::PartitionValues>,
     pub row_groups: Vec<Arc<RowGroupMetadata>>,
@@ -168,7 +162,6 @@ pub(crate) struct UploadedFile {
 pub(super) struct UploadFactory {
     store: Arc<dyn ObjectStore>,
     location: ObjectPath,
-    table_id: Uuid,
     /// The table's declared column types, reconciled with each uploaded file's
     /// footer when its row groups are built.
     declared_columns: Arc<[Column]>,
@@ -186,7 +179,6 @@ impl UploadFactory {
     pub fn new(
         store: Arc<dyn ObjectStore>,
         location: ObjectPath,
-        table_id: Uuid,
         declared_columns: Arc<[Column]>,
         uploaded_files: Arc<Injector<UploadedFile>>,
         rows: Arc<AtomicUsize>,
@@ -195,7 +187,6 @@ impl UploadFactory {
         Self {
             store,
             location,
-            table_id,
             declared_columns,
             uploaded_files,
             rows,
@@ -211,7 +202,6 @@ impl UnaryFactory<AssembledFile, RecordBatch> for UploadFactory {
         Upload {
             store: self.store,
             location: self.location,
-            table_id: self.table_id,
             declared_columns: self.declared_columns,
             uploaded_files: self.uploaded_files,
             rows: self.rows,
@@ -233,7 +223,6 @@ struct PendingUpload {
 pub(super) struct Upload {
     store: Arc<dyn ObjectStore>,
     location: ObjectPath,
-    table_id: Uuid,
     /// The table's declared column types, reconciled with each uploaded file's
     /// footer when its row groups are built (see [`UploadFactory`]).
     declared_columns: Arc<[Column]>,
@@ -284,7 +273,6 @@ impl Upload {
         // transaction. Its commit drains this queue and appends every file to
         // Delta only after the whole dataflow has succeeded.
         self.uploaded_files.push(UploadedFile {
-            table_id: self.table_id,
             file: pending.file,
             partition: pending.partition,
             row_groups: loaded.row_groups,
