@@ -551,7 +551,6 @@ impl Worker {
             self.cancel_upstream_in_dataflows();
 
             self.process_io_completions()?;
-            self.deliver_ready_reads();
 
             self.step_run_ready_cpu_work();
 
