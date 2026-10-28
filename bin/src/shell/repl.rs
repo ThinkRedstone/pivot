@@ -1,17 +1,17 @@
-use std::future::Future;
-use std::io::{self, IsTerminal, Write};
-use std::time::Instant;
-
 use crate::execution::{ExecuteOptions, STATS_VARIABLE, StatementOutput, is_truthy};
-use clap::{Parser, ValueEnum};
-use rustyline::DefaultEditor;
-use rustyline::error::ReadlineError;
-
 use crate::shell::copy::{CopyCommand, copy_from_file, parse_copy_command};
 use crate::shell::parser::split_complete;
 use crate::shell::progress::show_opening_progress;
 use crate::shell::render::{TextBatch, render_table};
-use crate::shell::{ShellInstance, ShellLimits, ShellTarget};
+use crate::shell::{ShellInput, ShellInstance, ShellLimits, ShellTarget};
+use clap::{Parser, ValueEnum};
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
+use std::fs::File;
+use std::future::Future;
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::process::ExitCode;
+use std::time::Instant;
 
 const HELP: &str = "\
 Shell commands:
@@ -28,86 +28,129 @@ Session settings:
   RESET pivot_stats;       stop printing them
 ";
 
+/// Why the shell, or one line of its input, stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// `\q` or `quit;`; `run_shell` turns it into success.
+    #[error("quit")]
+    Quit,
+    /// A statement or `\copy` that failed or was canceled.
+    #[error("ERROR:  {0}")]
+    Statement(Box<dyn std::error::Error>),
+    /// A backslash command that did not parse; its message is complete as-is.
+    #[error("{0}")]
+    InvalidCommand(String),
+    #[error("{0}")]
+    Open(Box<dyn std::error::Error>),
+    #[error("{input}: {source}")]
+    Input { input: String, source: io::Error },
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Readline(#[from] ReadlineError),
+}
+
+impl Error {
+    pub fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::Quit => ExitCode::SUCCESS,
+            Self::Open(_) => ExitCode::from(2),
+            Self::Statement(_) | Self::InvalidCommand(_) => ExitCode::from(3),
+            Self::Input { .. } | Self::Io(_) | Self::Readline(_) => ExitCode::from(1),
+        }
+    }
+}
+
 pub(crate) async fn run_shell(
     target: ShellTarget,
     limits: ShellLimits,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if !io::stdin().is_terminal() {
-        return Err("an interactive terminal is required".into());
+    inputs: Vec<ShellInput>,
+) -> Result<(), Error> {
+    let interactive = inputs.is_empty();
+    if interactive && !io::stdin().is_terminal() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "an interactive terminal is required",
+        )
+        .into());
     }
 
-    let instance = show_opening_progress(|| ShellInstance::open_with_limits(&target, limits))?;
-    let editor = DefaultEditor::new()?;
+    let session = Session::open(&target, limits)?;
+    if !interactive {
+        return match run_inputs(session, inputs).await {
+            Err(Error::Quit) => Ok(()),
+            result => result,
+        };
+    }
 
+    let editor = DefaultEditor::new()?;
     println!("pivot shell ({})", env!("CARGO_PKG_VERSION"));
     println!("Type \"\\help\" for help.");
-
-    run_repl(instance.executor(), editor).await
+    run_repl(session, editor).await
 }
 
-async fn run_repl(
-    executor: &crate::execution::Executor,
-    mut editor: DefaultEditor,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut buffer = String::new();
-    let mut timing = false;
-    let mut stats = false;
+/// Run each input in order, stopping at the first that fails or quits.
+async fn run_inputs(mut session: Session, inputs: Vec<ShellInput>) -> Result<(), Error> {
+    for input in inputs {
+        session.run_input(&input).await?;
+    }
+    Ok(())
+}
+
+/// A reader over the input's text, so a file of any size is read a line at
+/// a time instead of all at once.
+fn open_input(input: &ShellInput) -> io::Result<impl BufRead + '_> {
+    let reader: Box<dyn BufRead + '_> = match input {
+        ShellInput::Command(command) => Box::new(command.as_bytes()),
+        ShellInput::File(path) if path.as_os_str() == "-" => Box::new(io::stdin().lock()),
+        ShellInput::File(path) => Box::new(BufReader::new(File::open(path)?)),
+    };
+    Ok(reader)
+}
+
+/// How errors name the input they came from.
+fn describe_input(input: &ShellInput) -> String {
+    match input {
+        // We shouldn't get IO errors reading from a CLI argument, but this is easier than
+        // untangling the typing
+        ShellInput::Command(command) => format!("-c '{command}'"),
+        ShellInput::File(path) if path.as_os_str() == "-" => "stdin".to_string(),
+        ShellInput::File(path) => path.display().to_string(),
+    }
+}
+
+async fn run_repl(mut session: Session, mut editor: DefaultEditor) -> Result<(), Error> {
     loop {
-        let prompt = if buffer.is_empty() {
+        let prompt = if session.buffer.is_empty() {
             "pivot=> "
         } else {
             "pivot-> "
         };
-        let (returned_editor, readline) = read_line(editor, prompt).await?;
+        let (returned_editor, readline) = read_line(editor, prompt).await;
         editor = returned_editor;
         let line = match readline {
             Ok(line) => line,
             Err(ReadlineError::Interrupted) => {
-                buffer.clear();
+                session.buffer.clear();
                 continue;
             }
             Err(ReadlineError::Eof) => break,
             Err(error) => return Err(error.into()),
         };
 
-        if let Some(parsed) = parse_meta_command(&line) {
-            let _ = editor.add_history_entry(line.clone());
-            if handle_meta_command(parsed, executor, &mut timing, stats).await {
-                break;
+        let mut record_history = |entry: String| {
+            let _ = editor.add_history_entry(entry);
+        };
+        match session.feed_line(&line, &mut record_history).await {
+            Ok(()) => {}
+            Err(Error::Quit) => break,
+            // An interactive statement failing is not fatal: report it and
+            // prompt again.
+            Err(error @ (Error::Statement(_) | Error::InvalidCommand(_))) => {
+                eprintln!("{error}");
+                session.buffer.clear();
             }
-            continue;
-        }
-
-        if !buffer.is_empty() {
-            buffer.push('\n');
-        }
-        buffer.push_str(&line);
-        let ParsedBuffer {
-            statements,
-            remainder,
-            trailing_meta_command,
-        } = parse_buffer(&buffer);
-        buffer = remainder;
-
-        let mut failed = false;
-        for statement in statements {
-            let _ = editor.add_history_entry(statement.clone());
-            if is_quit_statement(&statement) {
-                return Ok(());
-            }
-            if !execute_statement(executor, statement, timing, &mut stats).await {
-                failed = true;
-                break;
-            }
-        }
-        if failed {
-            buffer.clear();
-        }
-        if let Some((input, parsed)) = trailing_meta_command {
-            let _ = editor.add_history_entry(input);
-            if handle_meta_command(parsed, executor, &mut timing, stats).await {
-                break;
-            }
+            Err(error) => return Err(error),
         }
     }
     Ok(())
@@ -116,12 +159,194 @@ async fn run_repl(
 async fn read_line(
     mut editor: DefaultEditor,
     prompt: &'static str,
-) -> Result<(DefaultEditor, rustyline::Result<String>), tokio::task::JoinError> {
+) -> (DefaultEditor, rustyline::Result<String>) {
     tokio::task::spawn_blocking(move || {
         let result = editor.readline(prompt);
         (editor, result)
     })
     .await
+    // If `readline` somehow panics in the other thread, we want to propagate that
+    .unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()))
+}
+
+/// One shell session over an open datastore: the statement buffer and the
+/// settings its meta-commands and `SET`s change.
+struct Session {
+    instance: ShellInstance,
+    timing: bool,
+    stats: bool,
+    buffer: String,
+}
+
+impl Session {
+    /// Open the datastore (behind the opening spinner) into a fresh session.
+    fn open(target: &ShellTarget, limits: ShellLimits) -> Result<Self, Error> {
+        let instance = show_opening_progress(|| ShellInstance::open_with_limits(target, limits))
+            .map_err(Error::Open)?;
+        Ok(Self {
+            instance,
+            timing: false,
+            stats: false,
+            buffer: String::new(),
+        })
+    }
+
+    fn executor(&self) -> &crate::execution::Executor {
+        self.instance.executor()
+    }
+
+    /// Handle one line of input: a meta-command, or SQL appended to the buffer
+    /// whose complete statements then run. `record_history` receives each
+    /// command as it is recognized.
+    async fn feed_line(
+        &mut self,
+        line: &str,
+        record_history: &mut impl FnMut(String),
+    ) -> Result<(), Error> {
+        if let Some(parsed) = parse_meta_command(line) {
+            record_history(line.to_string());
+            return self.handle_meta_command(parsed).await;
+        }
+
+        if !self.buffer.is_empty() {
+            self.buffer.push('\n');
+        }
+        self.buffer.push_str(line);
+        let ParsedBuffer {
+            statements,
+            remainder,
+            trailing_meta_command,
+        } = parse_buffer(&self.buffer);
+        self.buffer = remainder;
+
+        let mut result = Ok(());
+        for statement in statements {
+            record_history(statement.clone());
+            if is_quit_statement(&statement) {
+                return Err(Error::Quit);
+            }
+            result = self.execute_statement(statement).await;
+            if result.is_err() {
+                break;
+            }
+        }
+        if let Some((input, parsed)) = trailing_meta_command {
+            record_history(input);
+            let meta_result = self.handle_meta_command(parsed).await;
+            if meta_result.is_err() {
+                result = meta_result;
+            }
+        }
+        result
+    }
+
+    /// Declare we have no more lines to feed: this runs the statement left
+    /// unterminated in the buffer, if any.
+    async fn finish(&mut self) -> Result<(), Error> {
+        let statement = std::mem::take(&mut self.buffer);
+        if statement.is_empty() {
+            Ok(())
+        } else if statement.trim().eq_ignore_ascii_case("quit") {
+            Err(Error::Quit)
+        } else {
+            self.execute_statement(statement).await
+        }
+    }
+
+    /// Feed `input` line by line as it is read, then finish it.
+    async fn run_input(&mut self, input: &ShellInput) -> Result<(), Error> {
+        let read_failed = |source| Error::Input {
+            input: describe_input(input),
+            source,
+        };
+        let mut reader = open_input(input).map_err(read_failed)?;
+        let mut line = String::new();
+        while reader.read_line(&mut line).map_err(read_failed)? != 0 {
+            let content = line.strip_suffix('\n').unwrap_or(&line);
+            let content = content.strip_suffix('\r').unwrap_or(content);
+            self.feed_line(content, &mut |_| {}).await?;
+            line.clear();
+        }
+        self.finish().await
+    }
+
+    /// Execute a parsed meta-command.
+    async fn handle_meta_command(
+        &mut self,
+        parsed: Result<MetaCommand, String>,
+    ) -> Result<(), Error> {
+        match parsed.map_err(Error::InvalidCommand)? {
+            MetaCommand::Quit => Err(Error::Quit),
+            MetaCommand::Help => {
+                print!("{HELP}");
+                Ok(())
+            }
+            MetaCommand::Timing { state } => {
+                self.timing = match state {
+                    Some(Switch::On) => true,
+                    Some(Switch::Off) => false,
+                    None => !self.timing,
+                };
+                println!("Timing is {}.", if self.timing { "on" } else { "off" });
+                Ok(())
+            }
+            MetaCommand::Copy { arguments } => {
+                let copy =
+                    parse_copy_command(&arguments.join(" ")).map_err(Error::InvalidCommand)?;
+                self.execute_copy(copy).await
+            }
+        }
+    }
+
+    async fn execute_statement(&mut self, sql: String) -> Result<(), Error> {
+        // Like the server, read the flag before the statement runs: the SET that
+        // turns stats on reports no stats itself, the one that turns them off
+        // still reports its own.
+        let collect_stats = self.stats;
+        let options = ExecuteOptions {
+            collect_stats,
+            profile: false,
+        };
+        let executor = self.instance.executor();
+        let stats = &mut self.stats;
+        let work = async {
+            let execution = executor
+                .execute_with_output::<TextBatch>(sql, options)
+                .await
+                .map_err(|error| Error::Statement(error.into()))?;
+            if let StatementOutput::Set { name, value } = &execution.output
+                && let Some(enabled) = parse_stats_toggle(name, value.as_deref())
+            {
+                *stats = enabled;
+            }
+            if collect_stats {
+                println!("{}", execution.stats.summary());
+            }
+            display_output(execution.output)?;
+            Ok(())
+        };
+        run_interruptible(work, self.timing).await
+    }
+
+    /// Run a `\copy`: load its file and report the row count like a COPY does.
+    async fn execute_copy(&self, copy: CopyCommand) -> Result<(), Error> {
+        let collect_stats = self.stats;
+        let options = ExecuteOptions {
+            collect_stats,
+            profile: false,
+        };
+        let work = async {
+            let outcome = copy_from_file(self.executor(), copy, options)
+                .await
+                .map_err(|error| Error::Statement(error.into()))?;
+            if collect_stats {
+                println!("{}", outcome.stats.summary());
+            }
+            println!("COPY {}", outcome.rows);
+            Ok(())
+        };
+        run_interruptible(work, self.timing).await
+    }
 }
 
 /// The shell's backslash commands. A line's first word names the command
@@ -199,48 +424,6 @@ fn parse_meta_command(line: &str) -> Option<Result<MetaCommand, String>> {
     Some(MetaCommand::try_parse_from(trimmed.split_whitespace()).map_err(|error| error.to_string()))
 }
 
-/// Execute a parsed meta-command (or print why it did not parse) and return
-/// whether the REPL should exit.
-async fn handle_meta_command(
-    parsed: Result<MetaCommand, String>,
-    executor: &crate::execution::Executor,
-    timing: &mut bool,
-    stats: bool,
-) -> bool {
-    let command = match parsed {
-        Ok(command) => command,
-        Err(message) => {
-            eprintln!("{message}");
-            return false;
-        }
-    };
-    match command {
-        MetaCommand::Quit => true,
-        MetaCommand::Help => {
-            print!("{HELP}");
-            false
-        }
-        MetaCommand::Timing { state } => {
-            *timing = match state {
-                Some(Switch::On) => true,
-                Some(Switch::Off) => false,
-                None => !*timing,
-            };
-            println!("Timing is {}.", if *timing { "on" } else { "off" });
-            false
-        }
-        MetaCommand::Copy { arguments } => {
-            match parse_copy_command(&arguments.join(" ")) {
-                Ok(copy) => {
-                    execute_copy(executor, copy, *timing, stats).await;
-                }
-                Err(message) => eprintln!("{message}"),
-            }
-            false
-        }
-    }
-}
-
 /// Interpret a parsed `SET`/`RESET` against the shell's stats toggle: the new
 /// state when the statement names `pivot_stats`, `None` for any other
 /// variable. `RESET` arrives with no value and reads as off.
@@ -255,102 +438,27 @@ fn is_quit_statement(statement: &str) -> bool {
         .is_some_and(|command| command.trim().eq_ignore_ascii_case("quit"))
 }
 
-async fn execute_statement(
-    executor: &crate::execution::Executor,
-    sql: String,
-    timing: bool,
-    stats: &mut bool,
-) -> bool {
-    // Like the server, read the flag before the statement runs: the SET that
-    // turns stats on reports no stats itself, the one that turns them off
-    // still reports its own.
-    let collect_stats = *stats;
-    let options = ExecuteOptions {
-        collect_stats,
-        profile: false,
-    };
-    let work = async {
-        match executor
-            .execute_with_output::<TextBatch>(sql, options)
-            .await
-        {
-            Ok(execution) => {
-                if let StatementOutput::Set { name, value } = &execution.output
-                    && let Some(enabled) = parse_stats_toggle(name, value.as_deref())
-                {
-                    *stats = enabled;
-                }
-                if collect_stats {
-                    println!("{}", execution.stats.summary());
-                }
-                if let Err(error) = display_output(execution.output) {
-                    eprintln!("pivot: writing output: {error}");
-                    false
-                } else {
-                    true
-                }
-            }
-            Err(error) => {
-                eprintln!("ERROR:  {error}");
-                false
-            }
-        }
-    };
-    run_interruptible(work, timing).await
-}
-
-/// Run a `\copy`: load its file and report the row count like a COPY does.
-async fn execute_copy(
-    executor: &crate::execution::Executor,
-    copy: CopyCommand,
-    timing: bool,
-    collect_stats: bool,
-) -> bool {
-    let options = ExecuteOptions {
-        collect_stats,
-        profile: false,
-    };
-    let work = async {
-        match copy_from_file(executor, copy, options).await {
-            Ok(outcome) => {
-                if collect_stats {
-                    println!("{}", outcome.stats.summary());
-                }
-                println!("COPY {}", outcome.rows);
-                true
-            }
-            Err(error) => {
-                eprintln!("ERROR:  {error}");
-                false
-            }
-        }
-    };
-    run_interruptible(work, timing).await
-}
-
-/// Drive `work` to its verdict unless Ctrl-C arrives first, in which case the
+/// Drive `work` to its result unless Ctrl-C arrives first, in which case the
 /// future is dropped, cancelling whatever it was running. Prints the elapsed
 /// time when `timing` is on.
-async fn run_interruptible(work: impl Future<Output = bool>, timing: bool) -> bool {
+async fn run_interruptible(
+    work: impl Future<Output = Result<(), Error>>,
+    timing: bool,
+) -> Result<(), Error> {
     let started = Instant::now();
-    let succeeded = tokio::select! {
-        succeeded = work => succeeded,
+    let result = tokio::select! {
+        result = work => result,
         signal = tokio::signal::ctrl_c() => {
-            match signal {
-                Ok(()) => {
-                    eprintln!("Cancel request sent");
-                    eprintln!("ERROR:  query canceled");
-                }
-                Err(error) => eprintln!("pivot: failed to listen for Ctrl-C: {error}"),
-            }
-            false
+            signal?;
+            eprintln!("Cancel request sent");
+            Err(Error::Statement("query canceled".into()))
         }
     };
 
     if timing {
         println!("Time: {:.3} ms", started.elapsed().as_secs_f64() * 1e3);
     }
-    succeeded
+    result
 }
 
 fn display_output(output: StatementOutput<TextBatch>) -> io::Result<()> {
@@ -375,9 +483,10 @@ fn display_output(output: StatementOutput<TextBatch>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MetaCommand, ParsedBuffer, Switch, execute_statement, is_quit_statement, parse_buffer,
+        MetaCommand, ParsedBuffer, Session, Switch, is_quit_statement, parse_buffer,
         parse_meta_command, parse_stats_toggle,
     };
+    use crate::shell::{ShellLimits, ShellTarget};
 
     #[test]
     fn parses_supported_meta_commands() {
@@ -464,33 +573,34 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let instance = runtime
+        let mut session = runtime
             .block_on(async {
-                crate::shell::ShellInstance::open_with_resources(
-                    &crate::shell::ShellTarget::pivot(directory.path().to_str().unwrap()),
-                    1,
-                    32,
-                    datastore_pivotlake::DEFAULT_REFRESH_INTERVAL,
+                Session::open(
+                    &ShellTarget::pivot(directory.path().to_str().unwrap()),
+                    ShellLimits {
+                        memory: Some("64m".parse().unwrap()),
+                        workers: Some(1),
+                    },
                 )
             })
             .unwrap();
-        let mut stats = false;
 
         let on_after_set = runtime.block_on(async {
-            let executor = instance.executor();
-            assert!(
-                execute_statement(executor, "SET pivot_stats = 1".into(), false, &mut stats).await
-            );
-            let on = stats;
-            assert!(
-                execute_statement(executor, "SET pivot_stats = 0".into(), false, &mut stats).await
-            );
+            session
+                .execute_statement("SET pivot_stats = 1".into())
+                .await
+                .unwrap();
+            let on = session.stats;
+            session
+                .execute_statement("SET pivot_stats = 0".into())
+                .await
+                .unwrap();
             on
         });
 
         assert!(on_after_set);
-        assert!(!stats);
-        drop(instance);
+        assert!(!session.stats);
+        drop(session);
     }
 
     #[test]
