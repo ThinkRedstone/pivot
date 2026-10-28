@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use bin::memory::MemoryBudget;
-use bin::shell::{ShellExit, ShellScript, ShellTarget};
+use bin::shell::{ShellInput, ShellTarget};
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
@@ -92,7 +92,25 @@ enum PivotCommand {
     Server(bin::server::ServerOptions),
 }
 
-fn run() -> Result<ShellExit, Box<dyn std::error::Error>> {
+/// Why `pivot` failed. Shell errors pick their own exit code.
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    #[error(transparent)]
+    ShellError(#[from] bin::shell::Error),
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error>),
+}
+
+impl Error {
+    fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::ShellError(error) => error.exit_code(),
+            Self::Other(_) => ExitCode::FAILURE,
+        }
+    }
+}
+
+fn run() -> Result<(), Error> {
     let matches = Args::command().get_matches();
     let args = Args::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     match args.command {
@@ -115,11 +133,12 @@ fn run() -> Result<ShellExit, Box<dyn std::error::Error>> {
                     workers: workers.map(NonZeroUsize::get),
                 },
                 order_scripts(open_matches, commands, files),
-            )
+            )?;
+            Ok(())
         }
         PivotCommand::Server(options) => {
-            bin::server::run(options)?;
-            Ok(ShellExit::Success)
+            bin::server::run(options).map_err(Box::from)?;
+            Ok(())
         }
     }
 }
@@ -131,7 +150,7 @@ fn order_scripts(
     open_matches: &ArgMatches,
     commands: Vec<String>,
     files: Vec<PathBuf>,
-) -> Vec<ShellScript> {
+) -> Vec<ShellInput> {
     let indices_of = |id: &str| {
         open_matches
             .indices_of(id)
@@ -139,13 +158,13 @@ fn order_scripts(
             .flatten()
             .collect::<Vec<_>>()
     };
-    let mut scripts: Vec<(usize, ShellScript)> = indices_of("commands")
+    let mut scripts: Vec<(usize, ShellInput)> = indices_of("commands")
         .into_iter()
-        .zip(commands.into_iter().map(ShellScript::Command))
+        .zip(commands.into_iter().map(ShellInput::Command))
         .chain(
             indices_of("files")
                 .into_iter()
-                .zip(files.into_iter().map(ShellScript::File)),
+                .zip(files.into_iter().map(ShellInput::File)),
         )
         .collect();
     scripts.sort_by_key(|(index, _)| *index);
@@ -172,11 +191,10 @@ fn build_shell_target(
 
 fn main() -> ExitCode {
     match run() {
-        Ok(ShellExit::Success) => ExitCode::SUCCESS,
-        Ok(ShellExit::ScriptFailed) => ExitCode::FAILURE,
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("pivot: {error}");
-            ExitCode::FAILURE
+            error.exit_code()
         }
     }
 }
@@ -184,7 +202,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{Args, DatastoreKind, PivotCommand, order_scripts};
-    use bin::shell::ShellScript;
+    use bin::shell::ShellInput;
     use clap::{CommandFactory, FromArgMatches, Parser};
 
     fn parse_open(arguments: &[&str]) -> (String, DatastoreKind, Option<String>) {
@@ -275,9 +293,9 @@ mod tests {
         assert_eq!(
             scripts,
             [
-                ShellScript::Command("x".into()),
-                ShellScript::File("y".into()),
-                ShellScript::Command("z".into()),
+                ShellInput::Command("x".into()),
+                ShellInput::File("y".into()),
+                ShellInput::Command("z".into()),
             ]
         );
     }

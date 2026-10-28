@@ -3,13 +3,14 @@ use crate::shell::copy::{CopyCommand, copy_from_file, parse_copy_command};
 use crate::shell::parser::split_complete;
 use crate::shell::progress::show_opening_progress;
 use crate::shell::render::{TextBatch, render_table};
-use crate::shell::{ShellExit, ShellInstance, ShellLimits, ShellScript, ShellTarget};
+use crate::shell::{ShellInput, ShellInstance, ShellLimits, ShellTarget};
 use clap::{Parser, ValueEnum};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::process::ExitCode;
 use std::time::Instant;
 
 const HELP: &str = "\
@@ -27,82 +28,105 @@ Session settings:
   RESET pivot_stats;       stop printing them
 ";
 
+/// Why the shell, or one line of its input, stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// `\q` or `quit;`; `run_shell` turns it into success.
+    #[error("quit")]
+    Quit,
+    /// A statement or `\copy` that failed or was canceled.
+    #[error("ERROR:  {0}")]
+    Statement(Box<dyn std::error::Error>),
+    /// A backslash command that did not parse; its message is complete as-is.
+    #[error("{0}")]
+    InvalidCommand(String),
+    #[error("{0}")]
+    Open(Box<dyn std::error::Error>),
+    #[error("{input}: {source}")]
+    Input { input: String, source: io::Error },
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Readline(#[from] ReadlineError),
+}
+
+impl Error {
+    pub fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::Quit => ExitCode::SUCCESS,
+            Self::Open(_) => ExitCode::from(2),
+            Self::Statement(_) | Self::InvalidCommand(_) => ExitCode::from(3),
+            Self::Input { .. } | Self::Io(_) | Self::Readline(_) => ExitCode::from(1),
+        }
+    }
+}
+
 pub(crate) async fn run_shell(
     target: ShellTarget,
     limits: ShellLimits,
-    scripts: Vec<ShellScript>,
-) -> Result<ShellExit, Box<dyn std::error::Error>> {
-    let interactive = scripts.is_empty();
+    inputs: Vec<ShellInput>,
+) -> Result<(), Error> {
+    let interactive = inputs.is_empty();
     if interactive && !io::stdin().is_terminal() {
-        return Err("an interactive terminal is required".into());
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "an interactive terminal is required",
+        )
+        .into());
     }
 
     let session = Session::open(&target, limits)?;
     if !interactive {
-        return run_scripts(session, scripts).await;
+        return match run_inputs(session, inputs).await {
+            Err(Error::Quit) => Ok(()),
+            result => result,
+        };
     }
 
     let editor = DefaultEditor::new()?;
     println!("pivot shell ({})", env!("CARGO_PKG_VERSION"));
     println!("Type \"\\help\" for help.");
-    run_repl(session, editor).await?;
-    Ok(ShellExit::Success)
+    run_repl(session, editor).await
 }
 
-/// Run each script in order, stopping at the first that fails or quits.
-async fn run_scripts(
-    mut session: Session,
-    scripts: Vec<ShellScript>,
-) -> Result<ShellExit, Box<dyn std::error::Error>> {
-    for script in scripts {
-        let reader = open_script(&script)
-            .map_err(|error| format!("{}: {error}", describe_script(&script)))?;
-        let flow = session
-            .run_script(reader)
-            .await
-            .map_err(|error| format!("{}: {error}", describe_script(&script)))?;
-        match flow {
-            Flow::Continue => {}
-            Flow::Quit => return Ok(ShellExit::Success),
-            Flow::Failed => return Ok(ShellExit::ScriptFailed),
-        }
+/// Run each input in order, stopping at the first that fails or quits.
+async fn run_inputs(mut session: Session, inputs: Vec<ShellInput>) -> Result<(), Error> {
+    for input in inputs {
+        session.run_input(&input).await?;
     }
-    Ok(ShellExit::Success)
+    Ok(())
 }
 
-/// A reader over the script's text, so a file of any size is read a line at
+/// A reader over the input's text, so a file of any size is read a line at
 /// a time instead of all at once.
-fn open_script(script: &ShellScript) -> io::Result<impl BufRead + '_> {
-    let reader: Box<dyn BufRead + '_> = match script {
-        ShellScript::Command(command) => Box::new(command.as_bytes()),
-        ShellScript::File(path) if path.as_os_str() == "-" => Box::new(io::stdin().lock()),
-        ShellScript::File(path) => Box::new(BufReader::new(File::open(path)?)),
+fn open_input(input: &ShellInput) -> io::Result<impl BufRead + '_> {
+    let reader: Box<dyn BufRead + '_> = match input {
+        ShellInput::Command(command) => Box::new(command.as_bytes()),
+        ShellInput::File(path) if path.as_os_str() == "-" => Box::new(io::stdin().lock()),
+        ShellInput::File(path) => Box::new(BufReader::new(File::open(path)?)),
     };
     Ok(reader)
 }
 
-/// How errors name the script they came from.
-fn describe_script(script: &ShellScript) -> String {
-    match script {
+/// How errors name the input they came from.
+fn describe_input(input: &ShellInput) -> String {
+    match input {
         // We shouldn't get IO errors reading from a CLI argument, but this is easier than
         // untangling the typing
-        ShellScript::Command(command) => format!("-c '{command}'"),
-        ShellScript::File(path) if path.as_os_str() == "-" => "stdin".to_string(),
-        ShellScript::File(path) => path.display().to_string(),
+        ShellInput::Command(command) => format!("-c '{command}'"),
+        ShellInput::File(path) if path.as_os_str() == "-" => "stdin".to_string(),
+        ShellInput::File(path) => path.display().to_string(),
     }
 }
 
-async fn run_repl(
-    mut session: Session,
-    mut editor: DefaultEditor,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_repl(mut session: Session, mut editor: DefaultEditor) -> Result<(), Error> {
     loop {
         let prompt = if session.buffer.is_empty() {
             "pivot=> "
         } else {
             "pivot-> "
         };
-        let (returned_editor, readline) = read_line(editor, prompt).await?;
+        let (returned_editor, readline) = read_line(editor, prompt).await;
         editor = returned_editor;
         let line = match readline {
             Ok(line) => line,
@@ -118,9 +142,15 @@ async fn run_repl(
             let _ = editor.add_history_entry(entry);
         };
         match session.feed_line(&line, &mut record_history).await {
-            Flow::Continue => {}
-            Flow::Failed => session.buffer.clear(),
-            Flow::Quit => break,
+            Ok(()) => {}
+            Err(Error::Quit) => break,
+            // An interactive statement failing is not fatal: report it and
+            // prompt again.
+            Err(error @ (Error::Statement(_) | Error::InvalidCommand(_))) => {
+                eprintln!("{error}");
+                session.buffer.clear();
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(())
@@ -129,20 +159,14 @@ async fn run_repl(
 async fn read_line(
     mut editor: DefaultEditor,
     prompt: &'static str,
-) -> Result<(DefaultEditor, rustyline::Result<String>), tokio::task::JoinError> {
+) -> (DefaultEditor, rustyline::Result<String>) {
     tokio::task::spawn_blocking(move || {
         let result = editor.readline(prompt);
         (editor, result)
     })
     .await
-}
-
-/// What the shell does after a line of input.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Flow {
-    Continue,
-    Failed,
-    Quit,
+    // If `readline` somehow panics in the other thread, we want to propagate that
+    .unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()))
 }
 
 /// One shell session over an open datastore: the statement buffer and the
@@ -156,8 +180,9 @@ struct Session {
 
 impl Session {
     /// Open the datastore (behind the opening spinner) into a fresh session.
-    fn open(target: &ShellTarget, limits: ShellLimits) -> Result<Self, Box<dyn std::error::Error>> {
-        let instance = show_opening_progress(|| ShellInstance::open_with_limits(target, limits))?;
+    fn open(target: &ShellTarget, limits: ShellLimits) -> Result<Self, Error> {
+        let instance = show_opening_progress(|| ShellInstance::open_with_limits(target, limits))
+            .map_err(Error::Open)?;
         Ok(Self {
             instance,
             timing: false,
@@ -173,7 +198,11 @@ impl Session {
     /// Handle one line of input: a meta-command, or SQL appended to the buffer
     /// whose complete statements then run. `record_history` receives each
     /// command as it is recognized.
-    async fn feed_line(&mut self, line: &str, record_history: &mut impl FnMut(String)) -> Flow {
+    async fn feed_line(
+        &mut self,
+        line: &str,
+        record_history: &mut impl FnMut(String),
+    ) -> Result<(), Error> {
         if let Some(parsed) = parse_meta_command(line) {
             record_history(line.to_string());
             return self.handle_meta_command(parsed).await;
@@ -190,71 +219,67 @@ impl Session {
         } = parse_buffer(&self.buffer);
         self.buffer = remainder;
 
-        let mut flow = Flow::Continue;
+        let mut result = Ok(());
         for statement in statements {
             record_history(statement.clone());
             if is_quit_statement(&statement) {
-                return Flow::Quit;
+                return Err(Error::Quit);
             }
-            if !self.execute_statement(statement).await {
-                flow = Flow::Failed;
+            result = self.execute_statement(statement).await;
+            if result.is_err() {
                 break;
             }
         }
         if let Some((input, parsed)) = trailing_meta_command {
             record_history(input);
-            let meta_flow = self.handle_meta_command(parsed).await;
-            if meta_flow != Flow::Continue {
-                flow = meta_flow;
+            let meta_result = self.handle_meta_command(parsed).await;
+            if meta_result.is_err() {
+                result = meta_result;
             }
         }
-        flow
+        result
     }
 
     /// Declare we have no more lines to feed: this runs the statement left
     /// unterminated in the buffer, if any.
-    async fn finish(&mut self) -> Flow {
+    async fn finish(&mut self) -> Result<(), Error> {
         let statement = std::mem::take(&mut self.buffer);
         if statement.is_empty() {
-            Flow::Continue
+            Ok(())
         } else if statement.trim().eq_ignore_ascii_case("quit") {
-            Flow::Quit
-        } else if self.execute_statement(statement).await {
-            Flow::Continue
+            Err(Error::Quit)
         } else {
-            Flow::Failed
+            self.execute_statement(statement).await
         }
     }
 
-    /// Feed `reader` line by line as it is read, then finish it.
-    async fn run_script(&mut self, mut reader: impl BufRead) -> io::Result<Flow> {
+    /// Feed `input` line by line as it is read, then finish it.
+    async fn run_input(&mut self, input: &ShellInput) -> Result<(), Error> {
+        let read_failed = |source| Error::Input {
+            input: describe_input(input),
+            source,
+        };
+        let mut reader = open_input(input).map_err(read_failed)?;
         let mut line = String::new();
-        while reader.read_line(&mut line)? != 0 {
+        while reader.read_line(&mut line).map_err(read_failed)? != 0 {
             let content = line.strip_suffix('\n').unwrap_or(&line);
             let content = content.strip_suffix('\r').unwrap_or(content);
-            let flow = self.feed_line(content, &mut |_| {}).await;
-            if flow != Flow::Continue {
-                return Ok(flow);
-            }
+            self.feed_line(content, &mut |_| {}).await?;
             line.clear();
         }
-        Ok(self.finish().await)
+        self.finish().await
     }
 
-    /// Execute a parsed meta-command, or print why it did not parse.
-    async fn handle_meta_command(&mut self, parsed: Result<MetaCommand, String>) -> Flow {
-        let command = match parsed {
-            Ok(command) => command,
-            Err(message) => {
-                eprintln!("{message}");
-                return Flow::Failed;
-            }
-        };
-        match command {
-            MetaCommand::Quit => Flow::Quit,
+    /// Execute a parsed meta-command.
+    async fn handle_meta_command(
+        &mut self,
+        parsed: Result<MetaCommand, String>,
+    ) -> Result<(), Error> {
+        match parsed.map_err(Error::InvalidCommand)? {
+            MetaCommand::Quit => Err(Error::Quit),
             MetaCommand::Help => {
                 print!("{HELP}");
-                Flow::Continue
+                Ok(())
             }
             MetaCommand::Timing { state } => {
                 self.timing = match state {
@@ -263,25 +288,17 @@ impl Session {
                     None => !self.timing,
                 };
                 println!("Timing is {}.", if self.timing { "on" } else { "off" });
-                Flow::Continue
+                Ok(())
             }
-            MetaCommand::Copy { arguments } => match parse_copy_command(&arguments.join(" ")) {
-                Ok(copy) => {
-                    if self.execute_copy(copy).await {
-                        Flow::Continue
-                    } else {
-                        Flow::Failed
-                    }
-                }
-                Err(message) => {
-                    eprintln!("{message}");
-                    Flow::Failed
-                }
-            },
+            MetaCommand::Copy { arguments } => {
+                let copy =
+                    parse_copy_command(&arguments.join(" ")).map_err(Error::InvalidCommand)?;
+                self.execute_copy(copy).await
+            }
         }
     }
 
-    async fn execute_statement(&mut self, sql: String) -> bool {
+    async fn execute_statement(&mut self, sql: String) -> Result<(), Error> {
         // Like the server, read the flag before the statement runs: the SET that
         // turns stats on reports no stats itself, the one that turns them off
         // still reports its own.
@@ -293,56 +310,40 @@ impl Session {
         let executor = self.instance.executor();
         let stats = &mut self.stats;
         let work = async {
-            match executor
+            let execution = executor
                 .execute_with_output::<TextBatch>(sql, options)
                 .await
+                .map_err(|error| Error::Statement(error.into()))?;
+            if let StatementOutput::Set { name, value } = &execution.output
+                && let Some(enabled) = parse_stats_toggle(name, value.as_deref())
             {
-                Ok(execution) => {
-                    if let StatementOutput::Set { name, value } = &execution.output
-                        && let Some(enabled) = parse_stats_toggle(name, value.as_deref())
-                    {
-                        *stats = enabled;
-                    }
-                    if collect_stats {
-                        println!("{}", execution.stats.summary());
-                    }
-                    if let Err(error) = display_output(execution.output) {
-                        eprintln!("pivot: writing output: {error}");
-                        false
-                    } else {
-                        true
-                    }
-                }
-                Err(error) => {
-                    eprintln!("ERROR:  {error}");
-                    false
-                }
+                *stats = enabled;
             }
+            if collect_stats {
+                println!("{}", execution.stats.summary());
+            }
+            display_output(execution.output)?;
+            Ok(())
         };
         run_interruptible(work, self.timing).await
     }
 
     /// Run a `\copy`: load its file and report the row count like a COPY does.
-    async fn execute_copy(&self, copy: CopyCommand) -> bool {
+    async fn execute_copy(&self, copy: CopyCommand) -> Result<(), Error> {
         let collect_stats = self.stats;
         let options = ExecuteOptions {
             collect_stats,
             profile: false,
         };
         let work = async {
-            match copy_from_file(self.executor(), copy, options).await {
-                Ok(outcome) => {
-                    if collect_stats {
-                        println!("{}", outcome.stats.summary());
-                    }
-                    println!("COPY {}", outcome.rows);
-                    true
-                }
-                Err(error) => {
-                    eprintln!("ERROR:  {error}");
-                    false
-                }
+            let outcome = copy_from_file(self.executor(), copy, options)
+                .await
+                .map_err(|error| Error::Statement(error.into()))?;
+            if collect_stats {
+                println!("{}", outcome.stats.summary());
             }
+            println!("COPY {}", outcome.rows);
+            Ok(())
         };
         run_interruptible(work, self.timing).await
     }
@@ -437,29 +438,27 @@ fn is_quit_statement(statement: &str) -> bool {
         .is_some_and(|command| command.trim().eq_ignore_ascii_case("quit"))
 }
 
-/// Drive `work` to its verdict unless Ctrl-C arrives first, in which case the
+/// Drive `work` to its result unless Ctrl-C arrives first, in which case the
 /// future is dropped, cancelling whatever it was running. Prints the elapsed
 /// time when `timing` is on.
-async fn run_interruptible(work: impl Future<Output = bool>, timing: bool) -> bool {
+async fn run_interruptible(
+    work: impl Future<Output = Result<(), Error>>,
+    timing: bool,
+) -> Result<(), Error> {
     let started = Instant::now();
-    let succeeded = tokio::select! {
-        succeeded = work => succeeded,
+    let result = tokio::select! {
+        result = work => result,
         signal = tokio::signal::ctrl_c() => {
-            match signal {
-                Ok(()) => {
-                    eprintln!("Cancel request sent");
-                    eprintln!("ERROR:  query canceled");
-                }
-                Err(error) => eprintln!("pivot: failed to listen for Ctrl-C: {error}"),
-            }
-            false
+            signal?;
+            eprintln!("Cancel request sent");
+            Err(Error::Statement("query canceled".into()))
         }
     };
 
     if timing {
         println!("Time: {:.3} ms", started.elapsed().as_secs_f64() * 1e3);
     }
-    succeeded
+    result
 }
 
 fn display_output(output: StatementOutput<TextBatch>) -> io::Result<()> {
@@ -587,17 +586,15 @@ mod tests {
             .unwrap();
 
         let on_after_set = runtime.block_on(async {
-            assert!(
-                session
-                    .execute_statement("SET pivot_stats = 1".into())
-                    .await
-            );
+            session
+                .execute_statement("SET pivot_stats = 1".into())
+                .await
+                .unwrap();
             let on = session.stats;
-            assert!(
-                session
-                    .execute_statement("SET pivot_stats = 0".into())
-                    .await
-            );
+            session
+                .execute_statement("SET pivot_stats = 0".into())
+                .await
+                .unwrap();
             on
         });
 
