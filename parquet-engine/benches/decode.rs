@@ -18,7 +18,9 @@
 //! dictionary-encode, so it lands in PLAIN byte-array pages (the long-URL scan
 //! shape). `search_phrase` is ~87% empty and otherwise ~31 B, with low distinct
 //! per row group, so DICTIONARY + RLE (the search-phrase scan shape).
-//! `event_time` is `i64` (the timestamp columns).
+//! `event_time` is `i64` (the timestamp columns). The boolean columns cover
+//! the three ways a flag column arrives: PLAIN bits, RLE runs (what other
+//! writers emit for a column with long runs), and PLAIN bits with nulls.
 //!
 //! Then it scans one column at a time with `table_input(..).collect()`, driving
 //! fetch → snappy-decompress → decode → Arrow materialize. Every scenario is a
@@ -44,7 +46,7 @@ use std::fs::File;
 use std::sync::Arc;
 
 use arrow_array::builder::StringViewBuilder;
-use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{Criterion, Throughput, black_box};
 use parquet::arrow::ArrowWriter;
@@ -174,9 +176,36 @@ fn i64_col(rng: &mut Rng, n: usize, base: i64, span: usize) -> ArrayRef {
     Arc::new(v)
 }
 
+/// A flag that is true for about half the rows, with no run structure.
+fn bool_col(rng: &mut Rng, n: usize) -> ArrayRef {
+    Arc::new(BooleanArray::from_iter(
+        (0..n).map(|_| Some(rng.chance(0.5))),
+    ))
+}
+
+/// A flag that flips about once every `run` rows: the shape a status column
+/// has in a table clustered on time, and what an RLE page stores as runs.
+fn bool_runs_col(rng: &mut Rng, n: usize, run: usize) -> ArrayRef {
+    let mut value = false;
+    Arc::new(BooleanArray::from_iter((0..n).map(|_| {
+        if rng.below(run) == 0 {
+            value = !value;
+        }
+        Some(value)
+    })))
+}
+
+/// A half-true flag with a null in about one row in ten.
+fn nullable_bool_col(rng: &mut Rng, n: usize) -> ArrayRef {
+    Arc::new(BooleanArray::from_iter(
+        (0..n).map(|_| (!rng.chance(0.1)).then(|| rng.chance(0.5))),
+    ))
+}
+
 /// Write a SNAPPY + dictionary Parquet file (one column per decode shape) into
-/// `dir`, `rows` total across `ROW_GROUP_ROWS`-sized row groups. Returns the
-/// schema column order: 0=url, 1=search_phrase, 2=event_time.
+/// `dir`, `rows` total across `ROW_GROUP_ROWS`-sized row groups. The schema
+/// column order: 0=url, 1=search_phrase, 2=event_time, 3=scattered_key,
+/// 4=sorted_key, 5=flag, 6=flag_runs, 7=flag_nullable, 8=flag_packed.
 fn write_parquet(dir: &TempDir, rows: usize) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("url", DataType::Utf8View, false),
@@ -184,6 +213,10 @@ fn write_parquet(dir: &TempDir, rows: usize) {
         Field::new("event_time", DataType::Int64, false),
         Field::new("scattered_key", DataType::Int64, false),
         Field::new("sorted_key", DataType::Int64, false),
+        Field::new("flag", DataType::Boolean, false),
+        Field::new("flag_runs", DataType::Boolean, false),
+        Field::new("flag_nullable", DataType::Boolean, true),
+        Field::new("flag_packed", DataType::Boolean, false),
     ]));
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
@@ -199,6 +232,13 @@ fn write_parquet(dir: &TempDir, rows: usize) {
         .set_column_encoding("scattered_key".into(), Encoding::DELTA_BINARY_PACKED)
         .set_column_dictionary_enabled("sorted_key".into(), false)
         .set_column_encoding("sorted_key".into(), Encoding::DELTA_BINARY_PACKED)
+        // A boolean column is PLAIN bits unless told otherwise; the run-shaped
+        // one is stored as runs, and so is a run-less one, which the RLE
+        // encoder then stores almost entirely as bit-packed groups.
+        .set_column_dictionary_enabled("flag_runs".into(), false)
+        .set_column_encoding("flag_runs".into(), Encoding::RLE)
+        .set_column_dictionary_enabled("flag_packed".into(), false)
+        .set_column_encoding("flag_packed".into(), Encoding::RLE)
         .build();
     let mut writer = ArrowWriter::try_new(
         File::create(dir.path().join("data.parquet")).unwrap(),
@@ -229,6 +269,10 @@ fn write_parquet(dir: &TempDir, rows: usize) {
                 // A clustered key: ascending with small gaps, so the deltas
                 // pack into a handful of bits (the `l_orderkey` shape).
                 sorted_i64_col(&mut rng, n, written as i64 * 4),
+                bool_col(&mut rng, n),
+                bool_runs_col(&mut rng, n, 64),
+                nullable_bool_col(&mut rng, n),
+                bool_col(&mut rng, n),
             ],
         )
         .unwrap();
@@ -276,8 +320,16 @@ fn bench_decode(c: &mut Criterion, dispatch: &Dispatch, table: &Arc<ParquetTable
     // DELTA_BINARY_PACKED at a narrow width: a clustered key whose deltas fit
     // in a few bits, so the unpacking loop does the most work per byte read.
     scenario("decode/delta_sorted", Projection::columns([4]));
-    // Every column at once — a fuller scan.
-    scenario("decode/all", Projection::all(5));
+    // Booleans: PLAIN bits, RLE runs, PLAIN bits with nulls, and RLE over
+    // run-less values (bit-packed groups behind run headers). Next to
+    // `event_time`, which is the same number of values as eight-byte
+    // integers, they show what a value costs to decode in each form.
+    scenario("decode/flag", Projection::columns([5]));
+    scenario("decode/flag_runs", Projection::columns([6]));
+    scenario("decode/flag_nullable", Projection::columns([7]));
+    scenario("decode/flag_packed", Projection::columns([8]));
+    // Every non-boolean column at once — a fuller scan.
+    scenario("decode/all", Projection::columns([0, 1, 2, 3, 4]));
 }
 
 fn main() {

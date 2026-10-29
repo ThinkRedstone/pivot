@@ -749,6 +749,36 @@ async fn insert_with_a_column_list_fills_only_the_named_columns(#[future] conn: 
     );
 }
 
+/// A BOOLEAN column takes true, false and NULL through INSERT, serves as a
+/// bare predicate and its negation, and renders as `t`/`f`/NULL on the wire.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn boolean_scan_filter_and_wire_format(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE flags (id BIGINT, flag BOOLEAN)")
+        .await
+        .unwrap();
+    conn.simple_query("INSERT INTO flags VALUES (1, true), (2, false), (3, NULL), (4, true)")
+        .await
+        .unwrap();
+
+    let rows = select_rows(&conn, "SELECT id, flag FROM flags ORDER BY id").await;
+    let set = select_rows(&conn, "SELECT id FROM flags WHERE flag ORDER BY id").await;
+    let unset = select_rows(&conn, "SELECT id FROM flags WHERE NOT flag").await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("t".into())],
+            vec![Some("2".into()), Some("f".into())],
+            vec![Some("3".into()), None],
+            vec![Some("4".into()), Some("t".into())],
+        ]
+    );
+    assert_eq!(set, vec![vec![Some("1".into())], vec![Some("4".into())]]);
+    assert_eq!(unset, vec![vec![Some("2".into())]]);
+}
+
 /// (k BIGINT, id BIGINT) table whose `k` is 3, NULL, 1, 2 for ids 1..=4, so
 /// the id order of a query sorted by `k` shows where the NULL key landed.
 async fn create_null_key_table(client: &Client, table: &str) {

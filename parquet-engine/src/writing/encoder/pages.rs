@@ -50,26 +50,29 @@ pub(super) fn page_ranges(leaf: &Leaf) -> WriteResult<Vec<PageRange>> {
 /// Cut a leaf into pages of about `target` uncompressed value bytes each. A leaf
 /// whose every row is absent still yields one page — levels, no values — which
 /// is what a shredded path's unused `value` fallback looks like.
+///
+/// The page is measured in bits, since a boolean's PLAIN form is one.
 fn page_ranges_of_size(leaf: &Leaf, target: usize) -> WriteResult<Vec<PageRange>> {
     let rows = leaf.rows();
     if rows == 0 {
         return Ok(Vec::new());
     }
     let sizes = PlainSizes::new(&leaf.values)?;
+    let target_bits = target * 8;
 
     let mut ranges = Vec::new();
-    let (mut row_start, mut value_start, mut value, mut page_size) = (0, 0, 0, 0usize);
+    let (mut row_start, mut value_start, mut value, mut page_bits) = (0, 0, 0, 0usize);
     for row in 0..rows {
         if leaf.is_present(row) {
-            page_size += sizes.at(value);
+            page_bits += sizes.bits_at(value);
             value += 1;
         }
-        if page_size >= target {
+        if page_bits >= target_bits {
             ranges.push(PageRange {
                 rows: row_start..row + 1,
                 values: value_start..value,
             });
-            (row_start, value_start, page_size) = (row + 1, value, 0);
+            (row_start, value_start, page_bits) = (row + 1, value, 0);
         }
     }
     // The rows left over once the last page was cut — and, for a leaf that never
@@ -107,6 +110,8 @@ pub(super) fn data_page_body(
 /// per leaf, so the page cutter's inner loop is a size lookup rather than a
 /// downcast per value.
 enum PlainSizes<'a> {
+    /// One bit per value.
+    Boolean,
     /// Fixed-width values, all of this many bytes.
     Fixed(usize),
     Utf8(&'a StringArray),
@@ -117,6 +122,7 @@ enum PlainSizes<'a> {
 impl<'a> PlainSizes<'a> {
     fn new(values: &'a ArrayRef) -> WriteResult<Self> {
         Ok(match values.data_type() {
+            DataType::Boolean => Self::Boolean,
             // A date is a day count, stored as the INT32 it is annotated as, and
             // a value narrower than its physical type takes that type's width
             // (the narrow integers widened to INT32).
@@ -143,14 +149,15 @@ impl<'a> PlainSizes<'a> {
         })
     }
 
-    /// The PLAIN size of value `i`: a fixed-width value's width, or a
-    /// BYTE_ARRAY's length prefix plus its bytes.
-    fn at(&self, i: usize) -> usize {
+    /// The PLAIN size of value `i` in bits: a boolean's one bit, a fixed-width
+    /// value's width, or a BYTE_ARRAY's length prefix plus its bytes.
+    fn bits_at(&self, i: usize) -> usize {
         match self {
-            Self::Fixed(width) => *width,
-            Self::Utf8(values) => BYTE_ARRAY_LEN_PREFIX + values.value(i).len(),
-            Self::Utf8View(values) => BYTE_ARRAY_LEN_PREFIX + values.value(i).len(),
-            Self::BinaryView(values) => BYTE_ARRAY_LEN_PREFIX + values.value(i).len(),
+            Self::Boolean => 1,
+            Self::Fixed(width) => *width * 8,
+            Self::Utf8(values) => (BYTE_ARRAY_LEN_PREFIX + values.value(i).len()) * 8,
+            Self::Utf8View(values) => (BYTE_ARRAY_LEN_PREFIX + values.value(i).len()) * 8,
+            Self::BinaryView(values) => (BYTE_ARRAY_LEN_PREFIX + values.value(i).len()) * 8,
         }
     }
 }

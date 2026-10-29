@@ -9,7 +9,7 @@
 //! ```text
 //!   arrow DataType    parquet physical   annotation              direction
 //!   --------------    ----------------   ----------------------  ---------
-//!   Boolean           BOOLEAN            -                       read only
+//!   Boolean           BOOLEAN            -                       read+write
 //!   Int8              INT32              Integer{ 8, signed}     read+write
 //!   UInt8             INT32              Integer{ 8, unsigned}   read+write
 //!   Int16             INT32              Integer{16, signed}     read+write
@@ -35,11 +35,10 @@
 //! to 18 digits, `Decimal128` beyond, matching the planner's
 //! `physical_arrow_type` so a file-derived schema and a declared schema agree.
 //!
-//! The "read only" rows resolve files written elsewhere; pivot's own writer only
-//! emits the column set its encoder supports (Int32/Int64/the unsigned widths/
-//! Date32/Timestamp/Float32/Float64/strings/binary/decimals), so
-//! [`arrow_to_parquet_physical`] errors on the rest. `writing::type_tests`
-//! round trips every one of them.
+//! Pivot's own writer only emits the column set its encoder supports (booleans,
+//! Int32/Int64/the unsigned widths/Date32/Timestamp/Float32/Float64/strings/
+//! binary/decimals), so [`arrow_to_parquet_physical`] errors on the rest.
+//! `writing::type_tests` round trips every one of them.
 //!
 //! The write path is two halves: [`arrow_to_parquet_physical`] for the physical
 //! type, [`arrow_to_annotation`] for everything the schema element says on top
@@ -455,6 +454,7 @@ fn integer_annotation(bit_width: i8, is_signed: bool, converted_type: i32) -> Le
 /// side.
 pub fn arrow_to_parquet_physical(data_type: &DataType) -> Result<i32> {
     Ok(match data_type {
+        DataType::Boolean => BOOLEAN,
         DataType::Int32 => INT32,
         DataType::Int64 => INT64,
         // Parquet has no unsigned physical type and no integer narrower than

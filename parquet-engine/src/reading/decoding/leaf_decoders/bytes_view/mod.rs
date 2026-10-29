@@ -3,36 +3,56 @@
 //!
 //! Arrow's *view* layout stores each value as a 128-bit view: short values
 //! (≤ 12 bytes) are inlined, while longer ones reference a `(block_id,
-//! offset)` into an external buffer list. This module provides the three
-//! components needed by [`TypedLeafDecoder`]:
+//! offset)` into an external buffer list. This module provides the components
+//! [`BytesViewLeaf`] names for [`TypedLeafDecoder`]:
 //!
 //! - [`ViewBuilder`] — the [`ArrayBuilder`](super::ArrayBuilder) that
 //!   accumulates views and data blocks.
 //! - [`PlainPageDecoder`] — the [`DecodePlain`](super::DecodePlain) that reads
 //!   length-prefixed byte arrays from plain-encoded pages.
+//! - [`DeltaLengthPageDecoder`] — the [`DecodeEncoding`](super::DecodeEncoding)
+//!   that reads `DELTA_LENGTH_BYTE_ARRAY` pages.
 //! - [`ViewDict`] — the [`Dict`](super::Dict) that pre-parses dictionary
 //!   entries into views for O(1) lookup.
 //!
 //! [`BytesViewDecoder`] ties them together as a ready-to-use type alias. All
-//! three are generic over [`ByteViewType`](arrow_array::types::ByteViewType):
+//! of them are generic over [`ByteViewType`]:
 //! the decode machinery is byte-for-byte identical for the two flavours, and
 //! the parameter only picks the array type the finished column is built as,
 //! matching the leaf's declared schema type (`Utf8View` or `BinaryView`).
 
-use crate::reading::decoding::leaf_decoders::TypedLeafDecoder;
+use std::marker::PhantomData;
+
+use arrow_array::types::ByteViewType;
+
+use crate::reading::decoding::leaf_decoders::bytes_view::delta_length_page_decoder::DeltaLengthPageDecoder;
 use crate::reading::decoding::leaf_decoders::bytes_view::dict::ViewDict;
 use crate::reading::decoding::leaf_decoders::bytes_view::plain_page_decoder::PlainPageDecoder;
+use crate::reading::decoding::leaf_decoders::{LeafType, TypedLeafDecoder, Unsupported};
 use dispatch::arrays::ViewBuilder;
 
 pub(crate) mod delta_length_page_decoder;
 pub(crate) mod dict;
 mod plain_page_decoder;
 
-/// Ready-to-use column decoder for variable-length string/binary types; `V`
-/// (a [`ByteViewType`](arrow_array::types::ByteViewType)) picks whether it
-/// finalises as a `StringViewArray` or a `BinaryViewArray`.
-pub type BytesViewDecoder<V> =
-    TypedLeafDecoder<ViewDict<V>, ViewDict<V>, ViewBuilder<V>, PlainPageDecoder<V>>;
+/// The [`LeafType`] of a variable-length string or binary column; `V` picks
+/// whether it finalises as a `StringViewArray` or a `BinaryViewArray`.
+pub struct BytesViewLeaf<V>(PhantomData<V>);
+
+impl<V: ByteViewType> LeafType for BytesViewLeaf<V> {
+    type Builder = ViewBuilder<V>;
+
+    type Plain = PlainPageDecoder<V>;
+    type DeltaBinaryPacked = Unsupported<ViewBuilder<V>>;
+    type DeltaLengthByteArray = DeltaLengthPageDecoder<V>;
+    type Rle = Unsupported<ViewBuilder<V>>;
+
+    type ContiguousDict = ViewDict<V>;
+    type ScatteredDict = ViewDict<V>;
+}
+
+/// Ready-to-use column decoder for variable-length string/binary types.
+pub type BytesViewDecoder<V> = TypedLeafDecoder<BytesViewLeaf<V>>;
 
 #[cfg(test)]
 mod tests {

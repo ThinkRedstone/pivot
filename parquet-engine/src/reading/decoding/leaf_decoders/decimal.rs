@@ -21,14 +21,14 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Decimal64Type, Decimal128Type, DecimalType};
-use arrow_array::{ArrayRef, ArrowPrimitiveType, RecordBatch, Scalar};
+use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use bytes::Bytes;
 
 use super::{BuiltDictionary, SharedDictionary};
 use crate::reading::decoding::leaf_decoders::primitive::ElemPtr;
 use crate::reading::decoding::leaf_decoders::{
-    DecimalDeltaDecoder, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error, FromDelta,
-    LeafDecoder, Result, TypedLeafDecoder,
+    DecodeEncoding, DecodePlain, DeltaDecoder, Dict, DictFromBytes, DictFromVecBytes, Error,
+    FromDelta, LeafDecoder, LeafType, Result, TypedLeafDecoder, Unsupported,
 };
 use crate::thrift::headers::DictionaryPageHeader;
 use crate::types::metadata::ColumnChunkMeta;
@@ -44,10 +44,10 @@ pub trait DecimalStorage: 'static {
     /// Bytes one value occupies on disk.
     const PHYSICAL_SIZE: usize;
 
-    /// Whether a page in this storage can arrive `DELTA_BINARY_PACKED`, which
-    /// the encoding defines for `INT32` and `INT64` but not for fixed-length
-    /// bytes.
-    const DELTA_PACKABLE: bool;
+    /// The decoder of a `DELTA_BINARY_PACKED` page in this storage. The
+    /// encoding is defined for `INT32` and `INT64`, whose unscaled integers
+    /// pack like any other integer's, and not for fixed-length bytes.
+    type DeltaBinaryPacked<T: DecimalCarrier>: DecodeEncoding<Builder = PrimitiveBuilder<T>>;
 
     /// Decodes one value from its exactly-`PHYSICAL_SIZE`-byte slice,
     /// sign-extending to 128 bits.
@@ -63,7 +63,7 @@ pub struct DecimalFromInt32;
 
 impl DecimalStorage for DecimalFromInt32 {
     const PHYSICAL_SIZE: usize = 4;
-    const DELTA_PACKABLE: bool = true;
+    type DeltaBinaryPacked<T: DecimalCarrier> = DeltaDecoder<T>;
 
     #[inline(always)]
     fn decode(bytes: &[u8]) -> i128 {
@@ -81,7 +81,7 @@ pub struct DecimalFromInt64;
 
 impl DecimalStorage for DecimalFromInt64 {
     const PHYSICAL_SIZE: usize = 8;
-    const DELTA_PACKABLE: bool = true;
+    type DeltaBinaryPacked<T: DecimalCarrier> = DeltaDecoder<T>;
 
     #[inline(always)]
     fn decode(bytes: &[u8]) -> i128 {
@@ -100,7 +100,7 @@ pub struct DecimalFromFixedLen<const LEN: usize>;
 
 impl<const LEN: usize> DecimalStorage for DecimalFromFixedLen<LEN> {
     const PHYSICAL_SIZE: usize = LEN;
-    const DELTA_PACKABLE: bool = false;
+    type DeltaBinaryPacked<T: DecimalCarrier> = Unsupported<PrimitiveBuilder<T>>;
 
     #[inline(always)]
     fn decode(bytes: &[u8]) -> i128 {
@@ -203,10 +203,6 @@ pub struct DecimalPlainDecoder<T: DecimalCarrier, S: DecimalStorage> {
 
 impl<T: DecimalCarrier, S: DecimalStorage> DecodePlain for DecimalPlainDecoder<T, S> {
     type Builder = PrimitiveBuilder<T>;
-    // A decimal stored as INT32/INT64 could be delta packed; the storage kinds
-    // are read through `DecimalStorage`, which the delta decoder does not go
-    // through yet, so such a page reports an unsupported encoding.
-    type Delta = DecimalDeltaDecoder<T, S>;
 
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
         Self {
@@ -344,14 +340,24 @@ impl<T: DecimalCarrier, S: DecimalStorage> DictFromVecBytes
     }
 }
 
+/// The [`LeafType`] of a decimal column of carrier `T` and storage `S`.
+pub struct DecimalLeaf<T, S>(PhantomData<(T, S)>);
+
+impl<T: DecimalCarrier, S: DecimalStorage> LeafType for DecimalLeaf<T, S> {
+    type Builder = PrimitiveBuilder<T>;
+
+    type Plain = DecimalPlainDecoder<T, S>;
+    type DeltaBinaryPacked = S::DeltaBinaryPacked<T>;
+    type DeltaLengthByteArray = Unsupported<PrimitiveBuilder<T>>;
+    type Rle = Unsupported<PrimitiveBuilder<T>>;
+
+    type ContiguousDict = DecimalDict<T, S, SlabBuffer<T::Native>>;
+    type ScatteredDict = DecimalDict<T, S, MultiSlabBuffer<T::Native>>;
+}
+
 /// The generic page decoder a decimal column decodes through, before its
 /// arrays are given the column's declared shape.
-type DecimalPageDecoder<T, S> = TypedLeafDecoder<
-    DecimalDict<T, S, SlabBuffer<<T as ArrowPrimitiveType>::Native>>,
-    DecimalDict<T, S, MultiSlabBuffer<<T as ArrowPrimitiveType>::Native>>,
-    PrimitiveBuilder<T>,
-    DecimalPlainDecoder<T, S>,
->;
+type DecimalPageDecoder<T, S> = TypedLeafDecoder<DecimalLeaf<T, S>>;
 
 /// Ready-to-use column decoder for a decimal column of carrier `T` and
 /// storage `S`: the page decoder plus the column's declared precision and

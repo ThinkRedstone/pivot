@@ -20,20 +20,21 @@
 //! and a block's widths are all known before its data, so a miniblock's byte
 //! length is known before reading it.
 //!
-//! The encoding only exists for the `INT32` and `INT64` physical types.
-//! [`DeltaDecoder::new`] answers `None` for any other column, which surfaces
-//! as the same "unsupported encoding" error a reader would get today.
+//! The encoding only exists for the `INT32` and `INT64` physical types, so
+//! [`DeltaPacking`] pairs the integer natives with [`DeltaDecoder`] and the
+//! floats with [`Unsupported`]. A header the decoder cannot make sense of
+//! also declines, which surfaces as the same "unsupported encoding" error.
 
 use std::marker::PhantomData;
 
 use arrow_array::types::ArrowPrimitiveType;
+use arrow_buffer::ArrowNativeType;
 use bytes::Bytes;
 use dispatch::arrays::ArrayBuilder;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
 
 use crate::reading::decoding::leaf_decoders::primitive::PrimitiveBuilder;
-use crate::reading::decoding::leaf_decoders::{DecimalStorage, DecodeDelta};
-use crate::thrift::general::Encoding;
+use crate::reading::decoding::leaf_decoders::{DecodeEncoding, Unsupported};
 
 /// Widest block layout accepted. Writers use four miniblocks of 32 values;
 /// this admits far more while keeping the per-block widths on the stack, and
@@ -48,25 +49,17 @@ const WINDOW_SLACK: usize = 16;
 
 /// A column value the decoder can produce from the `i64` it accumulates in.
 ///
-/// The encoding stores whole numbers, so every integer column has one of these
-/// and the float columns do not: their pages are never delta packed, and
-/// [`DELTA_PACKABLE`](Self::DELTA_PACKABLE) is how a decoder for such a column
-/// declines to build. A decimal's raw unscaled integer is delta packed like any
-/// other, so its carrier has one too.
+/// The encoding stores whole numbers, so every integer has one of these and
+/// the floats do not. A decimal's raw unscaled integer is delta packed like
+/// any other, so its carrier has one too.
 pub trait FromDelta: Copy + Default {
-    /// Whether a page of this type can arrive `DELTA_BINARY_PACKED`.
-    const DELTA_PACKABLE: bool;
-
-    /// Narrow a value the decoder accumulated in `i64` to this type. Only
-    /// called for types with [`DELTA_PACKABLE`](Self::DELTA_PACKABLE).
+    /// Narrow a value the decoder accumulated in `i64` to this type.
     fn from_delta(value: i64) -> Self;
 }
 
 macro_rules! integer_from_delta {
     ($($ty:ty),*) => {
         $(impl FromDelta for $ty {
-            const DELTA_PACKABLE: bool = true;
-
             #[inline(always)]
             fn from_delta(value: i64) -> Self {
                 value as $ty
@@ -76,19 +69,32 @@ macro_rules! integer_from_delta {
 }
 integer_from_delta!(i8, u8, i16, u16, i32, u32, i64, u64, i128);
 
-macro_rules! float_from_delta {
-    ($($ty:ty),*) => {
-        $(impl FromDelta for $ty {
-            const DELTA_PACKABLE: bool = false;
+/// How a primitive column with this native type reads a `DELTA_BINARY_PACKED`
+/// page: through [`DeltaDecoder`] for the integers, which the encoding is
+/// defined for, and not at all for the floats.
+pub trait DeltaPacking: ArrowNativeType {
+    type Decoder<T: ArrowPrimitiveType<Native = Self>>: DecodeEncoding<
+        Builder = PrimitiveBuilder<T>,
+    >;
+}
 
-            #[inline(always)]
-            fn from_delta(_value: i64) -> Self {
-                unreachable!("a float column is never delta packed")
-            }
+macro_rules! integer_delta_packing {
+    ($($ty:ty),*) => {
+        $(impl DeltaPacking for $ty {
+            type Decoder<T: ArrowPrimitiveType<Native = $ty>> = DeltaDecoder<T>;
         })*
     };
 }
-float_from_delta!(f32, f64);
+integer_delta_packing!(i8, u8, i16, u16, i32, u32, i64, u64, i128);
+
+macro_rules! float_delta_packing {
+    ($($ty:ty),*) => {
+        $(impl DeltaPacking for $ty {
+            type Decoder<T: ArrowPrimitiveType<Native = $ty>> = Unsupported<PrimitiveBuilder<T>>;
+        })*
+    };
+}
+float_delta_packing!(f32, f64);
 
 /// Reads `DELTA_BINARY_PACKED` pages for a fixed-width primitive column.
 pub struct DeltaDecoder<T: ArrowPrimitiveType>
@@ -119,17 +125,13 @@ where
     phantom: PhantomData<T>,
 }
 
-impl<T: ArrowPrimitiveType> DecodeDelta for DeltaDecoder<T>
+impl<T: ArrowPrimitiveType> DecodeEncoding for DeltaDecoder<T>
 where
     T::Native: FromDelta,
 {
     type Builder = PrimitiveBuilder<T>;
-    const ENCODING: Encoding = Encoding::DELTA_BINARY_PACKED;
 
     fn new(data: Vec<Bytes>, mut position: ReaderPosition) -> Option<Self> {
-        if !T::Native::DELTA_PACKABLE {
-            return None;
-        }
         let (block_size, miniblocks_per_block, total_values, first_value) = {
             let mut reader = MultiBufferReader::new(&data, &mut position);
             (
@@ -478,51 +480,9 @@ fn read_zigzag(reader: &mut MultiBufferReader) -> i64 {
     ((raw >> 1) as i64) ^ -((raw & 1) as i64)
 }
 
-/// Reads `DELTA_BINARY_PACKED` pages for a decimal column.
-///
-/// A decimal is stored as its raw unscaled integer, so the packed values are
-/// decoded exactly as a plain integer column's are and then carried at the
-/// column's own width. Only the `INT32` and `INT64` storages can be packed this
-/// way, which is what [`DecimalStorage::DELTA_PACKABLE`] answers: a decimal
-/// stored as fixed-length bytes declines and reports an unsupported encoding.
-pub struct DecimalDeltaDecoder<T: ArrowPrimitiveType, S: DecimalStorage>
-where
-    T::Native: FromDelta,
-{
-    inner: DeltaDecoder<T>,
-    phantom: PhantomData<S>,
-}
-
-impl<T: ArrowPrimitiveType, S: DecimalStorage> DecodeDelta for DecimalDeltaDecoder<T, S>
-where
-    T::Native: FromDelta,
-{
-    type Builder = PrimitiveBuilder<T>;
-    const ENCODING: Encoding = Encoding::DELTA_BINARY_PACKED;
-
-    fn new(data: Vec<Bytes>, position: ReaderPosition) -> Option<Self> {
-        if !S::DELTA_PACKABLE {
-            return None;
-        }
-        Some(Self {
-            inner: DeltaDecoder::new(data, position)?,
-            phantom: PhantomData,
-        })
-    }
-
-    fn read(&mut self, builder: &mut Self::Builder, size: usize) {
-        self.inner.read(builder, size);
-    }
-
-    fn skip(&mut self, size: usize) {
-        self.inner.skip(size);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reading::decoding::leaf_decoders::decimal::DecimalFromInt64;
     use arrow_array::types::{Decimal64Type, Decimal128Type, Float64Type, Int32Type, Int64Type};
     use dispatch::memory::{SlabAllocator, init_test_free_pool};
 
@@ -813,7 +773,7 @@ mod tests {
     #[test]
     fn decodes_a_decimal_column_carried_at_both_widths() {
         // A decimal is packed as its raw unscaled integer, so the same page
-        // decodes under either carrier.
+        // decodes under either carrier through the integer decoder.
         let values: Vec<i64> = (0..64).map(|i| -12_345 + i * 100).collect();
         let page = encode(&values, 32, 4);
         init_test_free_pool(8);
@@ -823,13 +783,13 @@ mod tests {
         let mut wide =
             PrimitiveBuilder::<Decimal128Type>::with_capacity(&mut allocator, values.len());
 
-        DecimalDeltaDecoder::<Decimal64Type, DecimalFromInt64>::new(
+        DeltaDecoder::<Decimal64Type>::new(
             vec![Bytes::copy_from_slice(&page)],
             ReaderPosition::default(),
         )
         .unwrap()
         .read(&mut narrow, values.len());
-        DecimalDeltaDecoder::<Decimal128Type, DecimalFromInt64>::new(
+        DeltaDecoder::<Decimal128Type>::new(
             vec![Bytes::copy_from_slice(&page)],
             ReaderPosition::default(),
         )
@@ -863,10 +823,11 @@ mod tests {
     #[test]
     fn a_float_column_has_no_delta_form() {
         // The encoding stores whole numbers, so a float page cannot be one and
-        // the decoder declines rather than reading the bytes as something else.
+        // the float's decoder declines rather than reading the bytes as
+        // something else.
         let page = encode(&[1i64, 2, 3], 32, 4);
 
-        let decoder = DeltaDecoder::<Float64Type>::new(
+        let decoder = <f64 as DeltaPacking>::Decoder::<Float64Type>::new(
             vec![Bytes::copy_from_slice(&page)],
             ReaderPosition::default(),
         );

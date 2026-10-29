@@ -1,16 +1,16 @@
 //! The PLAIN encode path: cut a leaf into pages and PLAIN-encode each.
 //!
 //! A page's body is its definition levels (for a leaf that has any) followed by
-//! the stored values back to back — fixed-width values little-endian, BYTE_ARRAY
-//! values a 4-byte LE length prefix then the bytes. [`encode_into`] is also
-//! reused by [`dictionary`](super::dictionary) to encode a dictionary page's
-//! distinct values.
+//! the stored values back to back — fixed-width values little-endian, booleans
+//! one bit each, BYTE_ARRAY values a 4-byte LE length prefix then the bytes.
+//! [`encode_into`] is also reused by [`dictionary`](super::dictionary) to encode
+//! a dictionary page's distinct values.
 
 use crate::thrift::general::{CompressionCodec, Encoding};
 use arrow_array::{
-    Array, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, StringViewArray,
-    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BinaryViewArray, BooleanArray, Date32Array, Decimal64Array, Decimal128Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
+    StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
 
@@ -65,7 +65,8 @@ fn encode_data_page(
 
 /// Append `array`'s PLAIN-encoded values to `out`: fixed-width values
 /// little-endian (except wide decimals, whose fixed-length bytes are
-/// big-endian), BYTE_ARRAY values a length-prefixed copy.
+/// big-endian), booleans one bit each, BYTE_ARRAY values a length-prefixed
+/// copy.
 ///
 /// Parquet stores only the values that are present, so a leaf's absent rows are
 /// already dropped by the time they reach here (see
@@ -110,6 +111,14 @@ pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<(
         }};
     }
     match array.data_type() {
+        // A boolean is one bit, least significant bit first, which is the
+        // layout arrow already holds the values in; `sliced` is the bitmap
+        // realigned to start at bit zero, as it does unless the array is a
+        // slice of a larger one.
+        DataType::Boolean => {
+            let a = downcast::<BooleanArray>(array)?;
+            out.extend_from_slice(&a.values().sliced()[..len.div_ceil(8)]);
+        }
         // The two narrow signed widths widen to the INT32 that is Parquet's
         // narrowest integer.
         DataType::Int8 => widened!(Int8Array, i32),

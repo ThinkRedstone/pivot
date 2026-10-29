@@ -8,11 +8,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_arith::aggregate::{max, min};
+use arrow_arith::aggregate::{bool_and, bool_or, max, min};
 use arrow_array::{
-    Array, ArrayRef, BinaryViewArray, Date32Array, Datum, Decimal64Array, Decimal128Array,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, StringArray,
-    StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryViewArray, BooleanArray, Date32Array, Datum, Decimal64Array,
+    Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    Scalar, StringArray, StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
 
@@ -43,6 +44,14 @@ pub(super) fn column_min_max(array: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
         }};
     }
     match array.data_type() {
+        // `false` orders below `true`, so the bounds are whether every value
+        // is true and whether any is.
+        DataType::Boolean => {
+            let a = array.as_any().downcast_ref::<BooleanArray>()?;
+            let lo: ArrayRef = Arc::new(BooleanArray::from(vec![bool_and(a)?]));
+            let hi: ArrayRef = Arc::new(BooleanArray::from(vec![bool_or(a)?]));
+            Some((lo, hi))
+        }
         DataType::Int8 => numeric!(Int8Array),
         DataType::Int16 => numeric!(Int16Array),
         DataType::Int32 => numeric!(Int32Array),
@@ -102,11 +111,11 @@ pub(super) fn column_min_max(array: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
 /// Encode a single-element stats array (a column's min or max, from
 /// [`column_min_max`]) into the Parquet `min_value`/`max_value` bytes.
 ///
-/// The encoding must match the reader's `decode_bounds` exactly — little-endian
-/// for primitives and for the INT32/INT64 decimal storages, raw UTF-8 for
-/// strings, and big-endian 16-byte two's-complement for wide decimals (the
-/// spec's FIXED_LEN_BYTE_ARRAY stats encoding) — or stats-based row-group
-/// pruning would silently drop rows.
+/// The encoding must match the reader's `decode_bounds` exactly — a single
+/// 0 or 1 byte for a boolean, little-endian for primitives and for the
+/// INT32/INT64 decimal storages, raw UTF-8 for strings, and big-endian 16-byte
+/// two's-complement for wide decimals (the spec's FIXED_LEN_BYTE_ARRAY stats
+/// encoding) — or stats-based row-group pruning would silently drop rows.
 pub(super) fn stat_bytes(value: &ArrayRef) -> Option<Vec<u8>> {
     macro_rules! le_bytes {
         ($arr:ty) => {
@@ -139,6 +148,9 @@ pub(super) fn stat_bytes(value: &ArrayRef) -> Option<Vec<u8>> {
         };
     }
     Some(match value.data_type() {
+        DataType::Boolean => {
+            vec![value.as_any().downcast_ref::<BooleanArray>()?.value(0) as u8]
+        }
         DataType::Int8 => widened_le_bytes!(Int8Array, i32),
         DataType::Int16 => widened_le_bytes!(Int16Array, i32),
         DataType::Int32 => le_bytes!(Int32Array),

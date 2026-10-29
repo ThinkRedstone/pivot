@@ -22,8 +22,7 @@ use dispatch::memory::{MultiBufferReader, ReaderPosition};
 use std::marker::PhantomData;
 
 use crate::reading::decoding::leaf_decoders::delta_binary_packed::DeltaDecoder;
-use crate::reading::decoding::leaf_decoders::{ArrayBuilder, DecodeDelta};
-use crate::thrift::general::Encoding;
+use crate::reading::decoding::leaf_decoders::{ArrayBuilder, DecodeEncoding};
 use dispatch::arrays::ViewBuilder;
 
 /// Reads `DELTA_LENGTH_BYTE_ARRAY` pages, producing views for a string or
@@ -44,9 +43,8 @@ pub struct DeltaLengthPageDecoder<V: ByteViewType> {
     phantom: PhantomData<V>,
 }
 
-impl<V: ByteViewType> DecodeDelta for DeltaLengthPageDecoder<V> {
+impl<V: ByteViewType> DecodeEncoding for DeltaLengthPageDecoder<V> {
     type Builder = ViewBuilder<V>;
-    const ENCODING: Encoding = Encoding::DELTA_LENGTH_BYTE_ARRAY;
 
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Option<Self> {
         // The lengths are a delta-packed `INT32` page in their own right, so
@@ -191,7 +189,7 @@ impl<V: ByteViewType> DeltaLengthPageDecoder<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reading::decoding::leaf_decoders::{ArrayBuilder, DecodeDelta};
+    use crate::reading::decoding::leaf_decoders::{ArrayBuilder, DecodeEncoding};
     use crate::writing::encoder::delta::encode_length_byte_array;
     use arrow_array::types::StringViewType;
     use arrow_array::{Array, StringViewArray};

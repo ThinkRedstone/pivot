@@ -1,25 +1,24 @@
 //! [`TypedLeafDecoder`] — the generic, type-parameterised implementation of
 //! [`LeafDecoder`].
 //!
-//! This struct is parameterised over the traits that together describe how to
-//! decode a particular Parquet column type:
-//! - `DC: DictFromBytes` / `DS: DictFromVecBytes` - the two dictionary
-//!   flavours; which one is built depends on whether the dictionary page
-//!   arrives in one contiguous buffer or scattered across several (see
-//!   [`DictStorage`]).
-//! - `B: ArrayBuilder` — accumulates decoded values into an Arrow array.
-//! - `P: DecodePlain` — reads plain-encoded values from raw page bytes.
+//! This struct is parameterised over a [`LeafType`], which names everything
+//! that decoding one Parquet column type needs:
+//! - its two dictionary flavours; which one is built depends on whether the
+//!   dictionary page arrives in one contiguous buffer or scattered across
+//!   several (see [`DictStorage`]).
+//! - its [`ArrayBuilder`], which accumulates decoded values into an Arrow
+//!   array.
+//! - its decoder for each encoding a data page may carry.
 //!
 //! Concrete column decoders (e.g. `PrimitiveLeafDecoder`, `BytesViewDecoder`)
-//! are type aliases over `TypedLeafDecoder` with the appropriate type
-//! parameters.
+//! are type aliases over `TypedLeafDecoder` with the appropriate leaf type.
 
 use super::{BuiltDictionary, SharedDictionary};
 use crate::reading::decoding::leaf_decoders::levels::decode_def_levels;
 use crate::reading::decoding::leaf_decoders::rle::RleDecoder;
 use crate::reading::decoding::leaf_decoders::{
-    ArrayBuilder, DecodeDelta, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
-    LeafDecoder, Result,
+    ArrayBuilder, DecodeEncoding, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
+    LeafDecoder, LeafType, Result,
 };
 use crate::thrift::general::Encoding;
 use crate::thrift::headers::DataPageHeader;
@@ -30,40 +29,47 @@ use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use bytes::Bytes;
 use dispatch::arrays::ValidityBuilder;
 use dispatch::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
-use std::marker::PhantomData;
 use std::sync::Arc;
 
-/// Which encoding strategy to use for a data page's values.
-pub enum ValueDecoder<P: DecodePlain> {
-    Plain(P),
-    Rle(RleDecoder),
-    Delta(P::Delta),
+/// The decoder of a data page's values, one variant per encoding a page may
+/// carry: PLAIN, indices into the dictionary, or one of the encodings the
+/// leaf type names a decoder for.
+pub enum ValueDecoder<L: LeafType> {
+    Plain(L::Plain),
+    Dictionary(RleDecoder),
+    DeltaBinaryPacked(L::DeltaBinaryPacked),
+    DeltaLengthByteArray(L::DeltaLengthByteArray),
+    Rle(L::Rle),
 }
 
 /// Decode `n` values into `builder` (a dictionary page looks each index up in
 /// `dict`). Shared by the required and nullable read loops.
-fn decode_run<D, P>(
-    decoder: &mut ValueDecoder<P>,
-    builder: &mut P::Builder,
+fn decode_run<D, L>(
+    decoder: &mut ValueDecoder<L>,
+    builder: &mut L::Builder,
     dict: Option<&D>,
     n: usize,
 ) where
-    D: Dict<Builder = P::Builder, Item = <P::Builder as ArrayBuilder>::Element>,
-    P: DecodePlain,
+    D: Dict<Builder = L::Builder, Item = <L::Builder as ArrayBuilder>::Element>,
+    L: LeafType,
 {
     match decoder {
         ValueDecoder::Plain(p) => p.read(builder, n),
-        ValueDecoder::Rle(r) => r.read(builder, dict.expect("No dict available!"), n),
-        ValueDecoder::Delta(d) => d.read(builder, n),
+        ValueDecoder::Dictionary(r) => r.read(builder, dict.expect("No dict available!"), n),
+        ValueDecoder::DeltaBinaryPacked(d) => d.read(builder, n),
+        ValueDecoder::DeltaLengthByteArray(d) => d.read(builder, n),
+        ValueDecoder::Rle(d) => d.read(builder, n),
     }
 }
 
 /// Advance past `n` values without decoding them (a filtered-out run).
-fn skip_run<P: DecodePlain>(decoder: &mut ValueDecoder<P>, n: usize) {
+fn skip_run<L: LeafType>(decoder: &mut ValueDecoder<L>, n: usize) {
     match decoder {
         ValueDecoder::Plain(p) => p.skip(n),
-        ValueDecoder::Rle(r) => r.skip(n),
-        ValueDecoder::Delta(d) => d.skip(n),
+        ValueDecoder::Dictionary(r) => r.skip(n),
+        ValueDecoder::DeltaBinaryPacked(d) => d.skip(n),
+        ValueDecoder::DeltaLengthByteArray(d) => d.skip(n),
+        ValueDecoder::Rle(d) => d.skip(n),
     }
 }
 
@@ -93,9 +99,9 @@ impl DefLevels {
 /// Tracks the value decoder, the optional filter mask cursor, how many rows
 /// remain in the page, and, for a nullable column, the page's definition
 /// levels (which logical rows are null).
-pub struct ReadPage<P: DecodePlain> {
-    /// Plain or RLE decoder for this page's values.
-    decoder: ValueDecoder<P>,
+pub struct ReadPage<L: LeafType> {
+    /// The decoder for this page's values, whichever encoding it carries.
+    decoder: ValueDecoder<L>,
     /// Filter mask cursor; `None` when the full page is kept.
     running_filter_mask_opt: Option<RunningFilterMask>,
     /// Rows left to decode in this page.
@@ -105,15 +111,15 @@ pub struct ReadPage<P: DecodePlain> {
     def_levels: Option<DefLevels>,
 }
 
-impl<P: DecodePlain> ReadPage<P> {
+impl<L: LeafType> ReadPage<L> {
     /// Decodes up to `size` rows from this page into `builder`.
     ///
     /// When a [`RunningFilterMask`] is present, false runs are skipped and
     /// only true runs are decoded, so the actual number of values pushed may
     /// be less than `size`.
-    pub fn read_into<D>(&mut self, dict: Option<&D>, builder: &mut P::Builder, size: usize)
+    pub fn read_into<D>(&mut self, dict: Option<&D>, builder: &mut L::Builder, size: usize)
     where
-        D: Dict<Builder = P::Builder, Item = <P::Builder as ArrayBuilder>::Element>,
+        D: Dict<Builder = L::Builder, Item = <L::Builder as ArrayBuilder>::Element>,
     {
         let current_len = builder.len();
         let mut read_left = size.min(self.remaining);
@@ -146,11 +152,11 @@ impl<P: DecodePlain> ReadPage<P> {
     pub fn read_into_nullable<D>(
         &mut self,
         dict: Option<&D>,
-        builder: &mut P::Builder,
+        builder: &mut L::Builder,
         validity: &mut ValidityBuilder,
         size: usize,
     ) where
-        D: Dict<Builder = P::Builder, Item = <P::Builder as ArrayBuilder>::Element>,
+        D: Dict<Builder = L::Builder, Item = <L::Builder as ArrayBuilder>::Element>,
     {
         let start_len = builder.len();
         let mut kept_left = size.min(self.remaining);
@@ -177,9 +183,7 @@ impl<P: DecodePlain> ReadPage<P> {
                     // safe to interpret.
                     (true, true) => decode_run(&mut self.decoder, builder, dict, n),
                     (true, false) => {
-                        builder
-                            .spare_mut(n)
-                            .fill(<P::Builder as ArrayBuilder>::Element::default());
+                        builder.push(&<L::Builder as ArrayBuilder>::Element::default(), n)
                     }
                     // Skipped present rows still consume their values; skipped
                     // nulls have no value in the stream.
@@ -229,19 +233,11 @@ impl<DC: DictFromBytes, DS: DictFromVecBytes> DictStorage<DC, DS> {
     }
 }
 
-/// Generic column decoder parameterised by dictionary, builder, and plain
-/// decoder types.
+/// Generic column decoder over a [`LeafType`].
 ///
 /// Accumulates [`DecompressedPage`]s and decodes them into Arrow arrays on
-/// demand. See the [module docs](self) for how the type parameters fit
-/// together.
-pub struct TypedLeafDecoder<DC, DS, B, P>
-where
-    DC: DictFromBytes<Builder = B, Item = B::Element>,
-    DS: DictFromVecBytes<Builder = B, Item = B::Element, EqConstant = DC::EqConstant>,
-    B: ArrayBuilder,
-    P: DecodePlain<Builder = B>,
-{
+/// demand. See the [module docs](self) for what the leaf type provides.
+pub struct TypedLeafDecoder<L: LeafType> {
     /// Indexed by page number. `None` means the page hasn't arrived yet.
     pages: Vec<Option<PageSlot>>,
     /// Index of the next page to decode.
@@ -249,24 +245,17 @@ where
     /// Maximum definition level for this column (0 = non-nullable).
     max_def_level: i16,
     /// The page currently being consumed, if any.
-    read_page: Option<ReadPage<P>>,
+    read_page: Option<ReadPage<L>>,
     /// The dictionary, once built here or adopted from another reader of the
     /// row group on this node.
-    dict: Option<Arc<DictStorage<DC, DS>>>,
+    dict: Option<Arc<DictStorage<L::ContiguousDict, L::ScatteredDict>>>,
     /// The pushed-down equality constant, in this dictionary flavour's own
     /// representation (see [`Dict::EqConstant`]). Drives row-group pruning
     /// and scan-side batch filtering once the dictionary is built.
-    eq_const: Option<DC::EqConstant>,
-    phantom_data: PhantomData<B>,
+    eq_const: Option<<L::ContiguousDict as Dict>::EqConstant>,
 }
 
-impl<DC, DS, B, P> TypedLeafDecoder<DC, DS, B, P>
-where
-    DC: DictFromBytes<Builder = B, Item = B::Element>,
-    DS: DictFromVecBytes<Builder = B, Item = B::Element, EqConstant = DC::EqConstant>,
-    B: ArrayBuilder,
-    P: DecodePlain<Builder = B>,
-{
+impl<L: LeafType> TypedLeafDecoder<L> {
     /// Creates a new decoder for a column with the given maximum definition
     /// level. Use `0` for non-nullable columns.
     pub fn new(max_def_level: i16) -> Self {
@@ -277,7 +266,6 @@ where
             read_page: None,
             dict: None,
             eq_const: None,
-            phantom_data: Default::default(),
         }
     }
 
@@ -291,16 +279,15 @@ where
         self.pages[idx] = Some(slot);
     }
 
-    /// Selects the appropriate [`ValueDecoder`] (plain, RLE-dictionary, or
-    /// delta) based on the page header's encoding.
+    /// Selects the [`ValueDecoder`] for a page from its header's encoding.
     fn create_decoder(
         &self,
         header: DataPageHeader,
         data: Vec<Bytes>,
         mut position: ReaderPosition,
-    ) -> Result<ValueDecoder<P>> {
-        match header.encoding {
-            Encoding::PLAIN => Ok(ValueDecoder::Plain(P::new(data, position))),
+    ) -> Result<ValueDecoder<L>> {
+        let decoder = match header.encoding {
+            Encoding::PLAIN => Some(ValueDecoder::Plain(L::Plain::new(data, position))),
             Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
                 if self.dict.is_none() {
                     return Err(Error::NoPagesReady);
@@ -309,17 +296,22 @@ where
                     let mut reader = MultiBufferReader::new(&data, &mut position);
                     reader.read_u8()
                 };
-                Ok(ValueDecoder::Rle(RleDecoder::new(
+                Some(ValueDecoder::Dictionary(RleDecoder::new(
                     data, position, bit_width,
                 )))
             }
-            // The column type decides which delta encoding it can read, so a
-            // page carrying the other one falls through as unsupported.
-            e if e == P::Delta::ENCODING => P::Delta::new(data, position)
-                .map(ValueDecoder::Delta)
-                .ok_or(Error::UnsupportedEncoding(e)),
-            r => Err(Error::UnsupportedEncoding(r)),
-        }
+            // The leaf type names a decoder for each of these, or
+            // `Unsupported` for one it never reads.
+            Encoding::DELTA_BINARY_PACKED => {
+                L::DeltaBinaryPacked::new(data, position).map(ValueDecoder::DeltaBinaryPacked)
+            }
+            Encoding::DELTA_LENGTH_BYTE_ARRAY => {
+                L::DeltaLengthByteArray::new(data, position).map(ValueDecoder::DeltaLengthByteArray)
+            }
+            Encoding::RLE => L::Rle::new(data, position).map(ValueDecoder::Rle),
+            _ => None,
+        };
+        decoder.ok_or(Error::UnsupportedEncoding(header.encoding))
     }
 
     /// Advances to the next buffered data page and prepares it for reading.
@@ -376,16 +368,9 @@ where
     }
 }
 
-impl<DC, DS, B, P> LeafDecoder for TypedLeafDecoder<DC, DS, B, P>
-where
-    DC: DictFromBytes<Builder = B, Item = B::Element>,
-    DS: DictFromVecBytes<Builder = B, Item = B::Element, EqConstant = DC::EqConstant>,
-    B: ArrayBuilder,
-    P: DecodePlain<Builder = B>,
-    B::Element: PartialEq,
-{
+impl<L: LeafType> LeafDecoder for TypedLeafDecoder<L> {
     fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>) {
-        self.eq_const = DC::eq_constant_from_scalar(value);
+        self.eq_const = L::ContiguousDict::eq_constant_from_scalar(value);
     }
 
     fn fast_filter_record_batch(&self, batch: RecordBatch, column: usize) -> RecordBatch {
@@ -451,11 +436,12 @@ where
     ) -> BuiltDictionary {
         let size = header.num_values as usize;
         if let Some(needle) = self.eq_const.as_ref()
-            && !DC::maybe_contains(&data, size, needle)
+            && !L::ContiguousDict::maybe_contains(&data, size, needle)
         {
             return BuiltDictionary::Pruned;
         }
-        let storage: DictStorage<DC, DS> = DictStorage::build(data, size, allocator);
+        let storage: DictStorage<L::ContiguousDict, L::ScatteredDict> =
+            DictStorage::build(data, size, allocator);
         BuiltDictionary::Built(Arc::new(storage))
     }
 
@@ -463,7 +449,7 @@ where
     /// dictionary downcasts to this one's storage.
     fn adopt_dictionary(&mut self, dictionary: SharedDictionary) {
         let dictionary = dictionary
-            .downcast::<DictStorage<DC, DS>>()
+            .downcast::<DictStorage<L::ContiguousDict, L::ScatteredDict>>()
             .unwrap_or_else(|_| panic!("a shared dictionary is adopted by its own decoder type"));
         self.dict = Some(dictionary);
     }
@@ -475,7 +461,7 @@ where
     }
 
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {
-        let mut builder = B::with_capacity(allocator, size);
+        let mut builder = L::Builder::with_capacity(allocator, size);
         match self.dict.as_deref() {
             Some(DictStorage::Contiguous(d)) => d.register_onto(&mut builder),
             Some(DictStorage::Scattered(d)) => d.register_onto(&mut builder),
@@ -523,7 +509,12 @@ where
                     Some(DictStorage::Scattered(d)) => {
                         read_page.read_into_nullable(Some(d), &mut builder, v, remaining)
                     }
-                    None => read_page.read_into_nullable(None::<&DC>, &mut builder, v, remaining),
+                    None => read_page.read_into_nullable(
+                        None::<&L::ContiguousDict>,
+                        &mut builder,
+                        v,
+                        remaining,
+                    ),
                 }
             } else {
                 let before = builder.len();
@@ -534,7 +525,9 @@ where
                     Some(DictStorage::Scattered(d)) => {
                         read_page.read_into(Some(d), &mut builder, remaining)
                     }
-                    None => read_page.read_into(None::<&DC>, &mut builder, remaining),
+                    None => {
+                        read_page.read_into(None::<&L::ContiguousDict>, &mut builder, remaining)
+                    }
                 }
                 if let Some(v) = &mut validity {
                     v.append_n(builder.len() - before, true);
@@ -683,6 +676,35 @@ mod tests {
         dec.insert_page(data_page(encode_i32s(&[1, 2]), 2, 1));
 
         assert_eq!(dec.available(), 2);
+    }
+
+    /// An integer leaf names no decoder for RLE, so a page in that encoding
+    /// is reported as unsupported rather than decoded as something else.
+    #[test]
+    fn a_page_in_an_encoding_the_leaf_does_not_read_is_unsupported() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = Dec::new(0);
+        let header = PageHeader::for_data_page(3, Encoding::RLE);
+        dec.insert_page(DecompressedPage {
+            worker_id: 0,
+            query_row_group_metadata: dummy_metadata(RowSelection::All),
+            column_idx: 0,
+            idx: 0,
+            first_row: 0,
+            data: DecompressedPageType::Data(DataPage {
+                header: header.data_page_header.unwrap(),
+                data: vec![Bytes::from(encode_i32s(&[1, 2, 3]))],
+                filter_mask: None,
+            }),
+        });
+
+        let read = dec.read(&mut allocator, 3);
+
+        assert!(matches!(
+            read,
+            Err(Error::UnsupportedEncoding(Encoding::RLE))
+        ));
     }
 
     /// RLE-dict page without a dictionary → 0 available.

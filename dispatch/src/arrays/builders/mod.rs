@@ -1,15 +1,18 @@
 //! Builders that accumulate values on slab memory and finish into an Arrow
 //! array with zero copies. [`ArrayBuilder`] is the interface the parquet page
 //! decoders and the GROUP BY output write through; [`PrimitiveBuilder`] builds
-//! fixed-width primitive arrays and [`ViewBuilder`] byte-view arrays, and
-//! [`ValidityBuilder`] the null bitmap that goes with either.
+//! fixed-width primitive arrays, [`BooleanBuilder`] boolean arrays and
+//! [`ViewBuilder`] byte-view arrays, and [`ValidityBuilder`] the null bitmap
+//! that goes with any of them.
 
+mod boolean_builder;
 mod primitive_builder;
 mod validity_builder;
 mod view_builder;
 
 use arrow_array::ArrayRef;
 use arrow_buffer::Buffer;
+pub use boolean_builder::BooleanBuilder;
 pub use primitive_builder::PrimitiveBuilder;
 pub use validity_builder::ValidityBuilder;
 pub use view_builder::ViewBuilder;

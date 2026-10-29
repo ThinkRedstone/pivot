@@ -19,14 +19,17 @@ use arrow_array::types::{
     Int32Type, Int64Type, TimestampMicrosecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_array::{
-    Array, ArrayRef, ArrowPrimitiveType, BinaryViewArray, Date32Array, PrimitiveArray, RecordBatch,
-    StringArray, StringViewArray, TimestampMicrosecondArray,
+    Array, ArrayRef, ArrowPrimitiveType, BinaryViewArray, BooleanArray, Date32Array,
+    PrimitiveArray, RecordBatch, StringArray, StringViewArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use dispatch::{Dispatch, Projection, values_input};
 
 use super::{AssembledFile, encode_record_batches_spec};
+use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::Encoding;
+use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 const ROWS: usize = 5_000;
@@ -53,8 +56,10 @@ enum Shape {
     Nullable,
 }
 
-/// How to build one type's column, and the encoding its distinct values take.
+/// How to build one type's column, and the encodings its repeated and its
+/// distinct values take.
 struct TypeSpec {
+    repeated_encoding: &'static str,
     distinct_encoding: &'static str,
     build: Box<dyn Fn(Shape) -> ArrayRef>,
 }
@@ -73,7 +78,7 @@ impl TypeSpec {
             name: format!("{type_name}_{shape_name}"),
             values: (self.build)(shape),
             encoding: match shape {
-                Shape::Repeated => DICTIONARY,
+                Shape::Repeated => self.repeated_encoding,
                 Shape::Distinct | Shape::Nullable => self.distinct_encoding,
             },
         }
@@ -105,6 +110,7 @@ fn primitive<T: ArrowPrimitiveType>(
     stamp: impl Fn(PrimitiveArray<T>) -> ArrayRef + 'static,
 ) -> TypeSpec {
     TypeSpec {
+        repeated_encoding: DICTIONARY,
         distinct_encoding,
         build: Box::new(move |shape| {
             let array: PrimitiveArray<T> = (0..ROWS)
@@ -124,6 +130,7 @@ fn primitive<T: ArrowPrimitiveType>(
 fn bytes(build: impl Fn(Vec<Option<String>>) -> ArrayRef + 'static) -> TypeSpec {
     let value = |row: usize| format!("{row}-{}", "value".repeat(row % 17));
     TypeSpec {
+        repeated_encoding: DICTIONARY,
         distinct_encoding: PACKED_LENGTHS,
         build: Box::new(move |shape| {
             let rows = (0..ROWS)
@@ -141,6 +148,25 @@ fn bytes(build: impl Fn(Vec<Option<String>>) -> ArrayRef + 'static) -> TypeSpec 
 /// The stamp for a type that needs none: the array is already what it is.
 fn as_is<T: ArrowPrimitiveType>(array: PrimitiveArray<T>) -> ArrayRef {
     Arc::new(array) as ArrayRef
+}
+
+/// A boolean column, which has neither a dictionary form (the format reserves
+/// it for the other types) nor a delta form: it stays PLAIN, one bit per value,
+/// whatever its values do. Two values is all the type has, so the shapes differ
+/// only in how long the runs of each are.
+fn boolean() -> TypeSpec {
+    TypeSpec {
+        repeated_encoding: PLAIN,
+        distinct_encoding: PLAIN,
+        build: Box::new(|shape| {
+            let value = |row: usize| row.is_multiple_of(3);
+            Arc::new(BooleanArray::from_iter((0..ROWS).map(|row| match shape {
+                Shape::Repeated => Some(value(repeated_index(row))),
+                Shape::Distinct => Some(value(row)),
+                Shape::Nullable => (!is_null(row)).then(|| value(row)),
+            }))) as ArrayRef
+        }),
+    }
 }
 
 /// Write `cases` as the columns of one file, through the pipeline a catalog
@@ -329,6 +355,38 @@ fn date_leaf_carries_its_annotation() {
     assert_reads_back_as(values, &DataType::Date32);
 }
 
+/// Another engine may store a boolean column as runs rather than bits (the
+/// format's RLE encoding), which pivot's writer never produces, so the file
+/// comes from arrow-rs's writer told to encode the column that way.
+#[test]
+fn booleans_stored_as_runs_by_another_engine_read_back() {
+    let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
+    let values = BooleanArray::from_iter(
+        (0..ROWS).map(|row| (row % 11 != 1).then_some(row % 100 < 60 || row % 2 == 0)),
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Boolean,
+            true,
+        )])),
+        vec![Arc::new(values.clone()) as ArrayRef],
+    )
+    .unwrap();
+    let properties = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_encoding(Encoding::RLE)
+        .build();
+    let mut writer = ArrowWriter::try_new(Vec::new(), batch.schema(), Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    let bytes = writer.into_inner().unwrap();
+    assert_eq!(encodings(bytes.clone(), 0), vec!["RLE".to_string()]);
+
+    let read = read_with_pivot(&dispatch, bytes, 1);
+
+    assert_eq!(read.column(0).as_ref(), &values);
+}
+
 /// Every type the writer accepts, one test per type and shape. A type added to
 /// the writer belongs here: this table is the only list of them, so a new line
 /// adds its three tests and its columns to the mixed-file test below.
@@ -393,6 +451,7 @@ macro_rules! type_tests {
 }
 
 type_tests! {
+    boolean => boolean();
     // The narrow signed widths store their bits in an INT32, and read back as
     // themselves only if the file kept the column's width. Their deltas fit
     // that width, so distinct values pack like any other whole number.

@@ -20,8 +20,8 @@ use arrow_buffer::ArrowNativeType;
 
 use super::{BuiltDictionary, SharedDictionary};
 use crate::reading::decoding::leaf_decoders::{
-    DecodePlain, DeltaDecoder, Dict, DictFromBytes, DictFromVecBytes, FromDelta, LeafDecoder,
-    Result, TypedLeafDecoder,
+    DecodePlain, DeltaPacking, Dict, DictFromBytes, DictFromVecBytes, LeafDecoder, LeafType,
+    Result, TypedLeafDecoder, Unsupported,
 };
 use crate::thrift::headers::DictionaryPageHeader;
 use crate::types::page::DecompressedPage;
@@ -247,7 +247,7 @@ pub use dispatch::arrays::PrimitiveBuilder;
 /// slow-path strategy.
 pub struct PrimitivePlainDecoder<T: ArrowPrimitiveType>
 where
-    T::Native: ReadLeBytes + FromDelta,
+    T::Native: ReadLeBytes,
 {
     data: Vec<Bytes>,
     position: ReaderPosition,
@@ -256,10 +256,9 @@ where
 
 impl<T: ArrowPrimitiveType> DecodePlain for PrimitivePlainDecoder<T>
 where
-    T::Native: ReadLeBytes + FromDelta,
+    T::Native: ReadLeBytes,
 {
     type Builder = PrimitiveBuilder<T>;
-    type Delta = DeltaDecoder<T>;
 
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
         Self {
@@ -390,14 +389,28 @@ where
     }
 }
 
+/// The [`LeafType`] of a fixed-width primitive column of arrow type `T`: its
+/// pages are PLAIN, dictionary indices, or, for the integers, delta packed.
+pub struct PrimitiveLeaf<T>(PhantomData<T>);
+
+impl<T: ArrowPrimitiveType> LeafType for PrimitiveLeaf<T>
+where
+    T::Native: ReadLeBytes + DeltaPacking,
+{
+    type Builder = PrimitiveBuilder<T>;
+
+    type Plain = PrimitivePlainDecoder<T>;
+    type DeltaBinaryPacked = <T::Native as DeltaPacking>::Decoder<T>;
+    type DeltaLengthByteArray = Unsupported<PrimitiveBuilder<T>>;
+    type Rle = Unsupported<PrimitiveBuilder<T>>;
+
+    type ContiguousDict = PrimitiveDict<T, SlabBuffer<T::Native>>;
+    type ScatteredDict = PrimitiveDict<T, MultiSlabBuffer<T::Native>>;
+}
+
 /// Ready-to-use column decoder for any [`ArrowPrimitiveType`] whose native
 /// type implements [`ReadLeBytes`].
-pub type PrimitiveLeafDecoder<T> = TypedLeafDecoder<
-    PrimitiveDict<T, SlabBuffer<<T as ArrowPrimitiveType>::Native>>,
-    PrimitiveDict<T, MultiSlabBuffer<<T as ArrowPrimitiveType>::Native>>,
-    PrimitiveBuilder<T>,
-    PrimitivePlainDecoder<T>,
->;
+pub type PrimitiveLeafDecoder<T> = TypedLeafDecoder<PrimitiveLeaf<T>>;
 
 /// Decodes a Parquet `INT64` timestamp and attaches its Arrow timezone
 /// metadata without touching the decoded microsecond values.

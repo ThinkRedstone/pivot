@@ -70,6 +70,11 @@ pub(super) fn try_encode(
     allocator: &mut SlabAllocator,
 ) -> WriteResult<Option<(EncodedPage, EncodedPage)>> {
     let values = &leaf.values;
+    // The format reserves dictionary encoding for the other types: a boolean
+    // leaf is bits already, and a reader expects it PLAIN or RLE.
+    if values.data_type() == &DataType::Boolean {
+        return Ok(None);
+    }
     // A temporal leaf packs through the integer it is stored as. Arrow packs an
     // integer directly but reaches that same integer from a temporal type by
     // two further casts and a rebuild, and the dictionary page holds the same
