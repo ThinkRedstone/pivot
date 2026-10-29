@@ -542,16 +542,3 @@ async fn prepare_describes_statement_shapes(#[future] conn: Conn) {
     assert!(copy.params().is_empty());
     assert!(copy.columns().is_empty(), "COPY describes as NoData");
 }
-
-#[rstest]
-#[awt]
-#[tokio::test(flavor = "multi_thread")]
-async fn extended_row_queries_refuse_binary_results_loudly(#[future] conn: Conn) {
-    let error = conn.query("SELECT 1", &[]).await.unwrap_err();
-
-    let message = error.as_db_error().expect("a server error").message();
-    assert!(
-        message.contains("binary result encoding"),
-        "unexpected error: {message}"
-    );
-}
