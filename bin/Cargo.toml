@@ -48,6 +48,8 @@ unicode-width = { workspace = true }
 # Only pulled in by the `perf` feature, for SIGINT-ing the `perf record` child
 # so it flushes its report (a plain `Child::kill` would SIGKILL and lose it).
 libc = { workspace = true, optional = true }
+chrono = "0.4.45"
+pg_interval_2 = "0.5.2"
 
 [target.'cfg(unix)'.dependencies]
 # Reads and raises the process's open-file limit at startup (see `server::limits`),
@@ -68,7 +70,7 @@ perf = ["dep:libc", "dispatch/perf"]
 unbounded-park = ["dispatch/unbounded-park"]
 
 [dev-dependencies]
-tokio-postgres = { workspace = true }
+tokio-postgres = { workspace = true, features = ["with-chrono-0_4"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 parquet = { workspace = true }

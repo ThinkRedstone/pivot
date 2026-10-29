@@ -15,11 +15,13 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use common::{Conn, conn, connect_client, server_port, table_dir};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use pg_interval_2::Interval;
 use rstest::rstest;
 use tempfile::TempDir;
 use tokio_postgres::{Client, SimpleQueryMessage};
@@ -1912,4 +1914,95 @@ async fn statements_between_begin_and_rollback_stay_committed(#[future] conn: Co
 
     let count = single_value(&conn, "SELECT COUNT(*) FROM transaction_noop").await;
     assert_eq!(count, "1");
+}
+
+/// `query_one` binds binary result columns, so each value arrives in its
+/// type's binary encoding and decodes into the matching Rust type.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn query_one_decodes_binary_scalars(#[future] conn: Conn) {
+    let row = conn
+        .query_one(
+            "SELECT 1::INTEGER AS i, 2::BIGINT AS b, 3::SMALLINT AS s, 4::TINYINT AS t, \
+             true AS flag, 1.5::DOUBLE AS f, 'hi' AS name",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, i32>("i"), 1);
+    assert_eq!(row.get::<_, i64>("b"), 2);
+    assert_eq!(row.get::<_, i16>("s"), 3);
+    assert_eq!(row.get::<_, i16>("t"), 4);
+    assert!(row.get::<_, bool>("flag"));
+    assert_eq!(row.get::<_, f64>("f"), 1.5);
+    assert_eq!(row.get::<_, String>("name"), "hi");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn query_one_decodes_binary_dates_and_timestamps(#[future] conn: Conn) {
+    let row = conn
+        .query_one(
+            "SELECT DATE '1999-12-31' AS d, TIMESTAMP '2020-01-01 00:00:00.5' AS ts, \
+             TIMESTAMPTZ '2020-01-01 02:00:00+02' AS tz",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let date = NaiveDate::from_ymd_opt(1999, 12, 31).unwrap();
+    let timestamp = NaiveDate::from_ymd_opt(2020, 1, 1)
+        .unwrap()
+        .and_hms_milli_opt(0, 0, 0, 500)
+        .unwrap();
+    let zoned = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+    assert_eq!(row.get::<_, NaiveDate>("d"), date);
+    assert_eq!(row.get::<_, NaiveDateTime>("ts"), timestamp);
+    assert_eq!(row.get::<_, DateTime<Utc>>("tz"), zoned);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn query_one_decodes_binary_intervals(#[future] conn: Conn) {
+    let row = conn
+        .query_one("SELECT INTERVAL '1 month 2 days 3.5 seconds' AS span", &[])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        row.get::<_, Interval>("span"),
+        Interval::new(1, 2, 3_500_000)
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn query_decodes_binary_nulls(#[future] conn: Conn) {
+    let row = conn
+        .query_one("SELECT CAST(NULL AS INTEGER) AS v", &[])
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, Option<i32>>("v"), None);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn query_returns_no_rows_for_an_empty_binary_result(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE binary_empty (id BIGINT)")
+        .await
+        .unwrap();
+
+    let rows = conn
+        .query("SELECT id FROM binary_empty", &[])
+        .await
+        .unwrap();
+
+    assert!(rows.is_empty());
 }
