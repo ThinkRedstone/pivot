@@ -63,7 +63,6 @@ core_affinity = "0.8.3"
 criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
 crossbeam-deque = "0.8.6"
 crossbeam-queue = "0.3"
-flate2 = "1"
 insta = "1"
 libc = "0.2.184"
 lru = "0.18.1"

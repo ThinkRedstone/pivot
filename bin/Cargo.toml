@@ -31,6 +31,9 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "macros"
 serde = { workspace = true }
 serde_yaml_ng = { workspace = true }
 pgwire = { workspace = true }
+# The INTERVAL value handed to pgwire; must resolve to the same version pgwire
+# depends on, since that is the one its binary encoding is implemented for.
+pg_interval_2 = "0.5"
 # Generates per-process secrets for mock authentication of unknown users.
 rand = { workspace = true }
 # Derives the stand-in verifier answered for an unknown user (see `server::auth`).
@@ -48,8 +51,6 @@ unicode-width = { workspace = true }
 # Only pulled in by the `perf` feature, for SIGINT-ing the `perf record` child
 # so it flushes its report (a plain `Child::kill` would SIGKILL and lose it).
 libc = { workspace = true, optional = true }
-chrono = "0.4.45"
-pg_interval_2 = "0.5.2"
 
 [target.'cfg(unix)'.dependencies]
 # Reads and raises the process's open-file limit at startup (see `server::limits`),
@@ -93,3 +94,4 @@ object-storage = { workspace = true, features = ["test-support"] }
 testcontainers = { version = "0.24", features = ["blocking"] }
 ureq = { workspace = true, features = ["json"] }
 url = { workspace = true }
+chrono = "0.4"
