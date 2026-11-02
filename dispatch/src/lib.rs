@@ -36,10 +36,11 @@
 //! let results = table_input(&dispatcher, &table, Projection::columns([13]), false)
 //!     .filter(|| {
 //!         let mut contains = Contains::new("google");
-//!         move |batch: &arrow_array::RecordBatch| {
+//!         move |batch: &arrow_array::RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
 //!             let col = batch.column(0).as_any()
 //!                 .downcast_ref::<StringViewArray>().unwrap();
-//!             contains.run(col)
+//!             collect_selected_indices(&contains.run(col), &mut scratch.positions);
+//!             Ok(RowSelection::Indices)
 //!         }
 //!     })
 //!     .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0, DataType::Int64)])
@@ -635,7 +636,7 @@ mod tests {
             }
             sender.close();
         });
-        let mut results = spec.map_each(|item| item * 2).collect().unwrap();
+        let mut results = spec.map_each(|item| Ok(item * 2)).collect().unwrap();
         producer.join().unwrap();
 
         results.sort();

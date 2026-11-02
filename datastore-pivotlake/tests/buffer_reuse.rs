@@ -32,11 +32,10 @@ fn dropped_batch_memory_is_reused() {
                     .unwrap()
                     .push(batch.column(0).to_data().buffers()[0].as_ptr() as usize);
                 let len = batch.num_rows();
-                RecordBatch::try_new(
+                Ok(RecordBatch::try_new(
                     Arc::new(Schema::new(vec![Field::new("d", DataType::Int64, false)])),
                     vec![Arc::new(Int64Array::from(vec![0i64; len]))],
-                )
-                .unwrap()
+                )?)
             }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(
@@ -107,11 +106,10 @@ fn decompressed_string_buffer_is_reused() {
                     .unwrap()
                     .push(sv.data_buffers()[0].as_ptr() as usize);
                 let len = batch.num_rows();
-                RecordBatch::try_new(
+                Ok(RecordBatch::try_new(
                     Arc::new(Schema::new(vec![Field::new("d", DataType::Int64, false)])),
                     vec![Arc::new(Int64Array::from(vec![0i64; len]))],
-                )
-                .unwrap()
+                )?)
             }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(

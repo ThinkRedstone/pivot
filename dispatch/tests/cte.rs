@@ -89,7 +89,7 @@ fn a_site_waits_out_a_lull_in_the_definition() {
     let definition = values_input(&d, batches).record_batches().project(|| {
         move |batch: RecordBatch| {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            batch
+            Ok(batch)
         }
     });
 
@@ -120,7 +120,7 @@ fn a_limit_over_one_site_spares_the_cte_its_other_readers_need() {
     let definition = values_input(&d, batches).record_batches().project(|| {
         move |batch: RecordBatch| {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            batch
+            Ok(batch)
         }
     });
 
@@ -131,7 +131,7 @@ fn a_limit_over_one_site_spares_the_cte_its_other_readers_need() {
             let seen = seen.clone();
             move |batch: RecordBatch| {
                 seen.fetch_add(batch.num_rows(), Ordering::Relaxed);
-                batch
+                Ok(batch)
             }
         }
     });

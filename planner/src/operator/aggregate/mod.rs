@@ -167,7 +167,7 @@ impl Aggregate {
             return input;
         }
         input.project(|| {
-            |batch: RecordBatch| reinterpret_columns(batch, |_, dt| temporal_to_int(dt))
+            |batch: RecordBatch| Ok(reinterpret_columns(batch, |_, dt| temporal_to_int(dt))?)
         })
     }
 
@@ -194,7 +194,9 @@ impl Aggregate {
         op.project(move || {
             let targets = targets.clone();
             move |batch: RecordBatch| {
-                reinterpret_columns(batch, |i, _| targets.get(i).and_then(Option::clone))
+                Ok(reinterpret_columns(batch, |i, _| {
+                    targets.get(i).and_then(Option::clone)
+                })?)
             }
         })
     }

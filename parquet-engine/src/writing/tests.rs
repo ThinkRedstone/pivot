@@ -150,7 +150,7 @@ fn write_grouped<T: IntoBatch>(
         rows_per_group,
         usize::MAX,
     )
-    .map_each(|file: AssembledFile| file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
+    .map_each(|file: AssembledFile| Ok(file.bytes.runs().flatten().copied().collect::<Vec<u8>>()))
     .execute()
     .collect()
     .unwrap();
@@ -773,7 +773,7 @@ fn compaction_merges_presorted_source_runs_into_one_sorted_file() {
         3,
         usize::MAX,
     )
-    .map_each(|file: AssembledFile| file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
+    .map_each(|file: AssembledFile| Ok(file.bytes.runs().flatten().copied().collect::<Vec<u8>>()))
     .execute()
     .collect()
     .unwrap();
@@ -821,7 +821,7 @@ fn a_stream_past_the_file_target_cuts_several_sorted_files() {
         500,
         8 * 1024,
     )
-    .map_each(|file: AssembledFile| file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
+    .map_each(|file: AssembledFile| Ok(file.bytes.runs().flatten().copied().collect::<Vec<u8>>()))
     .execute()
     .collect()
     .unwrap();

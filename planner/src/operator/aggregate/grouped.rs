@@ -337,7 +337,7 @@ fn reexpand_coalesced(
     input.project(move || {
         let cols = cols.clone();
         move |batch: RecordBatch| {
-            let out = batch.project(&cols).unwrap();
+            let out = batch.project(&cols)?;
             let fields: Vec<Field> = out
                 .schema()
                 .fields()
@@ -351,7 +351,10 @@ fn reexpand_coalesced(
                     }
                 })
                 .collect();
-            RecordBatch::try_new(Arc::new(Schema::new(fields)), out.columns().to_vec()).unwrap()
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(fields)),
+                out.columns().to_vec(),
+            )?)
         }
     })
 }
@@ -456,7 +459,7 @@ fn project_leading_columns(
                 // A constant column (e.g. `GROUP BY 1`) is broadcast to the batch
                 // length so it can sit beside the per-row columns.
                 let arr = eval(&batch).into_array(batch.num_rows());
-                let casted = arrow::compute::cast(&arr, &targets[i]).unwrap();
+                let casted = arrow::compute::cast(&arr, &targets[i])?;
                 fields.push(Field::new(format!("k{i}"), targets[i].clone(), true));
                 columns.push(casted);
             }
@@ -464,7 +467,10 @@ fn project_leading_columns(
                 fields.push(field.as_ref().clone());
                 columns.push(col.clone());
             }
-            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(fields)),
+                columns,
+            )?)
         }
     }))
 }
@@ -673,8 +679,10 @@ fn swap_leading_key_columns(op: RecordBatchOperatorSpec) -> RecordBatchOperatorS
             fields.swap(0, 1);
             let mut columns = batch.columns().to_vec();
             columns.swap(0, 1);
-            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-                .expect("swapping two columns keeps the batch valid")
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(fields)),
+                columns,
+            )?)
         }
     })
 }

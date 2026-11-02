@@ -234,7 +234,7 @@ fn stamp_output_names(spec: RecordBatchOperatorSpec, names: &[String]) -> Record
             // Fewer columns than DuckDB reported names (e.g. EXPLAIN emits one
             // column where DuckDB resolves two): leave the batch untouched.
             if fields.len() < names.len() {
-                return batch;
+                return Ok(batch);
             }
             // Already correctly named (a plain `SELECT a, b` or `SELECT *`):
             // skip the rebuild and pass the batch through zero-copy.
@@ -243,7 +243,7 @@ fn stamp_output_names(spec: RecordBatchOperatorSpec, names: &[String]) -> Record
                 .zip(fields.iter())
                 .all(|(name, field)| field.name() == name)
             {
-                return batch;
+                return Ok(batch);
             }
             // `with_name` preserves each field's data type, nullability, and
             // metadata (e.g. an extension-type annotation); only the leading
@@ -264,7 +264,7 @@ fn stamp_output_names(spec: RecordBatchOperatorSpec, names: &[String]) -> Record
             // We own `batch`, so move its column arrays out (there is at least
             // one, since `fields.len() >= names.len() >= 1`) instead of cloning.
             let (_, columns, _) = batch.into_parts();
-            RecordBatch::try_new(new_schema, columns).unwrap()
+            Ok(RecordBatch::try_new(new_schema, columns)?)
         }
     })
 }

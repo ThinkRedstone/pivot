@@ -10,7 +10,7 @@ use super::{Error, Result, ResultColumn};
 
 pub(super) enum StatementHandle<T> {
     Batches(DataFlowHandle<T>),
-    Insert(DataFlowHandle<std::result::Result<usize, String>>),
+    Insert(DataFlowHandle<usize>),
 }
 
 impl<T> StatementHandle<T> {
@@ -37,7 +37,7 @@ impl<T> StatementHandle<T> {
 
 pub(super) enum StatementResults<T> {
     Batches(Vec<T>),
-    Insert(Vec<std::result::Result<usize, String>>),
+    Insert(Vec<usize>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,39 +79,46 @@ pub(super) fn result_columns(plan: &planner::Plan) -> Result<Vec<ResultColumn>> 
         .collect())
 }
 
-pub(super) fn affected_rows(outputs: Vec<std::result::Result<usize, String>>) -> Result<usize> {
+pub(super) fn affected_rows(outputs: Vec<usize>) -> Result<usize> {
     if outputs.len() != 1 {
         return Err(Error::InvalidInsertResult(format!(
             "expected one affected-row output, got {}",
             outputs.len()
         )));
     }
-    outputs
+    Ok(outputs
         .into_iter()
         .next()
-        .expect("output length checked above")
-        .map_err(Error::InvalidInsertResult)
+        .expect("output length checked above"))
 }
 
-pub(super) fn affected_rows_from_record_batch(
-    batch: RecordBatch,
-) -> std::result::Result<usize, String> {
+/// The affected-row count an INSERT's sink emits as its one-row, one-column
+/// output batch. A batch of another shape fails the dataflow.
+pub(super) fn affected_rows_from_record_batch(batch: RecordBatch) -> dispatch::UnaryResult<usize> {
     if batch.num_rows() != 1 || batch.num_columns() != 1 {
-        return Err(format!(
-            "expected one row and one column, got {} rows and {} columns",
-            batch.num_rows(),
-            batch.num_columns()
+        return Err(dispatch::UnaryError::Operator(
+            format!(
+                "expected one row and one column, got {} rows and {} columns",
+                batch.num_rows(),
+                batch.num_columns()
+            )
+            .into(),
         ));
     }
     let counts = batch
         .column(0)
         .as_any()
         .downcast_ref::<Int64Array>()
-        .ok_or_else(|| format!("expected Int64, got {}", batch.column(0).data_type()))?;
+        .ok_or_else(|| {
+            dispatch::UnaryError::Operator(
+                format!("expected Int64, got {}", batch.column(0).data_type()).into(),
+            )
+        })?;
     if counts.is_null(0) {
-        return Err("count is null".to_string());
+        return Err(dispatch::UnaryError::Operator("count is null".into()));
     }
-    usize::try_from(counts.value(0)).map_err(|_| "count is negative or too large".to_string())
+    usize::try_from(counts.value(0))
+        .map_err(|_| dispatch::UnaryError::Operator("count is negative or too large".into()))
 }
 
 pub(super) async fn collect_handle<T>(

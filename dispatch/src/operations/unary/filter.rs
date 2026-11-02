@@ -94,7 +94,11 @@ pub struct FilterFactory<F>(pub F, pub RowDelivery);
 
 impl<F> UnaryFactory<RecordBatch, RecordBatch> for FilterFactory<F>
 where
-    F: FnMut(&RecordBatch, &mut SlabAllocator, &mut SelectionScratch) -> RowSelection
+    F: FnMut(
+            &RecordBatch,
+            &mut SlabAllocator,
+            &mut SelectionScratch,
+        ) -> unary::Result<RowSelection>
         + Send
         + 'static,
 {
@@ -113,7 +117,12 @@ where
 
 pub struct Filter<F>
 where
-    F: FnMut(&RecordBatch, &mut SlabAllocator, &mut SelectionScratch) -> RowSelection + Send,
+    F: FnMut(
+            &RecordBatch,
+            &mut SlabAllocator,
+            &mut SelectionScratch,
+        ) -> unary::Result<RowSelection>
+        + Send,
 {
     func: F,
     /// Whether surviving rows wait for a full batch or go downstream at once.
@@ -130,7 +139,12 @@ where
 
 impl<F> Filter<F>
 where
-    F: FnMut(&RecordBatch, &mut SlabAllocator, &mut SelectionScratch) -> RowSelection + Send,
+    F: FnMut(
+            &RecordBatch,
+            &mut SlabAllocator,
+            &mut SelectionScratch,
+        ) -> unary::Result<RowSelection>
+        + Send,
 {
     /// Apply the positions sitting in the scratch to `batch`: send whole
     /// surviving batches directly, gather partial ones out of the batch when
@@ -267,7 +281,12 @@ where
 
 impl<F> Unary<RecordBatch, RecordBatch> for Filter<F>
 where
-    F: FnMut(&RecordBatch, &mut SlabAllocator, &mut SelectionScratch) -> RowSelection + Send,
+    F: FnMut(
+            &RecordBatch,
+            &mut SlabAllocator,
+            &mut SelectionScratch,
+        ) -> unary::Result<RowSelection>
+        + Send,
 {
     fn consume(
         &mut self,
@@ -276,7 +295,7 @@ where
         _io: &mut crate::io::OperatorIO,
     ) -> unary::Result<()> {
         self.scratch.positions.clear();
-        let selection = (self.func)(&batch, &mut self.allocator, &mut self.scratch);
+        let selection = (self.func)(&batch, &mut self.allocator, &mut self.scratch)?;
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -312,7 +331,11 @@ mod tests {
 
     fn filter_operator<F>(func: F) -> Filter<F>
     where
-        F: FnMut(&RecordBatch, &mut SlabAllocator, &mut SelectionScratch) -> RowSelection
+        F: FnMut(
+                &RecordBatch,
+                &mut SlabAllocator,
+                &mut SelectionScratch,
+            ) -> unary::Result<RowSelection>
             + Send
             + 'static,
     {
@@ -323,10 +346,10 @@ mod tests {
         _: &RecordBatch,
         _: &mut SlabAllocator,
         scratch: &mut SelectionScratch,
-    ) -> RowSelection {
+    ) -> unary::Result<RowSelection> {
         scratch.positions.clear();
         scratch.positions.push(0);
-        RowSelection::Indices
+        Ok(RowSelection::Indices)
     }
 
     /// Write the mask keeping the rows `keep` names of `rows` into the scratch.
@@ -334,13 +357,13 @@ mod tests {
         scratch: &mut SelectionScratch,
         rows: usize,
         keep: impl Fn(usize) -> bool,
-    ) -> RowSelection {
+    ) -> unary::Result<RowSelection> {
         scratch.mask_words.clear();
         scratch.mask_words.resize(rows.div_ceil(64), 0);
         for row in (0..rows).filter(|&row| keep(row)) {
             scratch.mask_words[row / 64] |= 1 << (row % 64);
         }
-        RowSelection::Mask
+        Ok(RowSelection::Mask)
     }
 
     fn batch(values: &[i32]) -> RecordBatch {
@@ -376,7 +399,7 @@ mod tests {
                 scratch
                     .positions
                     .extend((0..b.num_rows() as u32).filter(|i| i % 1000 != 0));
-                RowSelection::Indices
+                Ok(RowSelection::Indices)
             },
         );
 
@@ -395,7 +418,7 @@ mod tests {
                 let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
                 let mask = BooleanArray::from_iter(col.values().iter().map(|v| Some(*v > 3)));
                 collect_selected_indices(&mask, &mut scratch.positions);
-                RowSelection::Indices
+                Ok(RowSelection::Indices)
             },
         );
 
@@ -457,7 +480,7 @@ mod tests {
         let filter = filter_operator(
             |_: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
                 scratch.positions.clear();
-                RowSelection::Indices
+                Ok(RowSelection::Indices)
             },
         );
 
@@ -470,7 +493,9 @@ mod tests {
     fn all_match() {
         init_test_free_pool(4);
         let filter = filter_operator(
-            |_: &RecordBatch, _: &mut SlabAllocator, _: &mut SelectionScratch| RowSelection::All,
+            |_: &RecordBatch, _: &mut SlabAllocator, _: &mut SelectionScratch| {
+                Ok(RowSelection::All)
+            },
         );
 
         let out = run_unary_to_completion(filter, vec![batch(&[10, 20, 30])]);
@@ -518,7 +543,7 @@ mod tests {
             |_: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
                 scratch.positions.clear();
                 scratch.positions.push(0);
-                RowSelection::Indices
+                Ok(RowSelection::Indices)
             },
         );
 
@@ -538,7 +563,7 @@ mod tests {
                 let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
                 let mask = BooleanArray::from_iter(col.values().iter().map(|v| Some(*v % 2 == 0)));
                 collect_selected_indices(&mask, &mut scratch.positions);
-                RowSelection::Indices
+                Ok(RowSelection::Indices)
             },
         );
 
@@ -666,7 +691,9 @@ mod tests {
     fn empty_batch() {
         init_test_free_pool(4);
         let filter = filter_operator(
-            |_: &RecordBatch, _: &mut SlabAllocator, _: &mut SelectionScratch| RowSelection::All,
+            |_: &RecordBatch, _: &mut SlabAllocator, _: &mut SelectionScratch| {
+                Ok(RowSelection::All)
+            },
         );
 
         let out = run_unary_to_completion(filter, vec![batch(&[])]);

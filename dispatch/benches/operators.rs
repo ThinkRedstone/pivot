@@ -301,7 +301,11 @@ fn batch(schema: &Arc<Schema>, cols: Vec<ArrayRef>) -> RecordBatch {
 // ---------------------------------------------------------------------------
 
 /// Keeps the rows where `column != 0` over an `i16` column.
-fn keep_i16_nonzero(batch: &RecordBatch, col: usize, indices: &mut Vec<u32>) -> RowSelection {
+fn keep_i16_nonzero(
+    batch: &RecordBatch,
+    col: usize,
+    indices: &mut Vec<u32>,
+) -> dispatch::UnaryResult<RowSelection> {
     let a = batch
         .column(col)
         .as_any()
@@ -309,7 +313,7 @@ fn keep_i16_nonzero(batch: &RecordBatch, col: usize, indices: &mut Vec<u32>) -> 
         .unwrap();
     let mask: BooleanArray = (0..a.len()).map(|i| Some(a.value(i) != 0)).collect();
     collect_selected_indices(&mask, indices);
-    RowSelection::Indices
+    Ok(RowSelection::Indices)
 }
 
 /// `column == target` over an `i64` column (point lookup).
@@ -318,7 +322,7 @@ fn keep_i64_eq(
     col: usize,
     target: i64,
     indices: &mut Vec<u32>,
-) -> RowSelection {
+) -> dispatch::UnaryResult<RowSelection> {
     let a = batch
         .column(col)
         .as_any()
@@ -326,11 +330,15 @@ fn keep_i64_eq(
         .unwrap();
     let mask: BooleanArray = (0..a.len()).map(|i| Some(a.value(i) == target)).collect();
     collect_selected_indices(&mask, indices);
-    RowSelection::Indices
+    Ok(RowSelection::Indices)
 }
 
 /// `column <> ''` over a string column.
-fn keep_nonempty(batch: &RecordBatch, col: usize, indices: &mut Vec<u32>) -> RowSelection {
+fn keep_nonempty(
+    batch: &RecordBatch,
+    col: usize,
+    indices: &mut Vec<u32>,
+) -> dispatch::UnaryResult<RowSelection> {
     let a = batch
         .column(col)
         .as_any()
@@ -339,7 +347,7 @@ fn keep_nonempty(batch: &RecordBatch, col: usize, indices: &mut Vec<u32>) -> Row
     // Length lives in the low 32 bits of each view, no UTF-8 decode needed.
     let mask: BooleanArray = a.views().iter().map(|&v| Some((v as u32) != 0)).collect();
     collect_selected_indices(&mask, indices);
-    RowSelection::Indices
+    Ok(RowSelection::Indices)
 }
 
 // ---------------------------------------------------------------------------
@@ -616,7 +624,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                     let a = b.column(0).as_any().downcast_ref::<Int16Array>().unwrap();
                     let mask: BooleanArray = (0..a.len()).map(|i| Some(a.value(i) == 62)).collect();
                     collect_selected_indices(&mask, &mut scratch.positions);
-                    RowSelection::Indices
+                    Ok(RowSelection::Indices)
                 }
             })
             .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(
@@ -920,7 +928,7 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
                         .unwrap();
                     let mask = contains.run(col);
                     collect_selected_indices(&mask, &mut scratch.positions);
-                    RowSelection::Indices
+                    Ok(RowSelection::Indices)
                 }
             })
             .aggregate::<i64>(vec![AggregationSlot::new(

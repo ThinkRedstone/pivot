@@ -10,7 +10,7 @@
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Decimal64Type, Decimal128Type};
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Schema};
 use std::sync::Arc;
 
 /// Rebuild `batch`, replacing each column `i` whose `target(i, current_type)`
@@ -20,7 +20,7 @@ use std::sync::Arc;
 pub(crate) fn reinterpret_columns(
     batch: RecordBatch,
     target: impl Fn(usize, &DataType) -> Option<DataType>,
-) -> RecordBatch {
+) -> Result<RecordBatch, ArrowError> {
     let schema = batch.schema();
     let mut fields = Vec::with_capacity(batch.num_columns());
     let mut columns = Vec::with_capacity(batch.num_columns());
@@ -38,7 +38,7 @@ pub(crate) fn reinterpret_columns(
             }
         }
     }
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("reinterpret schema")
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
 }
 
 /// Reinterpret one column to `dt` without changing its stored values. A

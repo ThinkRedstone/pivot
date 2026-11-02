@@ -130,7 +130,7 @@ impl Input {
                 move |batch: &arrow_array::RecordBatch,
                       _slab: &mut dispatch::memory::SlabAllocator,
                       scratch: &mut dispatch::SelectionScratch| {
-                    match slot.get() {
+                    Ok(match slot.get() {
                         None => dispatch::RowSelection::All,
                         Some(bitset) => {
                             scratch.positions.clear();
@@ -141,7 +141,7 @@ impl Input {
                                 dispatch::RowSelection::Indices
                             }
                         }
-                    }
+                    })
                 }
             });
         }

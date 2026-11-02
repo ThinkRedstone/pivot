@@ -62,7 +62,7 @@ fn filter_string_contains() {
                         .unwrap(),
                 );
                 dispatch::collect_selected_indices(&mask, &mut scratch.positions);
-                dispatch::RowSelection::Indices
+                Ok(dispatch::RowSelection::Indices)
             }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(
@@ -96,7 +96,7 @@ fn filter_no_matches_returns_zero() {
                         .unwrap(),
                 );
                 dispatch::collect_selected_indices(&mask, &mut scratch.positions);
-                dispatch::RowSelection::Indices
+                Ok(dispatch::RowSelection::Indices)
             }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(
@@ -130,7 +130,7 @@ fn filter_integer_column() {
                     col.value(i) > 20
                 }));
                 dispatch::collect_selected_indices(&mask, &mut scratch.positions);
-                dispatch::RowSelection::Indices
+                Ok(dispatch::RowSelection::Indices)
             }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(
@@ -153,7 +153,7 @@ fn project_selects_single_column() {
         .record_batches()
         .project(|| {
             let idx = vec![1];
-            move |batch: RecordBatch| batch.project(&idx).unwrap()
+            move |batch: RecordBatch| Ok(batch.project(&idx)?)
         })
         .collect()
         .unwrap();
@@ -239,7 +239,7 @@ fn ordered_batches_stay_ordered_through_projection_and_copy_out() {
     let results = values_input(&dispatch, batches)
         .record_batches()
         .order_by(vec![OrderBy::new(1, false, false)])
-        .project(|| |batch| batch)
+        .project(|| Ok)
         .collect()
         .unwrap();
 
@@ -397,7 +397,7 @@ fn limit_abandons_upstream_after_reaching_count() {
                   _: &mut dispatch::memory::SlabAllocator,
                   _: &mut dispatch::SelectionScratch| {
                 counter.fetch_add(1, Ordering::Relaxed);
-                dispatch::RowSelection::All
+                Ok(dispatch::RowSelection::All)
             }
         })
         .limit(1, 0)

@@ -4,7 +4,7 @@ use crate::compile::{Error, ExprEvalFn, ExprFn};
 use crate::expression::Expression;
 use crate::types::Type;
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{Field, Schema};
+use arrow_schema::{ArrowError, Field, Schema};
 use dispatch::RecordBatchOperatorSpec;
 use parquet_variant_compute::VariantArray;
 use std::fmt;
@@ -56,12 +56,12 @@ impl Projection {
                     // any such trailing pair through untouched.
                     let meta = dispatch::trailing_metadata_columns(batch.schema_ref());
                     if meta == 0 {
-                        batch.project(&idxs).unwrap()
+                        Ok(batch.project(&idxs)?)
                     } else {
                         let n = batch.num_columns();
                         let mut cols: Vec<usize> = idxs.as_ref().clone();
                         cols.extend((n - meta)..n);
-                        batch.project(&cols).unwrap()
+                        Ok(batch.project(&cols)?)
                     }
                 }
             }));
@@ -109,16 +109,14 @@ impl Projection {
                     .enumerate()
                     .map(|(i, c)| {
                         let name = format!("col{i}");
-                        match variant_outputs[i] {
+                        Ok(match variant_outputs[i] {
                             // `VariantArray::field` is the constructor that
                             // re-applies the extension tag.
-                            true => VariantArray::try_new(c.as_ref())
-                                .expect("a projection typed VARIANT yields a variant array")
-                                .field(name),
+                            true => VariantArray::try_new(c.as_ref())?.field(name),
                             false => Field::new(name, c.data_type().clone(), true),
-                        }
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_, ArrowError>>()?;
                 // As in the fast path above: carry a late-materialized narrow
                 // scan's trailing row-group metadata columns through untouched,
                 // so the downstream materializer still finds them.
@@ -127,7 +125,10 @@ impl Projection {
                     fields.push(batch.schema().field(column).clone());
                     columns.push(batch.column(column).clone());
                 }
-                RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+                Ok(RecordBatch::try_new(
+                    Arc::new(Schema::new(fields)),
+                    columns,
+                )?)
             }
         }))
     }

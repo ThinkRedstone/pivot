@@ -277,7 +277,7 @@ fn run_sort(d: &DataFlowDispatcher, batches: &[RecordBatch], order_by: &[OrderBy
     let spec = values_input(d, batches.to_vec()).record_batches();
     let batch_rows = spec
         .order_by(order_by.to_vec())
-        .map(|| |batch: RecordBatch| batch.num_rows())
+        .map(|| |batch: RecordBatch| Ok(batch.num_rows()))
         .collect()
         .unwrap();
     let input_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();

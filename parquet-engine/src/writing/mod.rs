@@ -192,7 +192,7 @@ pub fn unshred_batches_spec(spec: RecordBatchOperatorSpec) -> RecordBatchOperato
         let mut allocator: Option<SlabAllocator> = None;
         move |batch| {
             let allocator = allocator.get_or_insert_with(|| SlabAllocator::new(false));
-            shredding::unshred_batch(batch, allocator).expect("a variant column reassembles")
+            Ok(shredding::unshred_batch(batch, allocator)?)
         }
     })
 }

@@ -14,11 +14,11 @@
 //! let results = table_input(dispatch.dispatcher(), &table, Projection::columns([0]), false)
 //!     .filter(|| {
 //!         let mut contains = Contains::new("google");
-//!         move |batch: RecordBatch| {
+//!         move |batch: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
 //!             let col = batch.column(0).as_any()
 //!                 .downcast_ref::<StringViewArray>().unwrap();
-//!             let mask = contains.run(col);
-//!             filter_record_batch(&batch, &mask).unwrap()
+//!             collect_selected_indices(&contains.run(col), &mut scratch.positions);
+//!             Ok(RowSelection::Indices)
 //!         }
 //!     })
 //!     .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0, DataType::Int64)])

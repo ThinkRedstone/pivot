@@ -192,7 +192,7 @@ fn write_cases(dispatch: &Dispatch, cases: &[Case]) -> Vec<u8> {
     let mut files: Vec<Vec<u8>> =
         encode_record_batches_spec(spec, schema, Arc::from([]), Arc::from([]), ROWS, usize::MAX)
             .map_each(|file: AssembledFile| {
-                file.bytes.runs().flatten().copied().collect::<Vec<u8>>()
+                Ok(file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
             })
             .execute()
             .collect()

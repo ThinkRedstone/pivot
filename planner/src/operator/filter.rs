@@ -7,7 +7,9 @@ use arrow_array::{Array, ArrayRef, BooleanArray, NullArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dispatch::arrays::take;
 use dispatch::memory::SlabAllocator;
-use dispatch::{RecordBatchOperatorSpec, RowDelivery, RowSelection, SelectionScratch};
+use dispatch::{
+    RecordBatchOperatorSpec, RowDelivery, RowSelection, SelectionScratch, UnaryError, UnaryResult,
+};
 use std::fmt;
 use std::sync::Arc;
 
@@ -133,13 +135,14 @@ impl RowSelector {
     /// The rows of `batch` passing every condition: every row, the rows of
     /// the mask built in the scratch's words, or, once a shrink compacted the
     /// batch so the mask is of the compacted rows, their ascending positions
-    /// in the input batch written into the scratch's positions.
+    /// in the input batch written into the scratch's positions. A condition
+    /// that evaluates to something other than a BOOLEAN column is an error.
     fn select(
         &mut self,
         batch: &RecordBatch,
         allocator: &mut SlabAllocator,
         scratch: &mut SelectionScratch,
-    ) -> RowSelection {
+    ) -> UnaryResult<RowSelection> {
         let mut current = batch.clone();
         let mut has_input_row_map = false;
         let mut selected_count = 0;
@@ -152,11 +155,19 @@ impl RowSelector {
         {
             let result = eval(&current);
             let (arr, _) = result.as_datum().get();
-            let mask = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+            let mask = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                UnaryError::Operator(
+                    format!(
+                        "a WHERE condition evaluated to {}, not BOOLEAN",
+                        arr.data_type()
+                    )
+                    .into(),
+                )
+            })?;
             selected_count = condition_mask.intersect(mask, current.num_rows());
             if selected_count == 0 {
                 scratch.positions.clear();
-                return RowSelection::Indices;
+                return Ok(RowSelection::Indices);
             }
             // Shrink or carry the mask? Arrow kernels cannot skip
             // rows, so rows that already failed a condition ("dead",
@@ -223,7 +234,7 @@ impl RowSelector {
         // through untouched. Only known without a shrink, whose count is of
         // the compacted rows.
         if !has_input_row_map && selected_count == batch.num_rows() {
-            return RowSelection::All;
+            return Ok(RowSelection::All);
         }
         // Report the selected rows as positions in the input batch.
         if has_input_row_map {
@@ -234,9 +245,9 @@ impl RowSelector {
                     .iter()
                     .map(|&pos| self.input_row_map[pos as usize]),
             );
-            return RowSelection::Indices;
+            return Ok(RowSelection::Indices);
         }
-        RowSelection::Mask
+        Ok(RowSelection::Mask)
     }
 }
 
@@ -459,11 +470,13 @@ mod tests {
         );
         let mut scratch = SelectionScratch::default();
 
-        let selection = selector.select(
-            &batch_of_a(&[1, 2, 3]),
-            &mut SlabAllocator::new(false),
-            &mut scratch,
-        );
+        let selection = selector
+            .select(
+                &batch_of_a(&[1, 2, 3]),
+                &mut SlabAllocator::new(false),
+                &mut scratch,
+            )
+            .unwrap();
 
         assert!(matches!(selection, RowSelection::All));
         assert!(scratch.positions.is_empty());
@@ -478,11 +491,13 @@ mod tests {
         );
         let mut scratch = SelectionScratch::default();
 
-        let selection = selector.select(
-            &batch_of_a(&[1, 0, 3]),
-            &mut SlabAllocator::new(false),
-            &mut scratch,
-        );
+        let selection = selector
+            .select(
+                &batch_of_a(&[1, 0, 3]),
+                &mut SlabAllocator::new(false),
+                &mut scratch,
+            )
+            .unwrap();
 
         assert!(matches!(selection, RowSelection::Mask));
         let mask = BooleanBuffer::new(Buffer::from_slice_ref(&scratch.mask_words), 0, 3);
@@ -516,7 +531,9 @@ mod tests {
         .unwrap();
         let mut scratch = SelectionScratch::default();
 
-        let selection = selector.select(&batch, &mut SlabAllocator::new(false), &mut scratch);
+        let selection = selector
+            .select(&batch, &mut SlabAllocator::new(false), &mut scratch)
+            .unwrap();
 
         assert!(matches!(selection, RowSelection::Indices));
         assert_eq!(scratch.positions, vec![9]);

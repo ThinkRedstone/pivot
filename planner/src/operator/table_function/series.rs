@@ -199,18 +199,15 @@ impl BoundTable for BoundSeries {
             let projected_schema = projected_schema.clone();
             let column_indices = column_indices.clone();
             move |batch| {
-                if column_indices.is_empty() {
+                Ok(if column_indices.is_empty() {
                     RecordBatch::try_new_with_options(
                         projected_schema.clone(),
                         Vec::new(),
                         &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-                    )
-                    .expect("empty series projection preserves its row count")
+                    )?
                 } else {
-                    batch
-                        .project(&column_indices)
-                        .expect("series projections contain only column 0")
-                }
+                    batch.project(&column_indices)?
+                })
             }
         }))
     }

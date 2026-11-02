@@ -34,12 +34,12 @@ fn filter_then_project() {
                         .unwrap(),
                 );
                 dispatch::collect_selected_indices(&mask, &mut scratch.positions);
-                dispatch::RowSelection::Indices
+                Ok(dispatch::RowSelection::Indices)
             }
         })
         .project(|| {
             let idx = vec![1];
-            move |batch: RecordBatch| batch.project(&idx).unwrap()
+            move |batch: RecordBatch| Ok(batch.project(&idx)?)
         })
         .collect()
         .unwrap();
@@ -72,7 +72,7 @@ fn filter_then_count() {
                         .unwrap(),
                 );
                 dispatch::collect_selected_indices(&mask, &mut scratch.positions);
-                dispatch::RowSelection::Indices
+                Ok(dispatch::RowSelection::Indices)
             }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(
@@ -119,7 +119,7 @@ fn filter_then_group_by_then_order_by() {
                     col.value(i) != "other.com"
                 }));
                 dispatch::collect_selected_indices(&mask, &mut scratch.positions);
-                dispatch::RowSelection::Indices
+                Ok(dispatch::RowSelection::Indices)
             }
         })
         .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,), u8>>(

@@ -26,7 +26,7 @@ pub struct CopyIngest {
     cancel: CancelToken,
     /// Taken by [`finish`](Self::finish); still present on drop marks an
     /// unfinished ingest, which the drop aborts.
-    handle: Option<DataFlowHandle<std::result::Result<usize, String>>>,
+    handle: Option<DataFlowHandle<usize>>,
     /// The transaction the statement was planned in, which its bound table
     /// stages into. Taken and committed by [`finish`](Self::finish); rolled
     /// back on drop otherwise.

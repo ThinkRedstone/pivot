@@ -20,7 +20,7 @@ fn map_each_transforms_every_item() {
     let dispatch = dispatch(worker_count());
 
     let mut doubled = values_input(&dispatch, 0..1000i64)
-        .map_each(|x| x * 2)
+        .map_each(|x| Ok(x * 2))
         .collect()
         .unwrap();
     doubled.sort_unstable();
@@ -33,7 +33,7 @@ fn empty_input_produces_no_output() {
     let dispatch = dispatch(worker_count());
 
     let out: Vec<i64> = values_input(&dispatch, Vec::<i64>::new())
-        .map_each(|x| x)
+        .map_each(Ok)
         .collect()
         .unwrap();
 

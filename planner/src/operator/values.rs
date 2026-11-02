@@ -68,17 +68,19 @@ impl Values {
                             .map(|row| row[column]()(&single_row).into_array(1))
                             .collect();
                         let values: Vec<&dyn Array> = values.iter().map(AsRef::as_ref).collect();
-                        arrow::compute::concat(&values).expect("one column's rows share a type")
+                        arrow::compute::concat(&values)
                     })
-                    .collect();
+                    .collect::<Result<_, _>>()?;
                 // Column names carry no meaning here: the insert matches VALUES
                 // columns to the table positionally, so leave them empty.
                 let fields = columns
                     .iter()
                     .map(|column| Field::new("", column.data_type().clone(), true))
                     .collect::<Vec<_>>();
-                RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-                    .expect("VALUES expressions in one row have equal length")
+                Ok(RecordBatch::try_new(
+                    Arc::new(Schema::new(fields)),
+                    columns,
+                )?)
             })
             .record_batches())
     }

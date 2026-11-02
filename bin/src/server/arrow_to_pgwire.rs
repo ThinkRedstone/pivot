@@ -63,8 +63,8 @@ impl From<RecordBatch> for PGRowBatch {
 }
 
 impl dispatch::OutputBatch for PGRowBatch {
-    fn from_record_batch(batch: RecordBatch) -> Self {
-        batch.into()
+    fn from_record_batch(batch: RecordBatch) -> dispatch::UnaryResult<Self> {
+        Ok(batch.into())
     }
 }
 

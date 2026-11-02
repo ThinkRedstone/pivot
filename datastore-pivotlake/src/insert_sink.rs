@@ -82,8 +82,10 @@ pub(super) fn build_insert_spec(
                 // declared here is the plain pair. Reassemble the documents, so
                 // the rows are shredded for the file they land in rather than
                 // carrying the source table's layout across.
-                RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
-                    .expect("INSERT binding matches the target table schema")
+                Ok(RecordBatch::try_new(
+                    schema.clone(),
+                    batch.columns().to_vec(),
+                )?)
             }
         }
     });

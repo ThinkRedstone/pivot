@@ -15,11 +15,11 @@
 //! let results = table_input(&dispatcher, &table, Projection::columns([0]), false)
 //!     .filter(|| {
 //!         let mut contains = Contains::new("google");
-//!         move |batch: RecordBatch| {
+//!         move |batch: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
 //!             let col = batch.column(0).as_any()
 //!                 .downcast_ref::<StringViewArray>().unwrap();
-//!             let mask = contains.run(col);
-//!             filter_record_batch(&batch, &mask).unwrap()
+//!             collect_selected_indices(&contains.run(col), &mut scratch.positions);
+//!             Ok(RowSelection::Indices)
 //!         }
 //!     })
 //!     .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0, DataType::Int64)])
@@ -30,6 +30,12 @@
 //! [`.project()`](RecordBatchOperatorSpec::project) take a **builder closure**
 //! (`Fn() -> F`) that is called once per worker thread, so each worker gets its own
 //! independent operator instance with private mutable state — no synchronization needed.
+//! The inner closure of [`.filter()`](RecordBatchOperatorSpec::filter),
+//! [`.map()`](RecordBatchOperatorSpec::map) and
+//! [`.project()`](RecordBatchOperatorSpec::project) returns a
+//! [`UnaryResult`](crate::UnaryResult): an `Err` fails the dataflow with that
+//! error, so a batch the closure cannot accept is refused rather than
+//! panicked over.
 //!
 //! Nothing executes until [`.collect()`](RecordBatchOperatorSpec::collect) is called.
 //! At that point the spec is shipped to worker threads, built into operator chains,
@@ -93,10 +99,11 @@ pub const RECORD_BATCH_SIZE: usize = 8192;
 /// let results = table_input(&dispatcher, &table, Projection::columns([0]), false)
 ///     .filter(|| {
 ///         let mut contains = Contains::new("google");
-///         move |batch: &RecordBatch| {
+///         move |batch: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
 ///             let col = batch.column(0).as_any()
 ///                 .downcast_ref::<StringViewArray>().unwrap();
-///             contains.run(col)
+///             collect_selected_indices(&contains.run(col), &mut scratch.positions);
+///             Ok(RowSelection::Indices)
 ///         }
 ///     })
 ///     .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0, DataType::Int64)])
@@ -125,10 +132,11 @@ pub const RECORD_BATCH_SIZE: usize = 8192;
 ///     let mut contains = Contains::new("google");
 ///
 ///     // Called once per RecordBatch on this worker.
-///     move |batch: &RecordBatch| {
+///     move |batch: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
 ///         let col = batch.column(0).as_any()
 ///             .downcast_ref::<StringViewArray>().unwrap();
-///         contains.run(col)
+///         collect_selected_indices(&contains.run(col), &mut scratch.positions);
+///         Ok(RowSelection::Indices)
 ///     }
 /// })
 /// # ;
@@ -146,14 +154,14 @@ pub struct RecordBatchOperatorSpec {
 ///
 /// The conversion runs on the worker that produced the input. Implementations
 /// must not retain ring-backed Arrow buffers; copy or encode everything kept in
-/// the returned value.
+/// the returned value. A conversion that fails fails the dataflow.
 pub trait OutputBatch: Sized + Send + 'static {
-    fn from_record_batch(batch: RecordBatch) -> Self;
+    fn from_record_batch(batch: RecordBatch) -> crate::UnaryResult<Self>;
 }
 
 impl OutputBatch for RecordBatch {
-    fn from_record_batch(batch: RecordBatch) -> Self {
-        copy_out(batch).expect("copying a valid RecordBatch should succeed")
+    fn from_record_batch(batch: RecordBatch) -> crate::UnaryResult<Self> {
+        copy_out(batch)
     }
 }
 
@@ -366,10 +374,12 @@ impl RecordBatchOperatorSpec {
     ///
     /// Takes an **outer builder closure** (`FB`) that is called once per worker thread
     /// during setup. The builder returns an **inner closure** (`F`) that is called once
-    /// per `RecordBatch` during execution, returning the batch of surviving rows. The
-    /// inner closure also receives the operator'"'"'s [`SlabAllocator`](crate::memory::SlabAllocator)
-    /// so survivors can be compacted into slab-backed buffers via
-    /// [`take`](crate::arrays::take).
+    /// per `RecordBatch` during execution, returning which of its rows survive as a
+    /// [`RowSelection`](crate::RowSelection) over the positions or mask it wrote into
+    /// the [`SelectionScratch`](crate::SelectionScratch), or the error that fails the
+    /// dataflow. The inner closure also receives the operator's
+    /// [`SlabAllocator`](crate::memory::SlabAllocator) so survivors can be compacted
+    /// into slab-backed buffers via [`take`](crate::arrays::take).
     ///
     /// This two-level pattern lets each worker own private mutable state (allocated in
     /// the builder):
@@ -388,11 +398,11 @@ impl RecordBatchOperatorSpec {
     ///     let mut contains = Contains::new("google");
     ///
     ///     // Called once per RecordBatch on this worker.
-    ///     move |batch: RecordBatch| {
+    ///     move |batch: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
     ///         let col = batch.column(0).as_any()
     ///             .downcast_ref::<StringViewArray>().unwrap();
-    ///         let mask = contains.run(col);
-    ///         filter_record_batch(&batch, &mask).unwrap()
+    ///         collect_selected_indices(&contains.run(col), &mut scratch.positions);
+    ///         Ok(RowSelection::Indices)
     ///     }
     /// })
     /// # ;
@@ -403,7 +413,7 @@ impl RecordBatchOperatorSpec {
                 &RecordBatch,
                 &mut crate::memory::SlabAllocator,
                 &mut crate::SelectionScratch,
-            ) -> crate::RowSelection
+            ) -> crate::UnaryResult<crate::RowSelection>
             + Send
             + 'static,
         FB: Fn() -> F,
@@ -424,7 +434,7 @@ impl RecordBatchOperatorSpec {
                 &RecordBatch,
                 &mut crate::memory::SlabAllocator,
                 &mut crate::SelectionScratch,
-            ) -> crate::RowSelection
+            ) -> crate::UnaryResult<crate::RowSelection>
             + Send
             + 'static,
         FB: Fn() -> F,
@@ -435,10 +445,10 @@ impl RecordBatchOperatorSpec {
 
     /// Apply a per-batch 1→1 transform that can change the output type.
     ///
-    /// Replaces both the old `project` (RB → RB) and the old `for_each`
-    /// (RB → T) — one method, generic over the output type. The closure
-    /// takes an owned `RecordBatch` and returns a single `T`; every `send`
-    /// downstream is monomorphized over the resulting `OperatorSpec<T, _>`.
+    /// One method, generic over the output type. The closure takes an owned
+    /// `RecordBatch` and returns a single `T`, or the error that fails the
+    /// dataflow; every `send` downstream is monomorphized over the resulting
+    /// `OperatorSpec<T, _>`.
     ///
     /// Lifts out of `RecordBatchOperatorSpec` into the generic
     /// [`OperatorSpec<T, _>`]. To chain back into RB-only methods like
@@ -459,17 +469,17 @@ impl RecordBatchOperatorSpec {
     /// # let dispatch = Dispatch::spin_up(1, 32, None);
     /// # let dispatcher = dispatch.dispatcher();
     /// # let spec = table_input(&dispatcher, &table, Projection::columns([0]), false);
-    /// // RB → RB (the old `project`)
+    /// // RB → RB
     /// spec.map(|| {
     ///     let indices = vec![0];
-    ///     move |batch: RecordBatch| batch.project(&indices).unwrap()
+    ///     move |batch: RecordBatch| Ok(batch.project(&indices)?)
     /// })
     /// # ;
     /// ```
     pub fn map<T, F, FB>(self, builder: FB) -> MapOperatorSpec<T, F>
     where
         T: Send + 'static,
-        F: FnMut(RecordBatch) -> T + Send + 'static,
+        F: FnMut(RecordBatch) -> crate::UnaryResult<T> + Send + 'static,
         FB: Fn() -> F,
     {
         let worker_count = self.worker_count();
@@ -496,7 +506,7 @@ impl RecordBatchOperatorSpec {
     fn map_ordered<T, F, FB>(self, builder: FB) -> OrderedMapOperatorSpec<T, F>
     where
         T: Send + 'static,
-        F: FnMut(RecordBatch) -> T + Send + 'static,
+        F: FnMut(RecordBatch) -> crate::UnaryResult<T> + Send + 'static,
         FB: Fn() -> F,
     {
         let worker_count = self.worker_count();
@@ -520,14 +530,15 @@ impl RecordBatchOperatorSpec {
 
     /// Sugar for [`map`](Self::map) when the output is `RecordBatch`: applies
     /// the transform and stays in `RecordBatchOperatorSpec` so you can keep
-    /// chaining RB-only methods like `.aggregate()` / `.order_by_limit()`.
+    /// chaining RB-only methods like `.aggregate()` / `.order_by_limit()`. A
+    /// transform that returns an error fails the dataflow with it.
     ///
     /// Unordered streams use the same work-stealing delivery as [`map`](Self::map).
     /// After `ORDER BY`, the stage instead reads the batches through one FIFO
     /// consumer so their global row order is preserved.
     pub fn project<F, FB>(self, builder: FB) -> Self
     where
-        F: FnMut(RecordBatch) -> RecordBatch + Send + 'static,
+        F: FnMut(RecordBatch) -> crate::UnaryResult<RecordBatch> + Send + 'static,
         FB: Fn() -> F,
     {
         let worker_count = self.worker_count();
@@ -1319,10 +1330,11 @@ impl RecordBatchOperatorSpec {
     /// let batches: Vec<RecordBatch> = table_input(&dispatcher, &table, Projection::columns([0]), false)
     ///     .filter(|| {
     ///         let mut contains = Contains::new("google");
-    ///         move |batch: &RecordBatch| {
+    ///         move |batch: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
     ///             let col = batch.column(0).as_any()
     ///                 .downcast_ref::<StringViewArray>().unwrap();
-    ///             contains.run(col)
+    ///             collect_selected_indices(&contains.run(col), &mut scratch.positions);
+    ///             Ok(RowSelection::Indices)
     ///         }
     ///     })
     ///     .collect()

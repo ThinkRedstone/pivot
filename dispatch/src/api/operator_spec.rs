@@ -143,10 +143,11 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
     }
 
     /// Append a parallel 1→1 map stage: every item is transformed by `f` on
-    /// whatever worker handles it. The stage reads through a work-stealing
-    /// channel, so items rebalance across idle workers — the basis of a
-    /// perfectly parallel job pipeline (e.g. [`values_input`] → `map_each` to
-    /// encode one Parquet page per item).
+    /// whatever worker handles it, and an item `f` fails on fails the
+    /// dataflow. The stage reads through a work-stealing channel, so items
+    /// rebalance across idle workers — the basis of a perfectly parallel job
+    /// pipeline (e.g. [`values_input`] → `map_each` to encode one Parquet page
+    /// per item).
     ///
     /// A thin wrapper over [`chain`](Self::chain): a [`stealable`] channel and
     /// `f` cloned once per worker (so `f` must be `Clone` — capture only
@@ -158,7 +159,7 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
     ) -> OperatorSpec<O2, UnaryOperatorFactory<O, O2, MapFactory<F>, StealableChannelFactory<O>, OF>>
     where
         O2: Send + 'static,
-        F: FnMut(O) -> O2 + Clone + Send + 'static,
+        F: FnMut(O) -> crate::UnaryResult<O2> + Clone + Send + 'static,
     {
         let worker_count = self.factories.len();
         let channels: Vec<_> = stealable::<O>(self.dispatcher.topology())

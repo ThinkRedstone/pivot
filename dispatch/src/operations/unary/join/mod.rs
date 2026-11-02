@@ -891,7 +891,7 @@ mod tests {
             |b: &RecordBatch, _: &mut _, scratch: &mut SelectionScratch| {
                 scratch.positions.clear();
                 scratch.positions.extend(1..b.num_rows() as u32);
-                RowSelection::Indices
+                Ok(RowSelection::Indices)
             },
             RowDelivery::Coalesced,
         )

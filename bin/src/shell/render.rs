@@ -20,7 +20,7 @@ pub struct TextBatch {
 /// Turn a ring-backed Arrow batch into owned display cells while still on its
 /// dispatch worker.
 impl dispatch::OutputBatch for TextBatch {
-    fn from_record_batch(batch: RecordBatch) -> Self {
+    fn from_record_batch(batch: RecordBatch) -> dispatch::UnaryResult<Self> {
         let fallback_options = FormatOptions::default();
         let fallback_formatters = batch
             .columns()
@@ -43,7 +43,7 @@ impl dispatch::OutputBatch for TextBatch {
                     .collect()
             })
             .collect();
-        Self { rows }
+        Ok(Self { rows })
     }
 }
 
