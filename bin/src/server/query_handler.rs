@@ -4,9 +4,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::execution::{Command, ExecuteOptions, Execution, StatementOutput, is_truthy};
-use crate::server::arrow_to_pgwire::{
-    PGBinaryRowBatch, PGRowBatch, PGRowEncoding, PGTextRowBatch, build_field_info,
-};
+use crate::server::arrow_to_pgwire::{Binary, PGRowBatch, Text, WireEncoding, build_field_info};
 use crate::server::auth::Authenticator;
 use crate::server::copy_session;
 use arrow_schema::{Field, Schema};
@@ -62,13 +60,12 @@ fn fields_for_columns(
     build_field_info(&schema, format)
 }
 
-fn build_query_response<T: PGRowEncoding>(
+fn build_query_response<E: WireEncoding>(
     columns: Vec<crate::execution::ResultColumn>,
-    batches: Vec<T>,
+    batches: Vec<PGRowBatch<E>>,
 ) -> Response {
-    let batches: Vec<PGRowBatch> = batches.into_iter().map(Into::into).collect();
     let fields = batches.first().map_or_else(
-        || fields_for_columns(columns, T::FORMAT),
+        || fields_for_columns(columns, E::FORMAT),
         |batch| batch.fields.clone(),
     );
     Response::Query(QueryResponse::new(
@@ -104,12 +101,12 @@ impl PivotQueryHandler {
         Self { executor }
     }
 
-    async fn run_query<T: PGRowEncoding>(
+    async fn run_query<E: WireEncoding>(
         &self,
         query: &str,
         collect_stats: bool,
         with_perf: bool,
-    ) -> crate::execution::Result<Execution<T>> {
+    ) -> crate::execution::Result<Execution<PGRowBatch<E>>> {
         #[cfg(feature = "perf")]
         let mut perf_guard = if with_perf {
             let sql = query.to_string();
@@ -129,7 +126,7 @@ impl PivotQueryHandler {
 
         let result = self
             .executor
-            .execute_with_output::<T>(
+            .execute_with_output::<PGRowBatch<E>>(
                 query.to_string(),
                 ExecuteOptions {
                     collect_stats,
@@ -267,11 +264,11 @@ impl CopyHandler for PivotQueryHandler {
 
 impl PivotQueryHandler {
     /// Execute one statement and build its wire response, its rows encoded
-    /// as `T` dictates. Shared by the simple and extended protocols; a COPY
+    /// as `E` dictates. Shared by the simple and extended protocols; a COPY
     /// FROM STDIN switches the connection into copy-in mode on the way out.
-    async fn execute_statement<T, C>(&self, client: &mut C, query: &str) -> PgWireResult<Response>
+    async fn execute_statement<E, C>(&self, client: &mut C, query: &str) -> PgWireResult<Response>
     where
-        T: PGRowEncoding,
+        E: WireEncoding,
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
@@ -284,7 +281,7 @@ impl PivotQueryHandler {
 
         info!(sql = %query, "query received");
         let execution = self
-            .run_query::<T>(query, with_stats, with_perf)
+            .run_query::<E>(query, with_stats, with_perf)
             .await
             .map_err(|error| {
                 warn!(%error, sql = %query, "query failed");
@@ -337,8 +334,7 @@ impl SimpleQueryHandler for PivotQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         Ok(vec![
-            self.execute_statement::<PGTextRowBatch, _>(client, query)
-                .await?,
+            self.execute_statement::<Text, _>(client, query).await?,
         ])
     }
 }
@@ -347,20 +343,22 @@ impl SimpleQueryHandler for PivotQueryHandler {
 /// column to use. Rows are encoded in a single format, so a request mixing
 /// text and binary columns is refused.
 fn resolve_result_format(format: &Format) -> PgWireResult<FieldFormat> {
-    const TEXT: i16 = 0;
-    const BINARY: i16 = 1;
     match format {
         Format::UnifiedText => Ok(FieldFormat::Text),
         Format::UnifiedBinary => Ok(FieldFormat::Binary),
-        Format::Individual(codes) if codes.iter().all(|&code| code == TEXT) => {
-            Ok(FieldFormat::Text)
+        Format::Individual(codes) => {
+            let formats = codes.iter().map(|c| FieldFormat::from(*c));
+            if formats.clone().all(|f| f == FieldFormat::Text) {
+                Ok(FieldFormat::Text)
+            } else if formats.clone().all(|f| f == FieldFormat::Binary) {
+                Ok(FieldFormat::Binary)
+            } else {
+                Err(user_error(
+                    "result format codes mix text and binary columns, which is not supported"
+                        .into(),
+                ))
+            }
         }
-        Format::Individual(codes) if codes.iter().all(|&code| code == BINARY) => {
-            Ok(FieldFormat::Binary)
-        }
-        Format::Individual(codes) => Err(user_error(format!(
-            "result format codes {codes:?} mix text and binary columns, which is not supported"
-        ))),
     }
 }
 
@@ -453,14 +451,8 @@ impl ExtendedQueryHandler for PivotQueryHandler {
         let format = resolve_result_format(&portal.result_column_format)?;
         let query = &portal.statement.statement;
         match format {
-            FieldFormat::Text => {
-                self.execute_statement::<PGTextRowBatch, _>(client, query)
-                    .await
-            }
-            FieldFormat::Binary => {
-                self.execute_statement::<PGBinaryRowBatch, _>(client, query)
-                    .await
-            }
+            FieldFormat::Text => self.execute_statement::<Text, _>(client, query).await,
+            FieldFormat::Binary => self.execute_statement::<Binary, _>(client, query).await,
         }
     }
 }
