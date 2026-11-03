@@ -76,7 +76,6 @@ fn create_table(
     transaction
         .bind_create_table(request)?
         .compile(&dispatcher())?
-        .execute()
         .collect()
         .map(|_| ())
         .map_err(|e| planner::catalog::Error::Other(Box::new(e)))?;
@@ -265,7 +264,6 @@ fn create_table_is_durable_and_visible_only_after_commit() {
         .unwrap()
         .compile(&dispatcher())
         .unwrap()
-        .execute()
         .collect()
         .unwrap();
 
@@ -312,7 +310,6 @@ fn rolling_back_create_table_discards_the_staged_creation() {
         .unwrap()
         .compile(&dispatcher())
         .unwrap()
-        .execute()
         .collect()
         .unwrap();
 

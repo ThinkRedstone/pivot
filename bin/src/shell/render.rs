@@ -17,10 +17,10 @@ pub struct TextBatch {
     pub rows: Vec<Vec<Option<String>>>,
 }
 
-/// Turn a ring-backed Arrow batch into owned display cells while still on its
-/// dispatch worker.
-impl dispatch::OutputBatch for TextBatch {
-    fn from_record_batch(batch: RecordBatch) -> dispatch::UnaryResult<Self> {
+impl TextBatch {
+    /// Turn a ring-backed Arrow batch into owned display cells while still on
+    /// its dispatch worker.
+    pub fn from_record_batch(batch: &RecordBatch) -> dispatch::UnaryResult<Self> {
         let fallback_options = FormatOptions::default();
         let fallback_formatters = batch
             .columns()

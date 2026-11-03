@@ -98,7 +98,6 @@ fn create_events(
         .unwrap()
         .compile(d)
         .unwrap()
-        .execute()
         .collect()
         .unwrap();
     commit_datastore_transaction(transaction).unwrap();
@@ -144,7 +143,6 @@ fn drop_table(d: &DispatchGuard, datastore: &Arc<PivotlakeDatastore>, name: &str
         .unwrap()
         .compile(d)
         .unwrap()
-        .execute()
         .collect()
         .unwrap();
     commit_datastore_transaction(transaction).unwrap();
@@ -169,7 +167,6 @@ mod bodies {
             .unwrap()
             .compile(&d)
             .unwrap()
-            .execute()
             .collect()
             .unwrap();
         commit_datastore_transaction(transaction).unwrap();
@@ -196,7 +193,6 @@ mod bodies {
             .unwrap()
             .compile(&d)
             .unwrap()
-            .execute()
             .collect()
             .unwrap();
         commit_datastore_transaction(transaction).unwrap();

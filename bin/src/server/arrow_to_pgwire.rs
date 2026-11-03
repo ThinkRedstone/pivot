@@ -1,16 +1,15 @@
 //! Encode an Arrow [`RecordBatch`] into pgwire `FieldInfo` schemas and
 //! `DataRow` streams.
 //!
-//! Rows are encoded in either wire format, fixed by the batch type: a
-//! `PGRowBatch<Text>` carries pgwire's [`FieldFormat::Text`], what `psql` and
-//! the simple protocol use, and a `PGRowBatch<Binary>` carries
-//! [`FieldFormat::Binary`], what a client binding binary result columns over
-//! the extended protocol asks for. Each Arrow array kind has a dedicated
-//! `encode` arm that pushes its native Rust type into [`DataRowEncoder`];
-//! anything we can't represent precisely is shipped as `text` so at least
-//! the value arrives.
+//! Rows are encoded in either wire format: pgwire's [`FieldFormat::Text`], what
+//! `psql` and the simple protocol use, or [`FieldFormat::Binary`], what a
+//! client binding binary result columns over the extended protocol asks for.
+//! Each Arrow array kind has a dedicated `encode` arm that pushes its native
+//! Rust type into [`DataRowEncoder`]. In text, anything we can't represent
+//! precisely is shipped as a debug rendering so at least the value arrives; in
+//! binary, where a client would decode those bytes as the advertised type,
+//! such a column is refused.
 
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -25,6 +24,7 @@ use planner::types::render_interval;
 
 use pgwire::api::Type;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
+use pgwire::error::PgWireError;
 use pgwire::messages::data::DataRow;
 
 /// Build a pgwire row schema from an Arrow [`SchemaRef`]. Each Arrow column
@@ -46,50 +46,38 @@ pub fn build_field_info(schema: &SchemaRef, format: FieldFormat) -> Arc<Vec<Fiel
     Arc::new(fields)
 }
 
-/// The wire format a [`PGRowBatch`]'s cells are encoded in.
-pub trait WireEncoding: Send + 'static {
-    const FORMAT: FieldFormat;
-}
-
-pub struct Text;
-
-pub struct Binary;
-
-impl WireEncoding for Text {
-    const FORMAT: FieldFormat = FieldFormat::Text;
-}
-
-impl WireEncoding for Binary {
-    const FORMAT: FieldFormat = FieldFormat::Binary;
-}
-
-pub struct PGRowBatch<E: WireEncoding> {
+pub struct PGRowBatch {
     pub rows: Vec<DataRow>,
     pub fields: Arc<Vec<FieldInfo>>,
-    encoding: PhantomData<E>,
 }
 
-impl<E: WireEncoding> dispatch::OutputBatch for PGRowBatch<E> {
-    fn from_record_batch(batch: RecordBatch) -> dispatch::UnaryResult<Self> {
-        Ok(encode_batch(&batch))
-    }
+/// Why a cell could not be put on the wire.
+#[derive(Debug, thiserror::Error)]
+pub enum EncodeError {
+    #[error(transparent)]
+    Wire(#[from] PgWireError),
+    /// The stored value is outside the range the Rust date/time type it is
+    /// read through can hold, so it has no rendering.
+    #[error("{data_type} value {stored} is out of range")]
+    OutOfRange { data_type: DataType, stored: i64 },
+    /// The column is advertised as a type whose binary representation we
+    /// don't produce.
+    #[error("{data_type} columns have no binary result encoding")]
+    NoBinaryEncoding { data_type: DataType },
 }
 
-fn encode_batch<E: WireEncoding>(batch: &RecordBatch) -> PGRowBatch<E> {
-    let fields = build_field_info(&batch.schema(), E::FORMAT);
+/// Encode every row of `batch` in the wire `format`.
+pub fn encode_batch(batch: &RecordBatch, format: FieldFormat) -> Result<PGRowBatch, EncodeError> {
+    let fields = build_field_info(&batch.schema(), format);
     let mut encoder = DataRowEncoder::new(fields.clone());
     let mut rows = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
         for col in 0..batch.num_columns() {
-            encode_cell::<E>(&mut encoder, batch.column(col).as_ref(), row);
+            encode_cell(&mut encoder, batch.column(col).as_ref(), row, format)?;
         }
         rows.push(encoder.take_row());
     }
-    PGRowBatch {
-        rows,
-        fields,
-        encoding: PhantomData,
-    }
+    Ok(PGRowBatch { rows, fields })
 }
 
 /// Generates [`pg_type_for_arrow`] (schema: arrow type -> Postgres OID) and
@@ -114,7 +102,7 @@ fn encode_batch<E: WireEncoding>(batch: &RecordBatch) -> PGRowBatch<E> {
 ///   them in text, and handed to the encoder as chrono / [`Interval`] values
 ///   in binary.
 /// - The advertise-only `Binary`/`LargeUtf8`, which fall through to the
-///   best-effort text fallback in `encode_cell`.
+///   best-effort text fallback in `encode_cell`, and are refused in binary.
 macro_rules! arrow_pg_types {
     (
         direct: [ $( ($dt:ident, $array:ty, $pg:ident) ),+ $(,)? ],
@@ -150,13 +138,21 @@ macro_rules! arrow_pg_types {
         /// path writes the value's `ToSql` bytes without checking them against
         /// the advertised type, so every value handed to it must already be
         /// that type's binary representation.
-        fn encode_cell<E: WireEncoding>(encoder: &mut DataRowEncoder, arr: &dyn Array, row: usize) {
+        fn encode_cell(
+            encoder: &mut DataRowEncoder,
+            arr: &dyn Array,
+            row: usize,
+            format: FieldFormat,
+        ) -> Result<(), EncodeError> {
             if arr.is_null(row) {
                 // Type is irrelevant for null encoding: the encoder writes -1 length.
-                let _ = encoder.encode_field::<Option<&str>>(&None);
-                return;
+                return Ok(encoder.encode_field::<Option<&str>>(&None)?);
             }
-            let _ = match arr.data_type() {
+            let out_of_range = |stored: i64| EncodeError::OutOfRange {
+                data_type: arr.data_type().clone(),
+                stored,
+            };
+            Ok(match arr.data_type() {
                 $( DataType::$dt => encoder
                     .encode_field(&arr.as_any().downcast_ref::<$array>().unwrap().value(row)), )+
                 // Ints widen to a Postgres integer type the value fits.
@@ -171,7 +167,7 @@ macro_rules! arrow_pg_types {
                 // In binary they are built from the stored integer and scale.
                 DataType::Decimal64(_, scale) => {
                     let decimals = arr.as_any().downcast_ref::<Decimal64Array>().unwrap();
-                    match E::FORMAT {
+                    match format {
                         FieldFormat::Text => encoder.encode_field(&decimals.value_as_string(row)),
                         FieldFormat::Binary => encoder
                             .encode_field(&encode_numeric_binary(i128::from(decimals.value(row)), *scale)),
@@ -179,7 +175,7 @@ macro_rules! arrow_pg_types {
                 }
                 DataType::Decimal128(_, scale) => {
                     let decimals = arr.as_any().downcast_ref::<Decimal128Array>().unwrap();
-                    match E::FORMAT {
+                    match format {
                         FieldFormat::Text => encoder.encode_field(&decimals.value_as_string(row)),
                         FieldFormat::Binary => {
                             encoder.encode_field(&encode_numeric_binary(decimals.value(row), *scale))
@@ -194,17 +190,22 @@ macro_rules! arrow_pg_types {
                 // digits, so every whole second would arrive as `.000000`.
                 // In binary the chrono value is handed over as is.
                 DataType::Date32 => {
-                    let date = arr.as_any().downcast_ref::<Date32Array>().unwrap().value_as_date(row);
-                    match E::FORMAT {
-                        FieldFormat::Text => encoder.encode_field(&date.map(|d| d.to_string())),
+                    let dates = arr.as_any().downcast_ref::<Date32Array>().unwrap();
+                    let date = dates
+                        .value_as_date(row)
+                        .ok_or_else(|| out_of_range(i64::from(dates.value(row))))?;
+                    match format {
+                        FieldFormat::Text => encoder.encode_field(&date.to_string()),
                         FieldFormat::Binary => encoder.encode_field(&date),
                     }
                 }
                 DataType::Timestamp(_, None) => {
-                    let timestamp = arr.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap()
-                        .value_as_datetime(row);
-                    match E::FORMAT {
-                        FieldFormat::Text => encoder.encode_field(&timestamp.map(|t| trim_fraction(t.to_string()))),
+                    let timestamps = arr.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+                    let timestamp = timestamps
+                        .value_as_datetime(row)
+                        .ok_or_else(|| out_of_range(timestamps.value(row)))?;
+                    match format {
+                        FieldFormat::Text => encoder.encode_field(&trim_fraction(timestamp.to_string())),
                         FieldFormat::Binary => encoder.encode_field(&timestamp),
                     }
                 }
@@ -213,12 +214,14 @@ macro_rules! arrow_pg_types {
                 // prints: `2020-01-01 00:00:00+00`. `value_as_datetime` reads
                 // the stored count as the UTC instant it is.
                 DataType::Timestamp(_, Some(_)) => {
-                    let timestamp = arr.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap()
-                        .value_as_datetime(row);
-                    match E::FORMAT {
+                    let timestamps = arr.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+                    let timestamp = timestamps
+                        .value_as_datetime(row)
+                        .ok_or_else(|| out_of_range(timestamps.value(row)))?;
+                    match format {
                         FieldFormat::Text => encoder
-                            .encode_field(&timestamp.map(|t| format!("{}+00", trim_fraction(t.to_string())))),
-                        FieldFormat::Binary => encoder.encode_field(&timestamp.map(|t| t.and_utc())),
+                            .encode_field(&format!("{}+00", trim_fraction(timestamp.to_string()))),
+                        FieldFormat::Binary => encoder.encode_field(&timestamp.and_utc()),
                     }
                 }
                 // A time span renders as the text a Postgres server prints for
@@ -227,7 +230,7 @@ macro_rules! arrow_pg_types {
                 DataType::Interval(_) => {
                     let interval =
                         arr.as_any().downcast_ref::<IntervalMonthDayNanoArray>().unwrap().value(row);
-                    match E::FORMAT {
+                    match format {
                         FieldFormat::Text => encoder.encode_field(&render_interval(interval)),
                         FieldFormat::Binary => encoder.encode_field(&Interval::new(
                             interval.months,
@@ -236,9 +239,16 @@ macro_rules! arrow_pg_types {
                         )),
                     }
                 }
-                // Best-effort fallback: stringify and ship as text.
-                _ => encoder.encode_field(&format!("{:?}", arr.slice(row, 1))),
-            };
+                // Best-effort text fallback: a debug rendering at least shows
+                // the value. Binary has no such fallback, since a client
+                // would decode the rendering as the advertised type.
+                data_type => match format {
+                    FieldFormat::Text => encoder.encode_field(&format!("{:?}", arr.slice(row, 1))),
+                    FieldFormat::Binary => {
+                        return Err(EncodeError::NoBinaryEncoding { data_type: data_type.clone() });
+                    }
+                },
+            }?)
         }
     };
 }
@@ -352,7 +362,6 @@ mod tests {
     use super::*;
     use arrow_array::ArrayRef;
     use arrow_schema::{Field, Schema};
-    use dispatch::OutputBatch;
 
     fn schema(fields: Vec<(&str, DataType)>) -> SchemaRef {
         Arc::new(Schema::new(
@@ -389,7 +398,7 @@ mod tests {
     }
 
     fn rows(batch: &RecordBatch) -> Vec<Vec<Option<String>>> {
-        let pg = PGRowBatch::<Text>::from_record_batch(batch.clone()).unwrap();
+        let pg = encode_batch(batch, FieldFormat::Text).unwrap();
         pg.rows.iter().map(decode_text_row).collect()
     }
 
@@ -415,7 +424,7 @@ mod tests {
 
     /// The single column of each row of `batch`, binary-encoded.
     fn binary_cells(batch: &RecordBatch) -> Vec<Option<Vec<u8>>> {
-        let pg = PGRowBatch::<Binary>::from_record_batch(batch.clone()).unwrap();
+        let pg = encode_batch(batch, FieldFormat::Binary).unwrap();
         pg.rows
             .iter()
             .map(|row| decode_binary_row(row).remove(0))
@@ -769,11 +778,54 @@ mod tests {
     }
 
     #[test]
+    fn out_of_range_dates_are_refused() {
+        let col: ArrayRef = Arc::new(Date32Array::from(vec![i32::MAX]));
+        let b = batch(vec![("d", DataType::Date32)], vec![col]);
+
+        let text = encode_batch(&b, FieldFormat::Text);
+        let binary = encode_batch(&b, FieldFormat::Binary);
+
+        assert!(matches!(text, Err(EncodeError::OutOfRange { .. })));
+        assert!(matches!(binary, Err(EncodeError::OutOfRange { .. })));
+    }
+
+    #[test]
+    fn out_of_range_timestamps_are_refused() {
+        let col: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![i64::MAX]));
+        let b = batch(
+            vec![(
+                "t",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            )],
+            vec![col],
+        );
+
+        let encoded = encode_batch(&b, FieldFormat::Binary);
+
+        assert!(matches!(encoded, Err(EncodeError::OutOfRange { .. })));
+    }
+
+    #[test]
+    fn binary_refuses_columns_it_has_no_binary_encoding_for() {
+        let col: ArrayRef = Arc::new(arrow_array::BinaryArray::from(vec![&b"ab"[..]]));
+        let b = batch(vec![("bytes", DataType::Binary)], vec![col]);
+
+        let encoded = encode_batch(&b, FieldFormat::Binary);
+
+        assert!(matches!(
+            encoded,
+            Err(EncodeError::NoBinaryEncoding {
+                data_type: DataType::Binary
+            })
+        ));
+    }
+
+    #[test]
     fn binary_batches_advertise_the_binary_format() {
         let col: ArrayRef = Arc::new(Int32Array::from(vec![1]));
         let b = batch(vec![("v", DataType::Int32)], vec![col]);
 
-        let pg = PGRowBatch::<Binary>::from_record_batch(b).unwrap();
+        let pg = encode_batch(&b, FieldFormat::Binary).unwrap();
 
         assert_eq!(pg.fields[0].format(), FieldFormat::Binary);
     }
@@ -787,7 +839,7 @@ mod tests {
             vec![ints, tiny],
         );
 
-        let pg = PGRowBatch::<Binary>::from_record_batch(b).unwrap();
+        let pg = encode_batch(&b, FieldFormat::Binary).unwrap();
         let decoded: Vec<_> = pg.rows.iter().map(decode_binary_row).collect();
 
         assert_eq!(
@@ -817,7 +869,7 @@ mod tests {
             vec![dates, timestamps],
         );
 
-        let pg = PGRowBatch::<Binary>::from_record_batch(b).unwrap();
+        let pg = encode_batch(&b, FieldFormat::Binary).unwrap();
         let decoded: Vec<_> = pg.rows.iter().map(decode_binary_row).collect();
 
         assert_eq!(

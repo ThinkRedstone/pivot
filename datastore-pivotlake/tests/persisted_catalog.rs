@@ -105,7 +105,6 @@ fn create(
     transaction
         .bind_create_table(request)?
         .compile(dispatch)?
-        .execute()
         .collect()
         .map(|_| ())
         .map_err(|e| planner::catalog::Error::Other(Box::new(e)))?;

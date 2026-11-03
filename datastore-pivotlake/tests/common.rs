@@ -342,7 +342,6 @@ pub fn write_parquet_files(
         .unwrap()
         .compile(dispatch)
         .unwrap()
-        .execute()
         .collect()
         .unwrap();
     commit_datastore_transaction(creation).unwrap();
@@ -379,7 +378,6 @@ pub fn insert_batches(
     table
         .compile_insert(rows, dispatch)
         .unwrap()
-        .execute()
         .collect()
         .unwrap();
     commit_datastore_transaction(transaction).unwrap();

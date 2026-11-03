@@ -362,7 +362,6 @@ fn insert(dispatch: &Dispatch, catalog: &PivotCatalog, input: Vec<RecordBatch>) 
     table
         .compile_insert(rows, dispatch.dispatcher())
         .unwrap()
-        .execute()
         .collect()
         .unwrap();
     transaction.rollback();
@@ -592,7 +591,6 @@ fn table_over(
         .unwrap()
         .compile(dispatch.dispatcher())
         .unwrap()
-        .execute()
         .collect()
         .unwrap();
     // The table is only visible to the transactions that insert into it once its

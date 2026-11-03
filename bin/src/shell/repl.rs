@@ -311,7 +311,7 @@ impl Session {
         let stats = &mut self.stats;
         let work = async {
             let execution = executor
-                .execute_with_output::<TextBatch>(sql, options)
+                .execute_with_output(sql, options, TextBatch::from_record_batch)
                 .await
                 .map_err(|error| Error::Statement(error.into()))?;
             if let StatementOutput::Set { name, value } = &execution.output

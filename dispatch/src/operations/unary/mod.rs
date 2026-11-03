@@ -90,7 +90,7 @@ mod normalizer;
 mod order_by;
 mod order_by_limit;
 
-pub(crate) use copy_out::copy_out;
+pub use copy_out::copy_out;
 pub(crate) use join::create_join_factories;
 pub(crate) use join::create_normalizing_for_workers as create_normalizing_join_factories;
 pub(crate) use join::create_range_join_factories;

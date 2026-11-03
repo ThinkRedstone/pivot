@@ -87,7 +87,6 @@ fn make_datastore() -> (TempDir, Arc<PivotlakeDatastore>) {
         .unwrap()
         .compile(&dispatcher())
         .unwrap()
-        .execute()
         .collect()
         .unwrap();
     commit_datastore_transaction(transaction).unwrap();

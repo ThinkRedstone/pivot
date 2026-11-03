@@ -140,7 +140,7 @@ pub(crate) async fn copy_from_file(
     options: ExecuteOptions,
 ) -> Result<CopyOutcome, CopyError> {
     let execution = executor
-        .execute_with_output::<TextBatch>(command.statement, options)
+        .execute_with_output(command.statement, options, TextBatch::from_record_batch)
         .await?;
     let StatementOutput::CopyFromStdin(mut ingest) = execution.output else {
         unreachable!("a COPY ... FROM STDIN statement plans as a copy-in");

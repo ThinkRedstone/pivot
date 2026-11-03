@@ -49,7 +49,6 @@ fn create_table(
     transaction
         .bind_create_table(request)?
         .compile(dispatch)?
-        .execute()
         .collect()
         .map(|_| ())
         .map_err(|e| planner::catalog::Error::Other(Box::new(e)))?;
@@ -90,7 +89,6 @@ fn stage_and_commit_schema(
             if_not_exists,
         })?
         .compile(dispatch)?
-        .execute()
         .collect()
         .map(|_| ())
         .map_err(|e| planner::catalog::Error::Other(Box::new(e)))?;
@@ -187,7 +185,6 @@ fn rolling_back_a_create_schema_discards_the_staged_schema() {
         .unwrap()
         .compile(&dispatch)
         .unwrap()
-        .execute()
         .collect()
         .unwrap();
 
@@ -453,7 +450,7 @@ fn compiling_a_create_schema_does_not_stage_it() {
         .unwrap()
         .compile(&dispatch)
         .unwrap();
-    spec.execute().collect().unwrap();
+    spec.collect().unwrap();
     commit_datastore_transaction(transaction).unwrap();
     assert!(datastore.contains_schema("analytics"));
 }

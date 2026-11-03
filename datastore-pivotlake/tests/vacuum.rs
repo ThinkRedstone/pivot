@@ -83,7 +83,6 @@ fn create_events_table(
         .unwrap()
         .compile(dispatch)
         .unwrap()
-        .execute()
         .collect()
         .unwrap();
     commit_datastore_transaction(transaction).unwrap();

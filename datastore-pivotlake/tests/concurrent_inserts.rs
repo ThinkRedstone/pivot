@@ -50,7 +50,6 @@ fn open_datastore_with_empty_table() -> (TempDir, Arc<PivotlakeDatastore>) {
         .unwrap()
         .compile(&dispatcher())
         .unwrap()
-        .execute()
         .collect()
         .unwrap();
     commit_datastore_transaction(transaction).unwrap();

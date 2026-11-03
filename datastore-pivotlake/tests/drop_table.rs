@@ -83,7 +83,6 @@ fn create_table(
         .unwrap()
         .compile(dispatch)
         .unwrap()
-        .execute()
         .collect()
         .unwrap();
     commit_datastore_transaction(transaction).unwrap();
@@ -110,7 +109,6 @@ fn drop_table(
     transaction
         .bind_drop_table(request)?
         .compile(dispatch)?
-        .execute()
         .collect()
         .map(|_| ())
         .map_err(|e| planner::catalog::Error::Other(Box::new(e)))?;
@@ -151,7 +149,6 @@ fn drop_is_visible_only_after_commit_and_survives_a_reopen() {
         .unwrap()
         .compile(&dispatch)
         .unwrap()
-        .execute()
         .collect()
         .unwrap();
 
@@ -177,7 +174,6 @@ fn rolling_back_a_drop_keeps_the_table() {
         .unwrap()
         .compile(&dispatch)
         .unwrap()
-        .execute()
         .collect()
         .unwrap();
 

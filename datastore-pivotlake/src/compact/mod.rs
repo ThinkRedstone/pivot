@@ -963,7 +963,6 @@ mod tests {
             .unwrap()
             .compile(dispatcher)
             .unwrap()
-            .execute()
             .collect()
             .unwrap();
         tokio::runtime::Builder::new_current_thread()
@@ -1022,7 +1021,6 @@ mod tests {
             .unwrap()
             .compile(dispatcher)
             .unwrap()
-            .execute()
             .collect()
             .unwrap();
         tokio::runtime::Builder::new_current_thread()
@@ -1066,7 +1064,6 @@ mod tests {
             .unwrap()
             .compile(dispatcher)
             .unwrap()
-            .execute()
             .collect()
             .unwrap();
         tokio::runtime::Builder::new_current_thread()

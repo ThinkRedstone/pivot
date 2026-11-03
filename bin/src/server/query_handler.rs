@@ -4,7 +4,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::execution::{Command, ExecuteOptions, Execution, StatementOutput, is_truthy};
-use crate::server::arrow_to_pgwire::{Binary, PGRowBatch, Text, WireEncoding, build_field_info};
+use crate::server::arrow_to_pgwire::{PGRowBatch, build_field_info, encode_batch};
 use crate::server::auth::Authenticator;
 use crate::server::copy_session;
 use arrow_schema::{Field, Schema};
@@ -60,12 +60,13 @@ fn fields_for_columns(
     build_field_info(&schema, format)
 }
 
-fn build_query_response<E: WireEncoding>(
+fn build_query_response(
     columns: Vec<crate::execution::ResultColumn>,
-    batches: Vec<PGRowBatch<E>>,
+    batches: Vec<PGRowBatch>,
+    format: FieldFormat,
 ) -> Response {
     let fields = batches.first().map_or_else(
-        || fields_for_columns(columns, E::FORMAT),
+        || fields_for_columns(columns, format),
         |batch| batch.fields.clone(),
     );
     Response::Query(QueryResponse::new(
@@ -101,12 +102,13 @@ impl PivotQueryHandler {
         Self { executor }
     }
 
-    async fn run_query<E: WireEncoding>(
+    async fn run_query(
         &self,
         query: &str,
+        format: FieldFormat,
         collect_stats: bool,
         with_perf: bool,
-    ) -> crate::execution::Result<Execution<PGRowBatch<E>>> {
+    ) -> crate::execution::Result<Execution<PGRowBatch>> {
         #[cfg(feature = "perf")]
         let mut perf_guard = if with_perf {
             let sql = query.to_string();
@@ -126,11 +128,15 @@ impl PivotQueryHandler {
 
         let result = self
             .executor
-            .execute_with_output::<PGRowBatch<E>>(
+            .execute_with_output(
                 query.to_string(),
                 ExecuteOptions {
                     collect_stats,
                     profile,
+                },
+                move |batch| {
+                    encode_batch(batch, format)
+                        .map_err(|error| dispatch::UnaryError::Operator(Box::new(error)))
                 },
             )
             .await;
@@ -264,11 +270,15 @@ impl CopyHandler for PivotQueryHandler {
 
 impl PivotQueryHandler {
     /// Execute one statement and build its wire response, its rows encoded
-    /// as `E` dictates. Shared by the simple and extended protocols; a COPY
-    /// FROM STDIN switches the connection into copy-in mode on the way out.
-    async fn execute_statement<E, C>(&self, client: &mut C, query: &str) -> PgWireResult<Response>
+    /// in `format`. Shared by the simple and extended protocols; a COPY FROM
+    /// STDIN switches the connection into copy-in mode on the way out.
+    async fn execute_statement<C>(
+        &self,
+        client: &mut C,
+        query: &str,
+        format: FieldFormat,
+    ) -> PgWireResult<Response>
     where
-        E: WireEncoding,
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
@@ -281,7 +291,7 @@ impl PivotQueryHandler {
 
         info!(sql = %query, "query received");
         let execution = self
-            .run_query::<E>(query, with_stats, with_perf)
+            .run_query(query, format, with_stats, with_perf)
             .await
             .map_err(|error| {
                 warn!(%error, sql = %query, "query failed");
@@ -300,7 +310,9 @@ impl PivotQueryHandler {
         }
 
         let response = match execution.output {
-            StatementOutput::Rows { columns, batches } => build_query_response(columns, batches),
+            StatementOutput::Rows { columns, batches } => {
+                build_query_response(columns, batches, format)
+            }
             StatementOutput::Command(command) => build_command_response(command),
             StatementOutput::Set { name, value } => apply_set(client, &name, value.as_deref())?,
             StatementOutput::CopyFromStdin(ingest) => {
@@ -334,7 +346,8 @@ impl SimpleQueryHandler for PivotQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         Ok(vec![
-            self.execute_statement::<Text, _>(client, query).await?,
+            self.execute_statement(client, query, FieldFormat::Text)
+                .await?,
         ])
     }
 }
@@ -449,11 +462,8 @@ impl ExtendedQueryHandler for PivotQueryHandler {
         }
         // Resolved before executing, so a refused request has no effects.
         let format = resolve_result_format(&portal.result_column_format)?;
-        let query = &portal.statement.statement;
-        match format {
-            FieldFormat::Text => self.execute_statement::<Text, _>(client, query).await,
-            FieldFormat::Binary => self.execute_statement::<Binary, _>(client, query).await,
-        }
+        self.execute_statement(client, &portal.statement.statement, format)
+            .await
     }
 }
 

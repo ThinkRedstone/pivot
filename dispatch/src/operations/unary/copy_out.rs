@@ -26,7 +26,7 @@ use arrow_array::{RecordBatch, RecordBatchOptions, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 
 /// Deep-copy one ring-backed batch into ordinary heap allocations.
-pub(crate) fn copy_out(batch: RecordBatch) -> unary::Result<RecordBatch> {
+pub fn copy_out(batch: &RecordBatch) -> unary::Result<RecordBatch> {
     let schema = batch.schema();
     let columns = batch
         .columns()
@@ -104,7 +104,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = copy_out(input).unwrap();
+        let out = copy_out(&input).unwrap();
 
         assert_eq!(out.num_columns(), 0);
         assert_eq!(out.num_rows(), 7);
@@ -118,7 +118,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = copy_out(input.clone()).unwrap();
+        let out = copy_out(&input).unwrap();
 
         assert_eq!(out, input);
     }
@@ -133,7 +133,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = copy_out(input).unwrap();
+        let out = copy_out(&input).unwrap();
 
         // Assert: the emitted batch points at a different allocation.
         let emitted_ptr = out.column(0).to_data().buffers()[0].as_ptr();
@@ -148,7 +148,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = copy_out(input.clone()).unwrap();
+        let out = copy_out(&input).unwrap();
 
         assert_eq!(out, input);
     }
@@ -162,7 +162,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = copy_out(input.clone()).unwrap();
+        let out = copy_out(&input).unwrap();
 
         assert_eq!(out, input);
     }
@@ -182,7 +182,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = copy_out(input.clone()).unwrap();
+        let out = copy_out(&input).unwrap();
 
         assert_eq!(out, input);
     }
@@ -199,7 +199,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = copy_out(input.clone()).unwrap();
+        let out = copy_out(&input).unwrap();
 
         assert_eq!(out, input);
     }
@@ -216,7 +216,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = copy_out(input.clone()).unwrap();
+        let out = copy_out(&input).unwrap();
 
         assert_eq!(out, input);
     }
@@ -229,7 +229,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = copy_out(input.clone()).unwrap();
+        let out = copy_out(&input).unwrap();
 
         assert_eq!(out, input);
     }

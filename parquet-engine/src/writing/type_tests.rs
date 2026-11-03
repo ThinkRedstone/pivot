@@ -194,7 +194,6 @@ fn write_cases(dispatch: &Dispatch, cases: &[Case]) -> Vec<u8> {
             .map_each(|file: AssembledFile| {
                 Ok(file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
             })
-            .execute()
             .collect()
             .unwrap();
     assert_eq!(files.len(), 1, "the rows fit one file");

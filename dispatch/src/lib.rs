@@ -130,7 +130,7 @@ pub use operations::channels::{
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use operations::unary::test_utils;
-pub use operations::unary::{Error as UnaryError, Result as UnaryResult};
+pub use operations::unary::{Error as UnaryError, Result as UnaryResult, copy_out};
 pub use operations::unary::{
     KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, batch_sort_indices,
 };
