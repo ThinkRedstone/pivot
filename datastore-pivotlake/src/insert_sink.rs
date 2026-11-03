@@ -17,7 +17,7 @@ use dispatch::{
 };
 use planner::catalog::Column;
 
-use crate::CatalogTable;
+use crate::{CatalogTable, CommitAction, PendingInsert};
 use object_storage::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
 use parquet_engine::RowGroupMetadata;
 use parquet_engine::writing::{AssembledFile, encode_record_batches_spec, unshred_batches_spec};
@@ -31,11 +31,22 @@ use parquet_engine::writing::{AssembledFile, encode_record_batches_spec, unshred
 /// the binding's `BoundTable::compile_insert` impl (see [`super::binding::TableBinding`]).
 pub(super) fn build_insert_spec(
     table: &CatalogTable,
-    uploaded_files: Arc<Injector<UploadedFile>>,
+    commit_actions: Arc<Injector<Box<dyn CommitAction>>>,
     input: RecordBatchOperatorSpec,
 ) -> crate::Result<RecordBatchOperatorSpec> {
     let store = table.store();
     store.prepare_write()?;
+    let uploaded_files = Arc::new(Injector::new());
+    // The pending insert this statement commits with. Staged before any file
+    // can land, so whatever lands is owned by a staged action the transaction
+    // can commit or discard.
+    let pending_insert: Box<dyn CommitAction> = Box::new(PendingInsert {
+        table_id: table.id(),
+        store: store.clone(),
+        location: table.object_location().clone(),
+        uploaded_files: uploaded_files.clone(),
+    });
+    let stage_pending_insert = Box::new(move || commit_actions.push(pending_insert));
 
     // In `INSERT INTO x VALUES (...)`, VALUES emits batches with unnamed columns
     // because only INSERT knows which table columns receive the rows. DuckDB has
@@ -109,6 +120,7 @@ pub(super) fn build_insert_spec(
         table.object_location().clone(),
         table.columns().into(),
         uploaded_files,
+        Some(stage_pending_insert),
         encoded,
     ))
 }
@@ -116,11 +128,15 @@ pub(super) fn build_insert_spec(
 /// Upload assembled Parquet files over the ring and push every completion onto
 /// `uploaded_files`. INSERT and compaction prepare files through different front
 /// halves of the write pipeline and share this storage-facing tail.
+/// `on_start` runs once, when the dataflow is built and before any file
+/// can land: an INSERT stages the pending insert its transaction commits there;
+/// compaction, which commits its files itself, has nothing to run.
 pub(super) fn upload_files_spec<OF>(
     store: Arc<dyn ObjectStore>,
     location: ObjectPath,
     declared_columns: Arc<[Column]>,
     uploaded_files: Arc<Injector<UploadedFile>>,
+    on_start: Option<Box<dyn FnOnce() + Send>>,
     encoded: OperatorSpec<AssembledFile, OF>,
 ) -> RecordBatchOperatorSpec
 where
@@ -133,6 +149,8 @@ where
     // separate fan-in is needed.
     let rows = Arc::new(AtomicUsize::new(0));
     let remaining_workers = Arc::new(AtomicUsize::new(workers));
+    // One factory per worker, but only the first runs `on_start`.
+    let mut on_start = on_start;
     let uploads = encoded.chain(
         stealable::<AssembledFile>(topology).into_iter().collect(),
         (0..workers)
@@ -142,6 +160,7 @@ where
                     location.clone(),
                     declared_columns.clone(),
                     uploaded_files.clone(),
+                    on_start.take(),
                     rows.clone(),
                     remaining_workers.clone(),
                 )
@@ -168,6 +187,9 @@ pub(super) struct UploadFactory {
     /// footer when its row groups are built.
     declared_columns: Arc<[Column]>,
     uploaded_files: Arc<Injector<UploadedFile>>,
+    /// Run once when this factory builds its operator. Held by one worker's
+    /// factory only.
+    on_start: Option<Box<dyn FnOnce() + Send>>,
     /// Total inserted rows, shared across every worker's `Upload`. Each worker's
     /// completions add to it; the emitting worker reads it once the finish barrier
     /// guarantees all uploads landed.
@@ -183,6 +205,7 @@ impl UploadFactory {
         location: ObjectPath,
         declared_columns: Arc<[Column]>,
         uploaded_files: Arc<Injector<UploadedFile>>,
+        on_start: Option<Box<dyn FnOnce() + Send>>,
         rows: Arc<AtomicUsize>,
         remaining_workers: Arc<AtomicUsize>,
     ) -> Self {
@@ -191,6 +214,7 @@ impl UploadFactory {
             location,
             declared_columns,
             uploaded_files,
+            on_start,
             rows,
             remaining_workers,
         }
@@ -200,7 +224,12 @@ impl UploadFactory {
 impl UnaryFactory<AssembledFile, RecordBatch> for UploadFactory {
     type Unary = Upload;
 
+    /// Building the operator is the dataflow starting, so `on_start` runs
+    /// here: before any file can land.
     fn build_unary(self) -> Self::Unary {
+        if let Some(on_start) = self.on_start {
+            on_start();
+        }
         Upload {
             store: self.store,
             location: self.location,

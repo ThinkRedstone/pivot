@@ -1324,6 +1324,35 @@ fn insert_files_reach_the_log_only_when_the_transaction_commits() {
     assert_eq!(common::extract_count(&after_rollback), 2);
 }
 
+#[test]
+fn a_rolled_back_insert_removes_the_files_it_uploaded() {
+    let (database, datastore) = empty_datastore();
+    create_table(
+        &datastore,
+        CreateTableRequest {
+            datastore_name: None,
+            schema_name: None,
+            name: "discarded_insert".to_string(),
+            columns: vec![Column {
+                name: "id".to_string(),
+                col_type: Type::Int32,
+            }],
+            options: HashMap::new(),
+            if_not_exists: false,
+        },
+    )
+    .unwrap();
+    let table_dir = common::table_dir(database.path(), &datastore, "discarded_insert");
+    let (transaction, compiled) =
+        compile_sql(&datastore, "INSERT INTO discarded_insert VALUES (1)");
+    compiled.collect().unwrap();
+    assert_eq!(common::parquet_files_in(&table_dir).len(), 1);
+
+    transaction.rollback();
+
+    assert!(common::parquet_files_in(&table_dir).is_empty());
+}
+
 /// A file appended after `CREATE TABLE` becomes visible to new binds, with
 /// global row-group indices kept sequential.
 #[test]

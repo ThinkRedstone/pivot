@@ -19,7 +19,7 @@ use planner::catalog::{
 use planner::expression::{CompareType, Expression};
 
 use super::insert_sink::build_insert_spec;
-use super::{CatalogTable, CommitAction, PendingInsert};
+use super::{CatalogTable, CommitAction};
 
 /// A catalog table resolved from one transaction: it captures the snapshot's own
 /// copy of the [`CatalogTable`] (schema, files, and their row groups), this
@@ -49,9 +49,8 @@ pub struct TableBinding {
     predicates: Vec<PushedPredicate>,
     /// The transaction's staging queue, shared (`Arc`) with the
     /// [`PivotlakeTransaction`](super::PivotlakeTransaction) that produced this
-    /// binding, so the append this binding's
-    /// [`compile_insert`](BoundTable::compile_insert) stages is applied by that
-    /// transaction's commit.
+    /// binding, so the append an INSERT compiled by this binding stages as it
+    /// runs is applied by that transaction's commit.
     commit_actions: Arc<Injector<Box<dyn CommitAction>>>,
 }
 
@@ -194,17 +193,15 @@ impl BoundTable for TableBinding {
         _dispatcher: &DataFlowDispatcher,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         // The captured snapshot copy stamps the durable schema onto every
-        // written file. The files land on this statement's own queue as the
-        // dataflow runs; the append staged here hands that queue to the
-        // transaction's commit, which resolves the live table by its durable id
-        // (surviving a concurrent rename).
-        let uploaded_files = Arc::new(Injector::new());
-        let spec = build_insert_spec(&self.table, uploaded_files.clone(), input)?;
-        self.commit_actions.push(Box::new(PendingInsert {
-            table_id: self.table.id(),
-            uploaded_files,
-        }));
-        Ok(spec)
+        // written file. Compiling stages nothing: the dataflow stages its
+        // append on the transaction's queue as it starts, and the transaction's
+        // commit resolves the live table by its durable id (surviving a
+        // concurrent rename).
+        Ok(build_insert_spec(
+            &self.table,
+            self.commit_actions.clone(),
+            input,
+        )?)
     }
 
     fn columns(&self) -> Vec<Column> {

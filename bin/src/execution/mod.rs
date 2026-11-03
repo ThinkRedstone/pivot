@@ -89,7 +89,13 @@ impl Executor {
                 Ok(execution)
             }
             Err(error) => {
-                transaction.rollback();
+                // A rollback removes what the statement already uploaded:
+                // blocking store I/O, kept off the runtime.
+                if let Err(panic) =
+                    tokio::task::spawn_blocking(move || transaction.rollback()).await
+                {
+                    tracing::error!(%panic, "rollback thread panicked");
+                }
                 Err(error)
             }
         }

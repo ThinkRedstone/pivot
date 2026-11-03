@@ -860,6 +860,7 @@ impl CatalogTable {
             self.location.clone(),
             self.declared_columns(),
             uploaded_files.clone(),
+            None,
             encoded,
         );
         // Drive encode → upload to completion; the emitted row-count batch is

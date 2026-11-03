@@ -1116,13 +1116,22 @@ impl PivotlakeTransaction {
 }
 
 /// One durable effect a statement staged on its transaction: a schema or table
-/// creation, a table drop, or the files an INSERT uploaded. The transaction's
+/// creation, a table drop, or the files an INSERT uploaded. A statement stages
+/// its action as its dataflow starts, never while it is compiled, so a
+/// statement that failed to compile has staged nothing. The transaction's
 /// commit applies its actions in the order the statements ran, so a statement
-/// sees what the ones before it did; a failure stops the commit and the effects
-/// applied before it stay. Blocking store I/O, so [`PivotlakeTransaction::commit`]
-/// applies them on the blocking pool.
+/// sees what the ones before it did; a failure stops the commit, the effects
+/// applied before it stay, and the actions after it are discarded. Blocking
+/// store I/O, so [`PivotlakeTransaction::commit`] applies them on the blocking
+/// pool.
 pub(crate) trait CommitAction: Send {
     fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> Result<()>;
+
+    /// Undo what the action put outside the catalog before its commit: a
+    /// rolled-back or never-committed INSERT removes the files it uploaded.
+    /// Best effort: a file that cannot be removed is logged and left behind,
+    /// unreferenced, for vacuum to sweep.
+    fn discard(self: Box<Self>);
 }
 
 impl CommitAction for PendingSchemaCreation {
@@ -1131,6 +1140,9 @@ impl CommitAction for PendingSchemaCreation {
     fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> Result<()> {
         datastore.finalize_schema_creation(*self)
     }
+
+    /// A schema creation writes nothing before its commit.
+    fn discard(self: Box<Self>) {}
 }
 
 impl CommitAction for PendingTableCreation {
@@ -1139,6 +1151,10 @@ impl CommitAction for PendingTableCreation {
     fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> Result<()> {
         datastore.finalize_table_creation(*self)
     }
+
+    /// A table creation writes nothing before its commit: the log is
+    /// initialized by the commit itself, and adopted files were never ours.
+    fn discard(self: Box<Self>) {}
 }
 
 impl CommitAction for PendingTableDrop {
@@ -1146,6 +1162,9 @@ impl CommitAction for PendingTableDrop {
     fn apply(self: Box<Self>, datastore: &PivotlakeDatastore) -> Result<()> {
         datastore.finalize_table_drop(*self)
     }
+
+    /// A table drop writes nothing before its commit.
+    fn discard(self: Box<Self>) {}
 }
 
 impl CommitAction for PendingInsert {
@@ -1176,6 +1195,21 @@ impl CommitAction for PendingInsert {
             return Ok(());
         }
         datastore.commit_to_table(self.table_id, &[], files, true)
+    }
+
+    /// Delete every file the INSERT uploaded: none is in the log, so no reader
+    /// can be holding one.
+    fn discard(self: Box<Self>) {
+        for uploaded in drain_injector(&self.uploaded_files) {
+            let key = self.location.resolve(&uploaded.file.path);
+            if let Err(error) = self.store.delete(&key) {
+                tracing::warn!(
+                    file = %key.as_str(),
+                    %error,
+                    "could not remove the uploaded file of a discarded INSERT; vacuum will"
+                );
+            }
+        }
     }
 }
 
@@ -1365,12 +1399,16 @@ pub(crate) struct PendingTableCreation {
 }
 
 /// The files one INSERT uploaded, waiting for its transaction to append them to
-/// the table in one version. Staged when the statement's sink is built; the
-/// files arrive on `uploaded_files` as the dataflow runs, so a sink that wrote
-/// no rows appends nothing. Carries the table's durable id, not its name, so
-/// the commit resolves the live table regardless of a rename.
+/// the table in one version. Staged by the statement's upload stage as the
+/// dataflow starts; the files arrive on `uploaded_files` as it runs, so a sink
+/// that wrote no rows appends nothing. Carries the table's durable id, not its
+/// name, so the commit resolves the live table regardless of a rename, and the
+/// store and location the files were written under, so a discard can remove
+/// them without the table.
 pub(crate) struct PendingInsert {
     pub(crate) table_id: Uuid,
+    pub(crate) store: Arc<dyn ObjectStore>,
+    pub(crate) location: ObjectPath,
     pub(crate) uploaded_files: Arc<Injector<insert_sink::UploadedFile>>,
 }
 
@@ -1511,8 +1549,14 @@ impl DatastoreTransaction for PivotlakeTransaction {
         let datastore = self.datastore.clone();
         let commit_actions = drain_injector(&self.commit_actions);
         tokio::task::spawn_blocking(move || -> CatalogResult<()> {
-            for action in commit_actions {
-                action.apply(&datastore)?;
+            let mut commit_actions = commit_actions.into_iter();
+            while let Some(action) = commit_actions.next() {
+                if let Err(error) = action.apply(&datastore) {
+                    for unapplied in commit_actions {
+                        unapplied.discard();
+                    }
+                    return Err(error.into());
+                }
             }
             Ok(())
         })
@@ -1520,8 +1564,13 @@ impl DatastoreTransaction for PivotlakeTransaction {
         .map_err(|e| CatalogError::Other(format!("commit thread panicked: {e}").into()))?
     }
 
+    /// Discard every staged action, removing what it already wrote. Blocking
+    /// store I/O when an INSERT uploaded files, so a caller on an async runtime
+    /// hops to the blocking pool first.
     fn rollback(&self) {
-        drain_injector(&self.commit_actions);
+        for action in drain_injector(&self.commit_actions) {
+            action.discard();
+        }
     }
 }
 
