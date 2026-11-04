@@ -135,18 +135,6 @@ Pivot is a high-performance analytics database that runs on open data formats. I
 - **Portable** -     Pivot can run both as a server serving backends and clients, or as a local engine where users and agents query the source of truth directly, allowing local ad-hoc and agentic analytics to share the same engine and architecture as traditional dashboards and in-app analytics
 - **Open** - Pivot is open source and built on open data formats (Delta Lake and Apache Iceberg). This means you can use Pivot with data already stored in your data warehouse, while data ingested by Pivot remains accessible to other query engines.
 
-### Project status
-
-Pivot is in early development and is not production ready. It is meant for
-evaluation, experiments and local analysis today.
-
-- **Breaking changes.** SQL surface, configuration keys, wire behaviour and
-  the on-disk layout change between releases, with no migration path and no
-  deprecation period. Expect to recreate a deployment rather than upgrade it.
-- **Gaps in coverage.** Whole areas of SQL are unimplemented. What is
-  supported today is listed under [SQL reference](/docs/reference/); assume
-  anything not listed there is missing.
-
 ### Where to start
 
 - [Quickstart](/docs/quickstart/) runs a server and issues a first query.
