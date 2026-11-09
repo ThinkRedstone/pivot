@@ -42,6 +42,19 @@ ab_common_init() {
     # path sits inside RUSTFLAGS, and identical flags are what keep the restored
     # target-pgogen artifacts valid run over run.
     pgo_dir="/tmp/benchmarks-pgo"
+    widen_tcp_receive_buffers
+}
+
+# Start every TCP socket with a receive buffer large enough to hold a whole
+# query result. The client reads a large result more slowly than the server
+# writes it over loopback; with the kernel's small starting buffer the client
+# keeps advertising a zero window, the kernel occasionally drops a segment it
+# has no room for, and when that segment is the result's last the query waits
+# out the 200ms minimum retransmit timer with both processes idle. That stall
+# lands on whichever side happens to hit it, as timing noise of a fifth of a
+# second on the queries with the largest results. Needs passwordless sudo.
+widen_tcp_receive_buffers() {
+    sudo sysctl -q -w net.ipv4.tcp_rmem="4096 16777216 33554432"
 }
 
 # ---------------------------------------------------------------------------
