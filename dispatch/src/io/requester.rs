@@ -2098,6 +2098,26 @@ mod tests {
         port
     }
 
+    /// Spawn a server whose first connection is accepted and then never
+    /// answered, as when the peer's reply is lost on the way, and whose second
+    /// connection serves one range GET.
+    #[cfg(target_os = "linux")]
+    fn spawn_silent_then_serving_server() -> u16 {
+        let server_config = server_tls_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (_silent, _) = listener.accept().unwrap();
+            let (tcp, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            serve_one_range(&mut tls);
+        });
+
+        port
+    }
+
     /// Shared log of the `[start, end]` ranges a recording server was asked for.
     type RangeLog = Arc<Mutex<Vec<(usize, usize)>>>;
 
@@ -2291,6 +2311,20 @@ mod tests {
         // re-issue the (idempotent) range read rather than surfacing an error.
         fetch(&mut requester, &loc, 4096, 4096);
         assert_cached(&loc, 4096, 4096);
+    }
+
+    /// A read whose connection goes silent is issued again on another one
+    /// rather than left waiting on it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_read_on_a_silent_connection_is_issued_again() {
+        init_test_free_pool(16);
+        let loc = remote_loc(spawn_silent_then_serving_server());
+        let mut requester = IORequester::with_http_config(client_config());
+
+        fetch(&mut requester, &loc, 0, 4096);
+
+        assert_cached(&loc, 0, 4096);
     }
 
     /// Spawn a server that accepts connections and drops them without responding,

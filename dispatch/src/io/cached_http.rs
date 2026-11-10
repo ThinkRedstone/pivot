@@ -345,6 +345,17 @@ impl CachedHttpEngine {
         disk_id: &mut Identifier,
         out: &mut Vec<ReadResult>,
     ) -> Result<()> {
+        // Before the completions: a piece issued again and finished within one
+        // pass is still tracked here, so its read is billed the re-issue. A read
+        // a sibling piece already failed is gone, with nothing left to bill.
+        #[cfg(target_os = "linux")]
+        for id in self.http.take_reissued() {
+            if let Some(http_read) = self.http_reads.get(&id)
+                && let Some(read) = self.requested_reads.get_mut(&http_read.read)
+            {
+                read.time.http_reissues += 1;
+            }
+        }
         for id in self.http.take_completed() {
             if let Some(http_read) = self.http_reads.remove(&id) {
                 self.complete_http_read(backend, disk_id, http_read, out)?;

@@ -10,6 +10,13 @@
 //! connection's state machine (connect → handshake → request → response). Idle
 //! keep-alive connections are pooled per host and reused.
 //!
+//! Each connect and recv of a range read carries a linked timeout, its step
+//! deadline. A lost packet is otherwise recovered only by TCP's own timers,
+//! which start at a second for a connection attempt and double on every repeat,
+//! and one such read holds up the whole scan waiting on it. A step that
+//! outlives its deadline is cancelled by the kernel and the read is issued
+//! again on another connection.
+//!
 //! On non-Linux (macOS) there is no ring: the engine hands each range read to a
 //! shared pool of blocking `std::net` + `rustls::StreamOwned` threads (mirroring
 //! the file path's `pread` pool) and collects their completions over a channel,
@@ -519,6 +526,45 @@ mod uring_engine {
     use std::net::SocketAddr;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Marks the CQE of the timeout linked to a read's connect or recv, as
+    /// opposed to the CQE of the operation itself. Only the operation's own CQE
+    /// drives an exchange, so a CQE carrying this bit is dropped on arrival.
+    const STEP_DEADLINE_TAG: u64 = 1 << 62;
+
+    /// A read's connect or recv that completes nothing for this many typical
+    /// read times is taken for stalled. One step is a fraction of a whole read,
+    /// so a healthy one stays far inside the bound even when reads slow down
+    /// together.
+    const STEP_DEADLINE_MULTIPLIER: u32 = 4;
+
+    /// The shortest step deadline. It sits above the 200 ms floor of a TCP
+    /// retransmission timer, so a packet the peer resends on its first timer
+    /// still arrives in time.
+    const MIN_STEP_DEADLINE: Duration = Duration::from_millis(250);
+
+    /// The longest step deadline before any doubling, whatever the typical read
+    /// time: a worker fetching very large ranges must still notice a dead
+    /// connection promptly.
+    const MAX_STEP_DEADLINE: Duration = Duration::from_secs(2);
+
+    /// What a read is assumed to take before this engine has finished one.
+    const INITIAL_TYPICAL_READ_TIME: Duration = Duration::from_millis(100);
+
+    /// Each time a read is issued again for missing its step deadline, its
+    /// deadline doubles, up to this many times. A peer that is slow for every
+    /// attempt is then waited for rather than hammered with new connections.
+    const MAX_STEP_DEADLINE_DOUBLINGS: u32 = 6;
+
+    /// How long one connect or recv of a read may take before the read is
+    /// issued again, given what reads on this engine typically take and how
+    /// often this read has already missed its deadline.
+    fn compute_step_deadline(typical_read_time: Duration, deadline_reissues: u32) -> Duration {
+        let base = (typical_read_time * STEP_DEADLINE_MULTIPLIER)
+            .clamp(MIN_STEP_DEADLINE, MAX_STEP_DEADLINE);
+        base * 2u32.pow(deadline_reissues.min(MAX_STEP_DEADLINE_DOUBLINGS))
+    }
 
     /// How many times a single range read is re-issued on a fresh connection
     /// before it's reported as failed. Covers the common case — a pooled
@@ -603,6 +649,16 @@ mod uring_engine {
         /// How many times this request has already been retried on a fresh
         /// connection; bounded by [`MAX_HTTP_RETRIES`].
         retries: u32,
+        /// How many times this read has been issued again because a connect or
+        /// recv missed its step deadline. Counted apart from `retries`: a slow
+        /// step is not an error, so it never brings the read closer to failing.
+        deadline_reissues: u32,
+        /// When this attempt started, to learn what a read typically takes.
+        started_at: Instant,
+        /// The deadline the timeout linked to the in-flight connect or recv
+        /// counts down. Boxed so the address the SQE carries stays put while
+        /// the exchange slab grows.
+        step_deadline: Box<types::Timespec>,
 
         // Cursor into the connection's pending send buffer (TLS ciphertext, or
         // the request head for plain HTTP).
@@ -647,6 +703,9 @@ mod uring_engine {
                 request_queued: false,
                 request,
                 retries: 0,
+                deadline_reissues: 0,
+                started_at: Instant::now(),
+                step_deadline: Box::new(types::Timespec::new()),
                 out_pos: 0,
                 upload_pos: 0,
                 sending_upload_direct: false,
@@ -867,6 +926,24 @@ mod uring_engine {
         fn request_complete(&self) -> bool {
             self.body.as_ref().is_some_and(|b| b.is_complete())
         }
+
+        /// Set the deadline for this exchange's next connect or recv and return
+        /// where the linked timeout reads it from. `None` for an upload, which
+        /// runs without one: its last recv waits on the store committing the
+        /// whole object, and sending it all again is the costlier mistake.
+        fn arm_step_deadline(
+            &mut self,
+            typical_read_time: Duration,
+        ) -> Option<*const types::Timespec> {
+            if matches!(self.request, RemoteRequest::Upload(_)) {
+                return None;
+            }
+            let deadline = compute_step_deadline(typical_read_time, self.deadline_reissues);
+            *self.step_deadline = types::Timespec::new()
+                .sec(deadline.as_secs())
+                .nsec(deadline.subsec_nanos());
+            Some(&*self.step_deadline as *const types::Timespec)
+        }
     }
 
     /// Feed a header-phase (plaintext) chunk: accumulate into `head_acc` until the
@@ -935,6 +1012,13 @@ mod uring_engine {
         /// Ids whose transport failed terminally (retries exhausted or a
         /// non-retryable error), paired with the error to report to the dataflow.
         failed: Vec<(Identifier, Error)>,
+        /// Ids of reads issued again since the last drain because a step missed
+        /// its deadline, once per re-issue.
+        reissued: Vec<Identifier>,
+        /// A running average of how long a read takes from the start of its
+        /// successful attempt to its last body byte. Step deadlines scale with
+        /// it, so they follow the store and the network instead of a constant.
+        typical_read_time: Duration,
     }
 
     impl HttpEngine {
@@ -947,7 +1031,15 @@ mod uring_engine {
                 active: 0,
                 completed: Vec::new(),
                 failed: Vec::new(),
+                reissued: Vec::new(),
+                typical_read_time: INITIAL_TYPICAL_READ_TIME,
             })
+        }
+
+        /// Ids of the reads issued again for a missed step deadline since the
+        /// last call, once per re-issue.
+        pub fn take_reissued(&mut self) -> Vec<Identifier> {
+            std::mem::take(&mut self.reissued)
         }
 
         pub fn has_active(&self) -> bool {
@@ -988,20 +1080,32 @@ mod uring_engine {
             id: Identifier,
             request: RemoteRequest,
         ) -> Result<()> {
+            let (conn, state) = self.take_connection(&request)?;
+            let exchange = HttpExchange::new(conn, id, request, state);
+            self.launch(ring, exchange)
+        }
+
+        /// A connection for `request` and the state its exchange starts in: an
+        /// idle keep-alive connection ready to send on, or a fresh socket still
+        /// to connect. The exchange owns it until the response completes or the
+        /// connection fails.
+        fn take_connection(&mut self, request: &RemoteRequest) -> Result<(Conn, State)> {
             let key = host_key(request.remote());
             if let Some(conn) = self.pool.get_mut(&key).and_then(Vec::pop) {
-                // Reuse a pooled keep-alive connection. The new exchange owns it
-                // until the response completes or the connection fails.
-                let exchange = HttpExchange::new(conn, id, request, State::Sending);
-                let idx = self.alloc_slot(exchange);
-                self.active += 1;
-                self.pump(ring, idx)
-            } else {
-                let conn = self.new_conn(key, &request)?;
-                let exchange = HttpExchange::new(conn, id, request, State::Connecting);
-                let idx = self.alloc_slot(exchange);
-                self.active += 1;
+                return Ok((conn, State::Sending));
+            }
+            Ok((self.new_conn(key, request)?, State::Connecting))
+        }
+
+        /// Put `exchange` in flight: give it a slot and submit its first SQE.
+        fn launch(&mut self, ring: &mut IoUring, exchange: HttpExchange) -> Result<()> {
+            let connecting = matches!(exchange.state, State::Connecting);
+            let idx = self.alloc_slot(exchange);
+            self.active += 1;
+            if connecting {
                 self.start_connect(ring, idx)
+            } else {
+                self.pump(ring, idx)
             }
         }
 
@@ -1014,8 +1118,22 @@ mod uring_engine {
         /// panic the worker). Instead the read is retried on a fresh connection
         /// or, once that's exhausted, recorded in `failed` so the requester can
         /// fail just the owning dataflow.
+        ///
+        /// A read's connect or recv that outlives its step deadline comes back
+        /// cancelled by the timeout linked to it. That is a stalled attempt
+        /// rather than a failed one, and the read is issued again.
         pub fn on_cqe(&mut self, ring: &mut IoUring, user_data: u64, result: i32) -> Result<()> {
+            if user_data & STEP_DEADLINE_TAG != 0 {
+                return Ok(());
+            }
             let idx = (user_data & !HTTP_TAG) as usize;
+
+            if result == -libc::ECANCELED
+                && let Some(exchange) = &self.exchanges[idx]
+                && matches!(exchange.request, RemoteRequest::Read(_))
+            {
+                return self.reissue_stalled_read(ring, idx);
+            }
 
             // Negative result = socket-level error (connect refused, reset,
             // broken pipe, ...). The connection is dead; retry or fail.
@@ -1034,6 +1152,10 @@ mod uring_engine {
                     .take()
                     .expect("cqe for an active HTTP exchange");
                 self.free_slots.push(idx);
+                if matches!(exchange.request, RemoteRequest::Read(_)) {
+                    self.typical_read_time =
+                        (self.typical_read_time * 7 + exchange.started_at.elapsed()) / 8;
+                }
                 let reusable = exchange.conn_reusable;
                 let (id, conn) = exchange.into_connection();
                 // A connection whose response body had unknown framing may
@@ -1092,6 +1214,46 @@ mod uring_engine {
             })
         }
 
+        /// Abandon the attempt at slot `idx`, whose connect or recv missed its
+        /// step deadline, and issue the read again from its first byte on
+        /// another connection, an idle keep-alive one when the pool has it. The
+        /// kernel has already cancelled the stalled operation, so nothing still
+        /// points into the attempt's buffers or its destination.
+        ///
+        /// The read keeps its error budget, and its next deadline is twice as
+        /// long, so a store that is slow for every attempt is waited for.
+        fn reissue_stalled_read(&mut self, ring: &mut IoUring, idx: usize) -> Result<()> {
+            let stalled = self.exchanges[idx]
+                .take()
+                .expect("cqe for an active HTTP exchange");
+            self.free_slots.push(idx);
+            self.active -= 1;
+            let HttpExchange {
+                conn,
+                id,
+                retries,
+                deadline_reissues,
+                request,
+                ..
+            } = stalled;
+            drop(conn); // close the stalled socket before issuing the read again
+            self.reissued.push(id);
+
+            match self.take_connection(&request) {
+                Ok((conn, state)) => {
+                    let mut fresh = HttpExchange::new(conn, id, request, state);
+                    fresh.retries = retries;
+                    fresh.deadline_reissues = deadline_reissues + 1;
+                    self.launch(ring, fresh)
+                }
+                // Couldn't even build the socket — treat as a terminal failure.
+                Err(error) => {
+                    self.failed.push((id, error));
+                    Ok(())
+                }
+            }
+        }
+
         /// Handle a dead connection for the request at slot `idx`: tear it down
         /// and either re-issue the (idempotent) read on a fresh connection — the
         /// common stale-keep-alive case — or, if the error isn't retryable or the
@@ -1108,6 +1270,7 @@ mod uring_engine {
                 conn,
                 id,
                 retries,
+                deadline_reissues,
                 request,
                 ..
             } = dead;
@@ -1119,6 +1282,7 @@ mod uring_engine {
                     Ok(conn) => {
                         let mut fresh = HttpExchange::new(conn, id, request, State::Connecting);
                         fresh.retries = retries + 1;
+                        fresh.deadline_reissues = deadline_reissues;
                         let new_idx = self.alloc_slot(fresh);
                         return self.start_connect(ring, new_idx);
                     }
@@ -1184,6 +1348,7 @@ mod uring_engine {
         }
 
         fn start_connect(&mut self, ring: &mut IoUring, idx: usize) -> Result<()> {
+            let typical_read_time = self.typical_read_time;
             let exchange = self.exchanges[idx].as_mut().unwrap();
             exchange.state = State::Connecting;
             let fd = exchange.conn.fd.as_raw_fd();
@@ -1193,12 +1358,16 @@ mod uring_engine {
             let entry = opcode::Connect::new(types::Fd(fd), addr_ptr, len)
                 .build()
                 .user_data(HTTP_TAG | idx as u64);
-            push(ring, &entry)
+            match exchange.arm_step_deadline(typical_read_time) {
+                Some(deadline) => push_with_step_deadline(ring, entry, deadline, idx),
+                None => push(ring, &entry),
+            }
         }
 
         /// Submit the next op (send or recv) for the connection based on its
         /// current send buffer.
         fn pump(&mut self, ring: &mut IoUring, idx: usize) -> Result<()> {
+            let typical_read_time = self.typical_read_time;
             let (is_send, addr, len, fd) = {
                 let exchange = self.exchanges[idx].as_mut().unwrap();
                 exchange.fill_out();
@@ -1260,17 +1429,46 @@ mod uring_engine {
             // length field goes out over successive sends; `advance` resumes each
             // one at `upload_pos`/`out_pos`.
             let len = len.min(crate::io::backend::MAX_IO_OP_LEN);
-            let entry = if is_send {
-                opcode::Send::new(types::Fd(fd), addr as *const u8, len as u32)
+            if is_send {
+                // A send completes as soon as the socket buffer takes the bytes,
+                // so the peer going quiet shows up at the recv that follows.
+                let entry = opcode::Send::new(types::Fd(fd), addr as *const u8, len as u32)
                     .build()
-                    .user_data(HTTP_TAG | idx as u64)
-            } else {
-                opcode::Recv::new(types::Fd(fd), addr as *mut u8, len as u32)
-                    .build()
-                    .user_data(HTTP_TAG | idx as u64)
-            };
-            push(ring, &entry)
+                    .user_data(HTTP_TAG | idx as u64);
+                return push(ring, &entry);
+            }
+            let entry = opcode::Recv::new(types::Fd(fd), addr as *mut u8, len as u32)
+                .build()
+                .user_data(HTTP_TAG | idx as u64);
+            let exchange = self.exchanges[idx].as_mut().unwrap();
+            match exchange.arm_step_deadline(typical_read_time) {
+                Some(deadline) => push_with_step_deadline(ring, entry, deadline, idx),
+                None => push(ring, &entry),
+            }
         }
+    }
+
+    /// Push a read's connect or recv together with the timeout that cancels it
+    /// if it has not completed by `deadline`, and flush. The pair is linked, so
+    /// the kernel does the cancelling and the operation's own CQE reports it
+    /// (`-ECANCELED`); the timeout's CQE carries [`STEP_DEADLINE_TAG`].
+    fn push_with_step_deadline(
+        ring: &mut IoUring,
+        operation: squeue::Entry,
+        deadline: *const types::Timespec,
+        idx: usize,
+    ) -> Result<()> {
+        let timeout = opcode::LinkTimeout::new(deadline)
+            .build()
+            .user_data(HTTP_TAG | STEP_DEADLINE_TAG | idx as u64);
+        let linked = [operation.flags(squeue::Flags::IO_LINK), timeout];
+        unsafe {
+            ring.submission()
+                .push_multiple(&linked)
+                .map_err(|_| Error::Io(std::io::Error::other("http submission queue full")))?;
+        }
+        ring.submit()?;
+        Ok(())
     }
 
     /// Push one SQE onto the (shared) ring and flush. The buffers it references

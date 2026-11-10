@@ -127,7 +127,7 @@ impl ExecutionStats {
         format!(
             "stats: plan={:.1}ms compile={:.1}ms exec={:.1}ms | \
              disk={} ops/{:.1}MiB/read={:.1}ms/write={:.1}ms  \
-             http={} ops/{:.1}MiB/get={:.1}ms/upload={:.1}ms  \
+             http={} ops/{:.1}MiB/get={:.1}ms/reissued={}/upload={:.1}ms  \
              http-disk-cache={} ops/{:.1}MiB/{:.1}ms  cpu={:.1}ms",
             ms(self.plan),
             ms(self.compile),
@@ -139,6 +139,7 @@ impl ExecutionStats {
             self.flow.http_requests,
             mib(self.flow.http_bytes),
             ms(self.flow.http_get_time),
+            self.flow.http_reissues,
             ms(self.flow.http_upload_time),
             self.flow.disk_cache_requests,
             mib(self.flow.disk_cache_bytes),

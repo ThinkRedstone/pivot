@@ -30,6 +30,9 @@ pub struct DataFlowStats {
     pub http_bytes: u64,
     /// Wall time HTTP GETs were in flight.
     pub http_get_time: Duration,
+    /// HTTP fetches issued again because their connection stalled. A count of
+    /// these well above zero means packets are being lost on the way in.
+    pub http_reissues: u64,
     /// Wall time HTTP uploads were in flight.
     pub http_upload_time: Duration,
     /// Cache-file reads issued, one per resident piece of a remote read (a hit
@@ -59,6 +62,7 @@ impl DataFlowStats {
         self.http_requests += other.http_requests;
         self.http_bytes += other.http_bytes;
         self.http_get_time += other.http_get_time;
+        self.http_reissues += other.http_reissues;
         self.http_upload_time += other.http_upload_time;
         self.disk_cache_requests += other.disk_cache_requests;
         self.disk_cache_bytes += other.disk_cache_bytes;
@@ -82,6 +86,7 @@ impl DataFlowStats {
             http_requests = self.http_requests,
             http_mib = self.http_bytes >> 20,
             http_get_ms = self.http_get_time.as_millis() as u64,
+            http_reissues = self.http_reissues,
             http_upload_ms = self.http_upload_time.as_millis() as u64,
             disk_cache_requests = self.disk_cache_requests,
             disk_cache_mib = self.disk_cache_bytes >> 20,
@@ -168,6 +173,7 @@ impl StatsCollector {
     pub fn record_http_get_time(&mut self, time: RemoteReadTime) {
         if let Some(stats) = &mut self.stats {
             stats.http_get_time += time.http;
+            stats.http_reissues += time.http_reissues;
             stats.disk_cache_time += time.disk_cache;
         }
     }

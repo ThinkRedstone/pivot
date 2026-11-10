@@ -566,6 +566,9 @@ pub struct RemoteSplit {
 pub struct RemoteReadTime {
     pub disk_cache: Duration,
     pub http: Duration,
+    /// How many times a network piece of the read was issued again because its
+    /// connection stalled. That wait is part of `http`.
+    pub http_reissues: u64,
 }
 
 /// One completed I/O operation drained from [`IORequester::completions`], with
