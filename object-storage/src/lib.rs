@@ -25,6 +25,7 @@ use std::time::Duration;
 pub mod file_injector;
 mod file_slice_injector;
 mod gcs;
+mod instance_bandwidth;
 mod local;
 mod object_fetcher;
 mod object_path;
@@ -32,6 +33,10 @@ mod s3;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub use gcs::GcsStore;
+pub use instance_bandwidth::{
+    INSTANCE_METADATA_ENDPOINT, InstanceBandwidth, InstanceBandwidthError,
+    find_instance_type_bandwidth, look_up_instance_bandwidth,
+};
 pub use local::LocalStore;
 pub use object_fetcher::{FileSlice, LoadedObject, load_file_slices, load_objects};
 pub use object_path::ObjectPath;
