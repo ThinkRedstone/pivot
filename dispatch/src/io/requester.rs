@@ -379,6 +379,13 @@ impl IORequester {
                 }
             }
         }
+        // Issued once the whole logical read is registered, so its ranges that
+        // lie close together in the object share a request.
+        let http_requests = self.http.issue_registered_fetches(&mut self.backend)?;
+        stats.record_issued_remote(RemoteSplit {
+            http_requests,
+            ..RemoteSplit::default()
+        });
 
         Ok(())
     }
@@ -1336,6 +1343,9 @@ impl IORequester {
     /// Linux both ride one ring, so a single `submit_and_wait` wakes on either.
     #[cfg(target_os = "linux")]
     pub fn wait(&mut self) -> Result<()> {
+        // Nothing registered may be left unissued across a wait: its
+        // completion is what the wait would be for.
+        self.http.issue_registered_fetches(&mut self.backend)?;
         // A signal, such as a profiler or debugger attaching, interrupts the
         // wait before anything completed; that is not progress or an error.
         loop {
@@ -1352,6 +1362,9 @@ impl IORequester {
     /// matching the Linux single-ring wake on either kind.
     #[cfg(not(target_os = "linux"))]
     pub fn wait(&mut self) -> Result<()> {
+        // Nothing registered may be left unissued across a wait: its
+        // completion is what the wait would be for.
+        self.http.issue_registered_fetches(&mut self.backend)?;
         // Flush any staged disk ops so they are in flight before we park.
         self.backend.submit()?;
         if self.backend.has_ready_completion() || self.http.has_ready_completion() {
@@ -2153,8 +2166,9 @@ mod tests {
     type RangeLog = Arc<Mutex<Vec<(usize, usize)>>>;
 
     /// Spawn a server that records every range it's asked for (so a test can
-    /// assert exactly which bytes went to the network) and serves each on one
-    /// keep-alive connection. Returns the port and the shared request log.
+    /// assert exactly which bytes went to the network) and serves them on as
+    /// many keep-alive connections as it is given. Returns the port and the
+    /// shared request log.
     fn spawn_recording_server() -> (u16, RangeLog) {
         let server_config = server_tls_config();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2163,27 +2177,32 @@ mod tests {
         let log_for_thread = log.clone();
 
         thread::spawn(move || {
-            let (tcp, _) = listener.accept().unwrap();
-            let conn = rustls::ServerConnection::new(server_config).unwrap();
-            let mut tls = rustls::StreamOwned::new(conn, tcp);
-            loop {
-                let head = read_head(&mut tls);
-                if head.is_empty() {
-                    break; // client closed the connection
-                }
-                let (start, end) = parse_range(&head);
-                log_for_thread.lock().unwrap().push((start, end));
-                let len = end - start + 1;
-                let body: Vec<u8> = (0..len).map(|i| pattern(start + i)).collect();
-                let resp = format!(
-                    "HTTP/1.1 206 Partial Content\r\n\
-                     Content-Length: {len}\r\n\
-                     Content-Range: bytes {start}-{end}/1000000\r\n\
-                     Connection: keep-alive\r\n\r\n"
-                );
-                tls.write_all(resp.as_bytes()).unwrap();
-                tls.write_all(&body).unwrap();
-                tls.flush().unwrap();
+            for tcp in listener.incoming() {
+                let server_config = server_config.clone();
+                let log = log_for_thread.clone();
+                thread::spawn(move || {
+                    let conn = rustls::ServerConnection::new(server_config).unwrap();
+                    let mut tls = rustls::StreamOwned::new(conn, tcp.unwrap());
+                    loop {
+                        let head = read_head(&mut tls);
+                        if head.is_empty() {
+                            break; // client closed the connection
+                        }
+                        let (start, end) = parse_range(&head);
+                        log.lock().unwrap().push((start, end));
+                        let len = end - start + 1;
+                        let body: Vec<u8> = (0..len).map(|i| pattern(start + i)).collect();
+                        let resp = format!(
+                            "HTTP/1.1 206 Partial Content\r\n\
+                             Content-Length: {len}\r\n\
+                             Content-Range: bytes {start}-{end}/1000000\r\n\
+                             Connection: keep-alive\r\n\r\n"
+                        );
+                        tls.write_all(resp.as_bytes()).unwrap();
+                        tls.write_all(&body).unwrap();
+                        tls.flush().unwrap();
+                    }
+                });
             }
         });
 
@@ -2259,6 +2278,10 @@ mod tests {
             }
         }
         assert!(submitted > 0, "expected blocks to read");
+        split.http_requests += requester
+            .http
+            .issue_registered_fetches(&mut requester.backend)
+            .unwrap();
 
         let mut completed = 0;
         while completed < submitted {
@@ -2282,6 +2305,84 @@ mod tests {
         for (i, &b) in bytes.iter().enumerate() {
             assert_eq!(b, pattern(offset + i), "byte {i}");
         }
+    }
+
+    /// Read every range of `ranges` from `loc` as the parts of one logical
+    /// read, and block until all of them have landed.
+    fn fetch_together(requester: &mut IORequester, loc: &OpenFile, ranges: &[(usize, usize)]) {
+        let OpenFile::Remote(remote) = loc else {
+            panic!("test fetches over http")
+        };
+        let mut lookups = Vec::new();
+        for &(offset, len) in ranges {
+            lookups.extend(memory_ctx().page_caches().compressed.get(loc, offset, len));
+        }
+        for lookup in &lookups {
+            let block = lookup.missing_extent().expect("an uncached range").clone();
+            let request = HttpRequest::Get(HttpGetRequest {
+                remote: remote.clone(),
+                block,
+            });
+            requester
+                .submit_http_request_to_backend(DataFlowRequest::new(0, 0, request))
+                .unwrap();
+        }
+        settle(requester);
+    }
+
+    /// Two ranges of one read that touch in the object are one request.
+    #[test]
+    fn ranges_next_to_each_other_are_fetched_in_one_request() {
+        init_test_free_pool(16);
+        let (port, requested) = spawn_recording_server();
+        let loc = remote_loc(port);
+        let mut requester = IORequester::with_http_config(client_config());
+
+        fetch_together(&mut requester, &loc, &[(0, 4096), (4096, 8192)]);
+
+        assert_eq!(*requested.lock().unwrap(), vec![(0, 12287)]);
+        assert_cached(&loc, 0, 4096);
+        assert_cached(&loc, 4096, 8192);
+    }
+
+    /// Two ranges of one read with no more between them than may be dropped
+    /// are one request, and what lies between them is not kept.
+    #[test]
+    fn ranges_a_little_apart_are_fetched_in_one_request_that_drops_the_gap() {
+        init_test_free_pool(16);
+        let (port, requested) = spawn_recording_server();
+        let loc = remote_loc(port);
+        let mut requester = IORequester::with_http_config(client_config());
+        requester.http.force_max_dropped_gap_bytes(8192);
+
+        fetch_together(&mut requester, &loc, &[(0, 4096), (12288, 8192)]);
+
+        assert_eq!(*requested.lock().unwrap(), vec![(0, 20479)]);
+        assert_cached(&loc, 0, 4096);
+        assert_cached(&loc, 12288, 8192);
+        let between = memory_ctx().page_caches().compressed.get(&loc, 4096, 8192);
+        assert!(
+            between
+                .iter()
+                .all(|lookup| lookup.missing_extent().is_some())
+        );
+    }
+
+    /// Two ranges of one read that do not touch are fetched on their own.
+    #[test]
+    fn ranges_apart_are_fetched_separately() {
+        init_test_free_pool(16);
+        let (port, requested) = spawn_recording_server();
+        let loc = remote_loc(port);
+        let mut requester = IORequester::with_http_config(client_config());
+
+        fetch_together(&mut requester, &loc, &[(0, 4096), (512 * 1024, 4096)]);
+
+        let mut requested = requested.lock().unwrap().clone();
+        requested.sort();
+        assert_eq!(requested, vec![(0, 4095), (512 * 1024, 512 * 1024 + 4095)]);
+        assert_cached(&loc, 0, 4096);
+        assert_cached(&loc, 512 * 1024, 4096);
     }
 
     #[test]

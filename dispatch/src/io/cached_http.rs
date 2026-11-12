@@ -24,7 +24,7 @@ use crate::Identifier;
 use crate::io::IORequesterError as Error;
 use crate::io::backend::IOBackend;
 use crate::io::disk_cache::{DiskCache, Object, Segment};
-use crate::io::http::{HttpEngine, RemoteRead, RemoteUpload, default_client_config};
+use crate::io::http::{BodyPart, HttpEngine, RemoteRead, RemoteUpload, default_client_config};
 use crate::io::{
     Completion, DataFlowRequest, FailedIO, HttpGetRequest, HttpUploadRequest, OpenFile,
     RemoteReadTime, RemoteSplit,
@@ -49,6 +49,20 @@ use std::time::{Duration, Instant};
 /// requester routes it here, and a bit no exchange slot or step deadline uses.
 #[cfg(target_os = "linux")]
 const RECEIVE_ALLOWANCE_TIMER: u64 = HTTP_TAG | (1 << 61);
+
+/// The most bytes between two ranges of one object that are fetched and
+/// dropped so that one request serves both ranges. None by default, so only
+/// ranges that touch are joined: bytes fetched to be dropped take the network
+/// card's rate from bytes that are wanted, which costs a read bound by the
+/// network more than the request it saves, and decrypting them costs about
+/// what a request does. Read from `PIVOT_REMOTE_READ_MAX_GAP_BYTES`.
+const DEFAULT_MAX_DROPPED_GAP_BYTES: usize = 0;
+
+/// The longest range one request asks for when ranges are joined. A store
+/// serves one connection at a limited rate, so a range much longer than this
+/// arrives sooner as several requests side by side. Read from
+/// `PIVOT_REMOTE_READ_MAX_BYTES`.
+const DEFAULT_MAX_JOINED_READ_BYTES: usize = 8 * 1024 * 1024;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -85,6 +99,19 @@ pub(crate) struct CachedHttpEngine {
     /// Write-backs populating the cache file after an HTTP piece landed (backend
     /// disk-id space). Each holds the slot pin until the write has read it.
     cache_writes: HashMap<Identifier, CacheWrite>,
+
+    /// Network pieces registered and not yet issued, in the order they were
+    /// registered. They wait for the rest of their logical read, so that
+    /// pieces lying close together in an object go out as one request (see
+    /// [`issue_registered_fetches`](Self::issue_registered_fetches)).
+    unissued_fetches: Vec<(Identifier, RemoteRead)>,
+    /// The pieces a joined request serves, by the request's id, which is its
+    /// first piece's. A request for a single piece has no entry.
+    joined_fetches: HashMap<Identifier, Vec<Identifier>>,
+    /// Requests that could not be started, failed on the next drain.
+    failed_starts: Vec<(Identifier, Error)>,
+    max_dropped_gap_bytes: usize,
+    max_joined_read_bytes: usize,
 
     /// The process's receive allowance: every network fetch takes its length
     /// from it before it is issued.
@@ -163,6 +190,17 @@ impl CachedHttpEngine {
             http_uploads: HashMap::new(),
             next_http_id: 0,
             cache_writes: HashMap::new(),
+            unissued_fetches: Vec::new(),
+            joined_fetches: HashMap::new(),
+            failed_starts: Vec::new(),
+            max_dropped_gap_bytes: crate::env::get_env_var_with_default(
+                "PIVOT_REMOTE_READ_MAX_GAP_BYTES",
+                DEFAULT_MAX_DROPPED_GAP_BYTES,
+            ),
+            max_joined_read_bytes: crate::env::get_env_var_with_default(
+                "PIVOT_REMOTE_READ_MAX_BYTES",
+                DEFAULT_MAX_JOINED_READ_BYTES,
+            ),
             #[cfg(target_os = "linux")]
             receive_limiter: process_receive_rate_limiter(),
             #[cfg(target_os = "linux")]
@@ -181,6 +219,13 @@ impl CachedHttpEngine {
         self.receive_limiter = limiter;
     }
 
+    /// Join ranges with up to `bytes` between them into one request, so a
+    /// test controls what is dropped.
+    #[cfg(test)]
+    pub fn force_max_dropped_gap_bytes(&mut self, bytes: usize) {
+        self.max_dropped_gap_bytes = bytes;
+    }
+
     pub fn with_default_config(disk_cache: Option<Arc<DiskCache>>) -> Result<Self> {
         Self::new(default_client_config(), disk_cache)
     }
@@ -189,6 +234,10 @@ impl CachedHttpEngine {
     /// are served from the cache file and holes fetched over HTTP, so only the
     /// missing ranges hit the network. With no cache the whole block is a single
     /// fetched piece. `disk_id` allocates ids for cache-file ops on the backend.
+    ///
+    /// The fetched pieces are registered here and go out with
+    /// [`issue_registered_fetches`](Self::issue_registered_fetches), once the
+    /// caller has submitted every region of its logical read.
     pub fn get(
         &mut self,
         backend: &mut IOBackend,
@@ -252,19 +301,21 @@ impl CachedHttpEngine {
                 );
             } else {
                 // A hole (or an uncached read): fetch over HTTP, written back once
-                // it lands iff there's a cache object.
-                split.http_requests += 1;
+                // it lands iff there's a cache object. The requests are counted
+                // as they go out, since several pieces may share one.
                 split.http_bytes += seg.len as u64;
                 let id = self.next_http_id;
                 self.next_http_id += 1;
                 let remote_read = RemoteRead {
                     remote: request.request.remote.clone(),
                     offset: block.file_offset() as u64,
-                    len: block.len(),
-                    dest: block.dest(),
+                    parts: vec![BodyPart::Kept {
+                        dest: block.dest(),
+                        len: block.len(),
+                    }],
                 };
                 let expected_body_len = remote_read.expected_body_len();
-                self.issue_or_hold_fetch(backend, id, remote_read)?;
+                self.unissued_fetches.push((id, remote_read));
                 self.http_reads.insert(
                     id,
                     HttpRead {
@@ -293,6 +344,57 @@ impl CachedHttpEngine {
             },
         );
         Ok(split)
+    }
+
+    /// Issue the network pieces registered since the last call, and return how
+    /// many requests they made. Pieces of one object that follow each other
+    /// with at most `max_dropped_gap_bytes` between them go out as one request
+    /// of at most `max_joined_read_bytes`: a logical read's ranges often lie
+    /// next to each other in the object, and a range the cache placed in two
+    /// slots is two pieces with nothing between them.
+    ///
+    /// A request that cannot be started fails its pieces on the next drain,
+    /// like one that failed on the network.
+    pub fn issue_registered_fetches(&mut self, backend: &mut IOBackend) -> Result<u64> {
+        let mut requests = 0;
+        let mut pieces = std::mem::take(&mut self.unissued_fetches)
+            .into_iter()
+            .peekable();
+        while let Some((id, mut fetch)) = pieces.next() {
+            let mut joined = Vec::new();
+            while let Some((_, next)) = pieces.peek() {
+                let end = fetch.offset + fetch.len() as u64;
+                let follows_closely = Arc::ptr_eq(&fetch.remote, &next.remote)
+                    && next.offset >= end
+                    && (next.offset - end) as usize <= self.max_dropped_gap_bytes
+                    && (next.offset - fetch.offset) as usize + next.len()
+                        <= self.max_joined_read_bytes;
+                if !follows_closely {
+                    break;
+                }
+                let (next_id, next) = pieces.next().expect("the piece just peeked at");
+                let gap = (next.offset - end) as usize;
+                if gap > 0 {
+                    fetch.parts.push(BodyPart::Dropped { len: gap });
+                }
+                fetch.parts.extend(next.parts);
+                if joined.is_empty() {
+                    joined.push(id);
+                }
+                joined.push(next_id);
+            }
+            if !joined.is_empty() {
+                self.joined_fetches.insert(id, joined);
+            }
+            requests += 1;
+            if let Err(error) = self.issue_or_hold_fetch(backend, id, fetch) {
+                self.failed_starts.push((id, error));
+            }
+            // Flushed as we go: one logical read can make more requests than
+            // the ring's submission queue holds.
+            backend.submit()?;
+        }
+        Ok(requests)
     }
 
     /// Issue a network fetch if the receive allowance covers it, and hold it
@@ -364,7 +466,7 @@ impl CachedHttpEngine {
                 .pop_front()
                 .expect("the fetch just inspected at the front");
             if let Err(error) = self.start_http(backend, id, read) {
-                self.fail_http_read(id, error, out);
+                self.fail_fetch(id, error, out);
             }
         }
         Ok(())
@@ -500,6 +602,12 @@ impl CachedHttpEngine {
         disk_id: &mut Identifier,
         out: &mut Vec<ReadResult>,
     ) -> Result<()> {
+        // A caller that registered pieces without issuing them has them issued
+        // here, so no piece waits on a call that never comes.
+        self.issue_registered_fetches(backend)?;
+        for (id, error) in std::mem::take(&mut self.failed_starts) {
+            self.fail_fetch(id, error, out);
+        }
         #[cfg(target_os = "linux")]
         self.issue_held_fetches(backend, out)?;
         // Before the completions: a piece issued again and finished within one
@@ -514,15 +622,21 @@ impl CachedHttpEngine {
             }
         }
         for id in self.http.take_completed() {
-            if let Some(http_read) = self.http_reads.remove(&id) {
-                self.complete_http_read(backend, disk_id, http_read, out)?;
-            } else if let Some(upload) = self.http_uploads.remove(&id) {
+            if let Some(upload) = self.http_uploads.remove(&id) {
                 out.push(Ok(Completion::HttpUpload(upload)));
+                continue;
+            }
+            // Every piece the request served has landed with it.
+            let joined = self.joined_fetches.remove(&id);
+            for piece in joined.as_deref().unwrap_or(std::slice::from_ref(&id)) {
+                if let Some(http_read) = self.http_reads.remove(piece) {
+                    self.complete_http_read(backend, disk_id, http_read, out)?;
+                }
             }
         }
         for (id, error) in self.http.take_failed() {
             if self.http_reads.contains_key(&id) {
-                self.fail_http_read(id, error.into(), out);
+                self.fail_fetch(id, error.into(), out);
             } else if let Some(upload) = self.http_uploads.remove(&id) {
                 out.push(Err(FailedIO {
                     data_flow_id: upload.data_flow_id,
@@ -533,6 +647,21 @@ impl CachedHttpEngine {
             }
         }
         Ok(())
+    }
+
+    /// Fail every piece the request `id` was to serve (see
+    /// [`fail_http_read`](Self::fail_http_read)).
+    fn fail_fetch(&mut self, id: Identifier, error: Error, out: &mut Vec<ReadResult>) {
+        match self.joined_fetches.remove(&id) {
+            None => self.fail_http_read(id, error, out),
+            Some(pieces) => {
+                let message = error.to_string();
+                for piece in pieces {
+                    let error = std::io::Error::other(message.clone()).into();
+                    self.fail_http_read(piece, error, out);
+                }
+            }
+        }
     }
 
     /// Fail the read the network piece `id` belongs to: its extent leaves the

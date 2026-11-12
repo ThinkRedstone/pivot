@@ -48,22 +48,48 @@ pub enum Error {
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// A single remote range read: fetch `[offset, offset + len)` of `remote` into
-/// `dest` (a pointer into the pinned cache slot, kept alive by the issuing
-/// [`MissingExtent`](crate::memory::cache::MissingExtent)'s pin).
+/// One stretch of a remote range read's body, in the order the bytes arrive.
+#[derive(Clone)]
+pub(crate) enum BodyPart {
+    /// `len` bytes that go to `dest`: a pointer into a pinned cache slot, kept
+    /// alive by the pin of the
+    /// [`MissingExtent`](crate::memory::cache::MissingExtent) the
+    /// part fills.
+    Kept { dest: *mut u8, len: usize },
+    /// `len` bytes nobody asked for, lying between two ranges that were: read
+    /// off the connection and dropped, so one request serves both ranges.
+    Dropped { len: usize },
+}
+
+impl BodyPart {
+    pub fn len(&self) -> usize {
+        match self {
+            BodyPart::Kept { len, .. } | BodyPart::Dropped { len } => *len,
+        }
+    }
+}
+
+/// A single remote range read: one request for the bytes of `remote` from
+/// `offset` on, whose body is the `parts` one after another. The ranges it
+/// keeps need not be next to each other in memory, nor in the file.
 ///
 /// `Clone` so a transient transport failure can re-issue the same read on a
 /// fresh connection (see the engine's retry path); the clone aliases the same
-/// pinned `dest`, which is sound because only one attempt is ever in flight.
+/// pinned destinations, which is sound because only one attempt is ever in
+/// flight.
 #[derive(Clone)]
 pub(crate) struct RemoteRead {
     pub remote: Arc<RemoteFile>,
     pub offset: u64,
-    pub len: usize,
-    pub dest: *mut u8,
+    pub parts: Vec<BodyPart>,
 }
 
 impl RemoteRead {
+    /// The length of the range requested: every part, kept or dropped.
+    pub fn len(&self) -> usize {
+        self.parts.iter().map(BodyPart::len).sum()
+    }
+
     /// Expected response-body length for this block-aligned range, based on the
     /// object size recorded when `RemoteFile` was opened.
     ///
@@ -76,15 +102,78 @@ impl RemoteRead {
     /// truncated response or that the remote object no longer matches its recorded
     /// size.
     pub fn expected_body_len(&self) -> usize {
-        (self.len as u64).min(self.remote.size().saturating_sub(self.offset)) as usize
+        (self.len() as u64).min(self.remote.size().saturating_sub(self.offset)) as usize
     }
 }
 
-// SAFETY: `dest` points into a cache slot kept alive for the read's whole
-// lifetime by the originating block's `Arc<ReadBuffer>` pin; only this read
-// writes to `[dest, dest+len)` (currently-invalid sub-blocks), so moving the
-// descriptor into the engine is sound. Mirrors the file path's PendingRead.
+// SAFETY: each kept part's `dest` points into a cache slot kept alive for the
+// read's whole lifetime by the originating block's `Arc<ReadBuffer>` pin; only
+// this read writes to `[dest, dest+len)` (currently-invalid sub-blocks), so
+// moving the descriptor into the engine is sound. Mirrors the file path's
+// PendingRead.
 unsafe impl Send for RemoteRead {}
+
+/// Where the next bytes of a read's body go.
+pub(crate) enum BodyWindow {
+    /// Into memory at this pointer, for at most this many bytes.
+    Kept(*mut u8, usize),
+    /// Nowhere: at most this many bytes are to be dropped.
+    Dropped(usize),
+}
+
+/// Follows a read's parts as its body arrives: which part the next byte
+/// belongs to, and how much of that part is already in.
+#[derive(Default)]
+pub(crate) struct BodyCursor {
+    part: usize,
+    filled: usize,
+}
+
+impl BodyCursor {
+    /// Where the next body bytes go and how many of them fit there, which is
+    /// what is left of the part they belong to. Only asked while the body has
+    /// bytes to come: a response is checked to be no longer than its read.
+    pub fn window(&self, parts: &[BodyPart]) -> BodyWindow {
+        match &parts[self.part] {
+            // SAFETY: `filled` stays below the part's length (see `advance`),
+            // so the pointer stays inside the part's destination.
+            BodyPart::Kept { dest, len } => {
+                BodyWindow::Kept(unsafe { dest.add(self.filled) }, len - self.filled)
+            }
+            BodyPart::Dropped { len } => BodyWindow::Dropped(len - self.filled),
+        }
+    }
+
+    /// Account for `count` bytes having gone where [`window`](Self::window)
+    /// said, at most as many as it said fit.
+    pub fn advance(&mut self, parts: &[BodyPart], count: usize) {
+        self.filled += count;
+        debug_assert!(self.filled <= parts[self.part].len());
+        if self.filled == parts[self.part].len() {
+            self.part += 1;
+            self.filled = 0;
+        }
+    }
+
+    /// Copy `bytes`, the next of the body, to where they go, across as many
+    /// parts as they span.
+    pub fn write(&mut self, parts: &[BodyPart], mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let count = match self.window(parts) {
+                BodyWindow::Kept(dest, room) => {
+                    let count = room.min(bytes.len());
+                    // SAFETY: `dest` has room for `count` bytes of a pinned,
+                    // currently-invalid slot region only this read writes.
+                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, count) };
+                    count
+                }
+                BodyWindow::Dropped(room) => room.min(bytes.len()),
+            };
+            self.advance(parts, count);
+            bytes = &bytes[count..];
+        }
+    }
+}
 
 /// A whole-object upload. The body is reference counted so the operator-owned
 /// bytes remain stable while socket SQEs point into them, and is held as runs so
@@ -109,6 +198,15 @@ impl RemoteRequest {
         }
     }
 
+    /// The parts a read's body is made of. An upload's response body has none:
+    /// it is drained and dropped.
+    pub fn body_parts(&self) -> &[BodyPart] {
+        match self {
+            Self::Read(read) => &read.parts,
+            Self::Upload(_) => &[],
+        }
+    }
+
     pub fn request_head(&self) -> Vec<u8> {
         let remote = self.remote();
         let auth = remote.auth_header();
@@ -117,7 +215,7 @@ impl RemoteRequest {
                 remote.host_header(),
                 remote.request_target(),
                 read.offset,
-                read.len,
+                read.len(),
                 auth.as_deref(),
             ),
             Self::Upload(upload) => proto::build_upload(

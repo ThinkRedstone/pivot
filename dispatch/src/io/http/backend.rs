@@ -23,7 +23,7 @@
 //! so a fetch never blocks the dataflow worker and many run concurrently.
 
 use super::proto;
-use super::{RemoteRead, RemoteRequest, RemoteUpload};
+use super::{BodyCursor, BodyWindow, RemoteRead, RemoteRequest, RemoteUpload};
 
 const IO_CHUNK_SIZE: usize = 16 * 1024;
 
@@ -258,15 +258,15 @@ mod blocking_engine {
         }
     }
 
-    /// Issue the range GET on `conn` and read its body into `read.dest`, returning
-    /// the connection for re-pooling on success.
+    /// Issue the range GET on `conn` and read its body to where the read's
+    /// parts say it goes, returning the connection for re-pooling on success.
     fn do_read(mut conn: Conn, read: &RemoteRead) -> Result<Conn> {
         let auth = read.remote.auth_header();
         let request = proto::build_range_get(
             read.remote.host_header(),
             read.remote.request_target(),
             read.offset,
-            read.len,
+            read.len(),
             auth.as_deref(),
         );
         conn.write_all(&request)?;
@@ -305,39 +305,42 @@ mod blocking_engine {
             }
         };
 
-        let body_len = head.content_length as usize;
-        // SAFETY: dest points into the pinned cache slot for exactly this block's
-        // currently-invalid sub-blocks; body_len == the expected body length <=
-        // read.len <= the block length (validated in parse_get_response_head).
-        let dest = unsafe { std::slice::from_raw_parts_mut(read.dest, body_len) };
-
         // Drive the body through the sans-IO decoder. The range policy guarantees
         // an identity (`Content-Length`) body, so the Direct path applies: read
-        // straight into the cache slot and report the count, no intermediate
+        // straight into the cache slots and report the count, no intermediate
         // buffer. `decode` first absorbs any body bytes that arrived alongside the
         // head, and would transparently handle a chunked body too were the range
         // policy ever relaxed.
         let mut body = http1::BodyDecoder::new(head.content_length);
-        let mut written = 0usize;
+        let mut cursor = BodyCursor::default();
         let leftover = &acc[head.head_len..];
-        body.decode(leftover, |bytes| {
-            dest[written..written + bytes.len()].copy_from_slice(bytes);
-            written += bytes.len();
-        });
+        body.decode(leftover, |bytes| cursor.write(&read.parts, bytes));
 
         while !body.is_complete() {
             match body.read_plan() {
                 http1::ReadPlan::Done => break,
                 http1::ReadPlan::Direct { max } => {
-                    let cap = (max as usize).min(dest.len() - written);
-                    let n = conn.read(&mut dest[written..written + cap])?;
+                    let n = match cursor.window(&read.parts) {
+                        // SAFETY: a kept part's destination is a pinned,
+                        // currently-invalid slot region only this read writes,
+                        // and no more is read than is left of it. The body is
+                        // no longer than the read's parts (validated in
+                        // parse_get_response_head).
+                        BodyWindow::Kept(dest, room) => conn.read(unsafe {
+                            std::slice::from_raw_parts_mut(dest, room.min(max as usize))
+                        })?,
+                        BodyWindow::Dropped(room) => {
+                            let count = room.min(max as usize).min(chunk.len());
+                            conn.read(&mut chunk[..count])?
+                        }
+                    };
                     if n == 0 {
                         return Err(Error::Io(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
                             "connection closed before response body completed",
                         )));
                     }
-                    written += n;
+                    cursor.advance(&read.parts, n);
                     body.consumed(n as u64)?;
                 }
             }
@@ -637,7 +640,8 @@ mod uring_engine {
     struct HttpExchange {
         conn: Conn,
         id: Identifier,
-        dest: *mut u8,
+        /// Where the next bytes of a read's body go.
+        body_cursor: BodyCursor,
         /// The exact body size a well-formed response must carry (the requested
         /// range clamped to the object's end); head parsing rejects any other.
         expected_body_len: usize,
@@ -672,13 +676,12 @@ mod uring_engine {
 
         // Response assembly. `head_acc` accumulates header bytes until the head
         // parses; `body` is then the sans-IO decoder that tracks body progress and
-        // completion (`None` until the head is in). `body_written` is the write
-        // cursor into `dest`.
+        // completion (`None` until the head is in).
         head_acc: Vec<u8>,
         body: Option<http1::BodyDecoder>,
-        body_written: usize,
-        /// True when the last recv was posted to read straight into `dest` (a
-        /// plaintext body, zero-copy) rather than into `in_buf`.
+        /// True when the last recv was posted to read a plaintext body straight
+        /// to where `body_cursor` said it goes, rather than into `in_buf` to be
+        /// parsed or decrypted.
         recv_in_dest: bool,
         /// Whether the connection may return to the keep-alive pool when the
         /// exchange finishes (false for a response body of unknown framing).
@@ -689,15 +692,15 @@ mod uring_engine {
 
     impl HttpExchange {
         fn new(conn: Conn, id: Identifier, request: RemoteRequest, state: State) -> Self {
-            let (dest, expected_body_len) = match &request {
-                RemoteRequest::Read(read) => (read.dest, read.expected_body_len()),
-                RemoteRequest::Upload(_) => (std::ptr::null_mut(), 0),
+            let expected_body_len = match &request {
+                RemoteRequest::Read(read) => read.expected_body_len(),
+                RemoteRequest::Upload(_) => 0,
             };
             let request_bytes = request.request_head();
             Self {
                 conn,
                 id,
-                dest,
+                body_cursor: BodyCursor::default(),
                 expected_body_len,
                 request_bytes,
                 request_queued: false,
@@ -711,7 +714,6 @@ mod uring_engine {
                 sending_upload_direct: false,
                 head_acc: Vec::new(),
                 body: None,
-                body_written: 0,
                 recv_in_dest: false,
                 conn_reusable: true,
                 state,
@@ -784,16 +786,14 @@ mod uring_engine {
                 head_acc,
                 body,
                 request,
-                dest,
+                body_cursor,
                 expected_body_len,
-                body_written,
                 conn_reusable,
                 ..
             } = self;
             let Conn {
                 transport, in_buf, ..
             } = conn;
-            let dest = *dest;
             let expected_body_len = *expected_body_len;
 
             match transport {
@@ -817,9 +817,8 @@ mod uring_engine {
                             head_acc,
                             body,
                             request,
-                            dest,
+                            body_cursor,
                             expected_body_len,
-                            body_written,
                             conn_reusable,
                             &in_buf[..n],
                         )
@@ -869,21 +868,26 @@ mod uring_engine {
                                 if remaining == 0 {
                                     break;
                                 }
-                                // SAFETY: writing this block's currently-invalid,
-                                // pinned slot region; content_length ==
-                                // expected_body_len <= the block length (validated
-                                // when parsing the head).
-                                let dst = unsafe {
-                                    std::slice::from_raw_parts_mut(
-                                        dest.add(*body_written),
-                                        remaining,
-                                    )
+                                let parts = request.body_parts();
+                                let decrypted = match body_cursor.window(parts) {
+                                    // SAFETY: writing a kept part's pinned,
+                                    // currently-invalid slot region, for no more
+                                    // than is left of it. The body is no longer
+                                    // than the read's parts (validated when
+                                    // parsing the head).
+                                    BodyWindow::Kept(dest, room) => tls.reader().read(unsafe {
+                                        std::slice::from_raw_parts_mut(dest, room.min(remaining))
+                                    }),
+                                    BodyWindow::Dropped(room) => {
+                                        let count = room.min(remaining).min(header_scratch.len());
+                                        tls.reader().read(&mut header_scratch[..count])
+                                    }
                                 };
-                                match tls.reader().read(dst) {
+                                match decrypted {
                                     Ok(0) => break,
                                     Ok(m) => {
                                         decoder.consumed(m as u64)?;
-                                        *body_written += m;
+                                        body_cursor.advance(parts, m);
                                         drained += m;
                                     }
                                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -899,9 +903,8 @@ mod uring_engine {
                                             head_acc,
                                             body,
                                             request,
-                                            dest,
+                                            body_cursor,
                                             expected_body_len,
-                                            body_written,
                                             conn_reusable,
                                             &header_scratch[..m],
                                         )?;
@@ -955,9 +958,8 @@ mod uring_engine {
         head_acc: &mut Vec<u8>,
         body: &mut Option<http1::BodyDecoder>,
         request: &RemoteRequest,
-        dest: *mut u8,
+        body_cursor: &mut BodyCursor,
         expected_body_len: usize,
-        body_written: &mut usize,
         conn_reusable: &mut bool,
         chunk: &[u8],
     ) -> Result<()> {
@@ -978,17 +980,7 @@ mod uring_engine {
                 if matches!(request, RemoteRequest::Upload(_)) {
                     return;
                 }
-                // SAFETY: as in consume_received — pinned, currently-invalid slot
-                // region; total body (content_length) == expected_body_len <= the
-                // block length.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        dest.add(*body_written),
-                        bytes.len(),
-                    );
-                }
-                *body_written += bytes.len();
+                body_cursor.write(request.body_parts(), bytes);
             });
             *body = Some(decoder);
         }
@@ -1205,7 +1197,9 @@ mod uring_engine {
                             .as_mut()
                             .expect("body decoder set before a Direct recv")
                             .consumed(size as u64)?;
-                        exchange.body_written += size;
+                        exchange
+                            .body_cursor
+                            .advance(exchange.request.body_parts(), size);
                     } else {
                         exchange.consume_received(size)?;
                     }
@@ -1412,11 +1406,21 @@ mod uring_engine {
                             http1::ReadPlan::Done => 0,
                         };
                         exchange.recv_in_dest = true;
-                        // SAFETY: pinned, currently-invalid slot region; remaining
-                        // bytes are within the block (content_length ==
-                        // expected_body_len <= the block length).
-                        let a = unsafe { exchange.dest.add(exchange.body_written) } as usize;
-                        (false, a, remaining, fd)
+                        match exchange.body_cursor.window(exchange.request.body_parts()) {
+                            // A kept part's pinned, currently-invalid slot
+                            // region, for no more than is left of it.
+                            BodyWindow::Kept(dest, room) => {
+                                (false, dest as usize, room.min(remaining), fd)
+                            }
+                            // Nobody asked for these bytes: they land in the
+                            // scratch and are left there.
+                            BodyWindow::Dropped(room) => (
+                                false,
+                                exchange.conn.in_buf.as_mut_ptr() as usize,
+                                room.min(remaining).min(IO_CHUNK_SIZE),
+                                fd,
+                            ),
+                        }
                     } else {
                         exchange.recv_in_dest = false;
                         let a = exchange.conn.in_buf.as_mut_ptr() as usize;
