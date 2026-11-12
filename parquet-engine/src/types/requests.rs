@@ -5,7 +5,7 @@ use crate::types::leaves::projected_leaves;
 use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::types::projection::Projection;
 use bytes::Bytes;
-use dispatch::io::{FileRange, OpenFile, ReadResponse};
+use dispatch::io::{FileRange, OpenFile, ReadAheadCharge, ReadResponse};
 use dispatch::memory::{MultiBufferReader, ReaderPosition, Segment, memory_ctx};
 
 /// A row group's read as the fetcher issues it: for each projected leaf, the
@@ -164,7 +164,15 @@ impl RowGroupRequest {
     /// `response`, `None` for a request that [reads nothing](Self::reads_nothing).
     /// Runs on the claiming worker (the fetcher emits from the worker that
     /// admitted the request), so the buffer records it as the decode owner.
-    pub fn into_row_group_buffer(self, response: Option<ReadResponse>) -> RowGroupBuffer {
+    ///
+    /// `read_ahead_charge` is what the claim counts against its worker's
+    /// read-ahead budget, if the scan is bounded by one. The buffer carries it
+    /// to whichever worker starts on the row group.
+    pub fn into_row_group_buffer(
+        self,
+        response: Option<ReadResponse>,
+        read_ahead_charge: Option<ReadAheadCharge>,
+    ) -> RowGroupBuffer {
         let mut resolved = response
             .map(|response| response.into_locations())
             .unwrap_or_default()
@@ -202,6 +210,7 @@ impl RowGroupRequest {
             metadata: self.metadata,
             columns,
             worker_id: dispatch::worker::WORKER_IDX.get(),
+            read_ahead_charge,
         }
     }
 }
@@ -216,6 +225,10 @@ pub struct RowGroupBuffer {
     /// `RowGroupFetcher`). The middle stages may run on stealing siblings, so
     /// the id is stamped at claim time, not by whoever runs a stage.
     pub worker_id: usize,
+    /// What this row group counts against its claiming worker's read-ahead
+    /// budget, if the scan is bounded by one. It is given back when the
+    /// buffer is dropped, which is when a worker has started on the row group.
+    pub read_ahead_charge: Option<ReadAheadCharge>,
 }
 
 /// One projected column of a row group as the ring resolved it.

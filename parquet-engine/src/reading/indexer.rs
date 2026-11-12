@@ -393,6 +393,7 @@ mod tests {
                 })
                 .collect(),
             worker_id: 0,
+            read_ahead_charge: None,
         }
     }
 

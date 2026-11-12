@@ -58,9 +58,9 @@ pub fn limit_network_receive_rate(bits_per_second: u64) {
 }
 
 /// The process's limiter: the one [`limit_network_receive_rate`] set, or one
-/// for a card of the assumed rate if nothing set it. Only Linux holds reads
-/// back by it.
-#[cfg(target_os = "linux")]
+/// for a card of the assumed rate if nothing set it. Each worker also sizes
+/// its budget of remote bytes from it (see [`super::read_ahead`]). Only Linux
+/// holds reads back by it.
 pub(crate) fn process_receive_rate_limiter() -> Arc<ReceiveRateLimiter> {
     PROCESS_LIMITER
         .get_or_init(|| {
@@ -118,6 +118,11 @@ impl ReceiveRateLimiter {
             bits_per_second / 8 * rate_percent / 100,
             Duration::from_millis(ceiling_millis),
         )
+    }
+
+    /// The rate the allowance refills at.
+    pub(crate) fn bytes_per_second(&self) -> u64 {
+        self.bytes_per_second
     }
 
     /// Take `len` bytes from the allowance as of `now`, or report how long

@@ -332,6 +332,10 @@ pub struct DataFlow {
     /// once at construction so the hot loop only polls the (usually empty) list,
     /// never every operator. An entry is dropped once it has fired.
     upstream_cancellers: Vec<(usize, Arc<AtomicBool>)>,
+    /// Operators that issue reads when asked to saturate the available IO (see
+    /// [`Operator::saturates_available_io`]), in the order CPU work visits
+    /// them. Collected once at construction, like `upstream_cancellers`.
+    io_saturators: Vec<usize>,
     /// Collects this worker's execution stats for the dataflow. Inert unless the
     /// query opted in; driven by the worker through [`stats`](Self::stats).
     stats: StatsCollector,
@@ -412,13 +416,26 @@ impl DataFlow {
             memory_ctx().register_dataflow_evictors(id, evictors);
         }
 
-        let graph = OperatorGraph::from_edges(
+        let mut graph = OperatorGraph::from_edges(
             id,
             registered_evictors,
             operators,
             publisher_to_subscriber,
             gates,
         );
+        // Every node is looked at, gated ones too: a gate only says when an
+        // operator starts, not what it will do once it has.
+        let mut io_saturators = Vec::new();
+        let Ok(_) = graph.graph.traverse_backwards(|idx, node| {
+            let saturates = node
+                .operator
+                .as_ref()
+                .is_some_and(|operator| operator.saturates_available_io());
+            if saturates && !io_saturators.contains(&idx) {
+                io_saturators.push(idx);
+            }
+            Ok::<ControlFlow<()>, std::convert::Infallible>(ControlFlow::Continue(()))
+        });
         let upstream_cancellers = graph
             .nodes()
             .iter()
@@ -434,6 +451,7 @@ impl DataFlow {
             id,
             graph,
             upstream_cancellers,
+            io_saturators,
             cancelled: canceled,
             err_tx,
             stats: StatsCollector::new(stats_tx, collect_stats),
@@ -681,6 +699,32 @@ impl DataFlow {
                 })
             })?;
             Ok(spiller.buffers_spilled())
+        })
+    }
+
+    /// Have one operator issue one more piece of remote IO, asking those that
+    /// can in the order CPU work visits them. Returns [`WorkStatus::Ran`] if
+    /// one did. A dataflow with no such operator (the common case) costs a
+    /// single `is_empty` check.
+    pub fn saturate_available_io(&mut self, requester: &RefCell<IORequester>) -> WorkStatus {
+        if self.io_saturators.is_empty() {
+            return WorkStatus::Pending;
+        }
+        self.try_run_or(WorkStatus::Pending, |d| {
+            let mut io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_request_id);
+            for &node_id in &d.io_saturators {
+                io.set_operator_idx(node_id);
+                let issued = d.graph.node_mut(node_id).run(&mut |_, operator| {
+                    Ok(match operator.saturate_available_io(&mut io)? {
+                        WorkStatus::Ran => ControlFlow::Break(()),
+                        WorkStatus::Pending => ControlFlow::Continue(()),
+                    })
+                })?;
+                if matches!(issued, Some(ControlFlow::Break(()))) {
+                    return Ok(WorkStatus::Ran);
+                }
+            }
+            Ok(WorkStatus::Pending)
         })
     }
 

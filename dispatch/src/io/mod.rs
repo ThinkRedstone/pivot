@@ -57,6 +57,9 @@ pub use disk_cache::{DiskCache, clear_disk_cache};
 
 pub mod http;
 
+mod read_ahead;
+pub use read_ahead::{ReadAheadBudget, ReadAheadCharge};
+
 mod receive_rate;
 pub use receive_rate::{
     ASSUMED_NETWORK_BITS_PER_SECOND, ReceiveRateLimiter, limit_network_receive_rate,

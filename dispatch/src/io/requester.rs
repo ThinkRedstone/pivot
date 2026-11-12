@@ -238,6 +238,8 @@ pub struct IORequester {
     /// than returned, so that one caller can take only the completions it is
     /// after and leave the rest for the worker's next pass.
     completed: Vec<std::result::Result<Completion, FailedIO>>,
+    /// This worker's budget of remote bytes asked for and not yet started on.
+    read_ahead: crate::io::ReadAheadBudget,
 }
 
 impl Default for IORequester {
@@ -264,6 +266,7 @@ impl IORequester {
             http: CachedHttpEngine::with_default_config(disk_cache)
                 .expect("Unable to create http engine"),
             completed: Vec::new(),
+            read_ahead: crate::io::ReadAheadBudget::for_this_worker(),
         }
     }
 
@@ -288,6 +291,7 @@ impl IORequester {
             http: CachedHttpEngine::new(http_config, disk_cache)
                 .expect("Unable to create http engine"),
             completed: Vec::new(),
+            read_ahead: crate::io::ReadAheadBudget::for_this_worker(),
         }
     }
 
@@ -992,6 +996,25 @@ impl IORequester {
     /// Returns `true` if any HTTP operation is in flight.
     pub fn has_http_pending(&self) -> bool {
         self.http.has_network_pending()
+    }
+
+    /// Whether this worker has asked for less than its read-ahead budget, so
+    /// its operators may issue more remote reads.
+    pub fn has_read_ahead_room(&self) -> bool {
+        self.read_ahead.has_room()
+    }
+
+    /// Count `bytes` against this worker's read-ahead budget until the
+    /// returned charge is dropped.
+    pub fn charge_read_ahead(&self, bytes: usize) -> crate::io::ReadAheadCharge {
+        self.read_ahead.charge(bytes)
+    }
+
+    /// Give this worker a read-ahead budget of `budget_bytes`, so a test
+    /// controls how much it may ask for.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn force_read_ahead_budget(&mut self, budget_bytes: usize) {
+        self.read_ahead = crate::io::ReadAheadBudget::of_bytes(budget_bytes);
     }
 
     /// Number of HTTP operations issued but not yet completed — the depth a

@@ -159,6 +159,24 @@ pub trait Operator {
     /// ready. May be called many times until it reports [`FinishStatus::Done`].
     fn try_finish(&mut self) -> Result<FinishStatus>;
 
+    /// Whether this operator issues reads through
+    /// [`saturate_available_io`](Self::saturate_available_io). A *capability*
+    /// declaration, made once at build time: the `DataFlow` records the
+    /// operators that do and asks only them, so the others cost nothing in the
+    /// hot loop.
+    fn saturates_available_io(&self) -> bool {
+        false
+    }
+
+    /// Issue one more piece of remote IO if there is any to issue. The worker
+    /// calls this while it has asked for less than its read-ahead budget (see
+    /// [`crate::io::ReadAheadBudget`]), whether or not it has CPU work: what
+    /// it asks for now is what it will have to work on once a read's time has
+    /// passed. Returns [`WorkStatus::Ran`] if it issued something.
+    fn saturate_available_io(&mut self, _io: &mut OperatorIO) -> Result<WorkStatus> {
+        Ok(WorkStatus::Pending)
+    }
+
     /// Try to steal work from a peer worker's channel. Default: no stealing.
     fn try_steal_work(&mut self, _io: &mut OperatorIO) -> Result<WorkStatus> {
         Ok(WorkStatus::Pending)

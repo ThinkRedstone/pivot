@@ -24,19 +24,19 @@
 pub struct RowGroupFetcherFactory {
     projection: std::sync::Arc<crate::types::projection::Projection>,
     pending_row_groups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    max_pending_row_groups: usize,
+    claim_bound: ClaimBound,
 }
 
 impl RowGroupFetcherFactory {
     pub fn new(
         projection: std::sync::Arc<crate::types::projection::Projection>,
         pending_row_groups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        max_pending_row_groups: usize,
+        claim_bound: ClaimBound,
     ) -> Self {
         Self {
             projection,
             pending_row_groups,
-            max_pending_row_groups,
+            claim_bound,
         }
     }
 }
@@ -50,12 +50,12 @@ impl dispatch::UnaryFactory<crate::types::metadata::QueryRowGroupMetadata, crate
         Built::new(RowGroupFetcher::new(
             self.projection,
             self.pending_row_groups,
-            self.max_pending_row_groups,
+            self.claim_bound,
         ))
     }
 }
 mod fetcher;
-pub use fetcher::pending_claim_bound;
+pub use fetcher::{ClaimBound, pending_claim_bound};
 
 mod table_source;
 use crate::reading::fetching::fetcher::RowGroupFetcher;

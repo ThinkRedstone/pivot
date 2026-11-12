@@ -142,6 +142,8 @@ pub struct Worker {
     data_flow_queue: Receiver<DataFlowBuilder>,
     /// A mapping of dataflows currently running
     data_flows: HashMap<Identifier, DataFlow>,
+    /// Which dataflow is offered read-ahead room first on the next pass.
+    next_saturating_flow: usize,
     /// Did the worker do work on last iteration? This is used to decide whether the worker should
     /// do background tasks, just as cleaning
     did_work_last_iteration: bool,
@@ -229,6 +231,7 @@ impl Worker {
                     io: Rc::new(RefCell::new(IORequester::new(disk_cache))),
                     id: core.id,
                     data_flows: Default::default(),
+                    next_saturating_flow: 0,
                     data_flow_queue: receiver,
                     did_work_last_iteration: false,
                     should_exit,
@@ -318,6 +321,48 @@ impl Worker {
             if wanted == 0 {
                 return;
             }
+        }
+    }
+
+    /// While this worker has asked for less than its read-ahead budget, have
+    /// each dataflow issue one more piece of remote IO. It runs ahead of the
+    /// CPU work and whether or not there is any: what the worker asks for now
+    /// is what it has to work on once a read's time has passed, so a worker
+    /// that asked only when it ran out of work would then sit waiting.
+    ///
+    /// The dataflows share the worker's budget, so each pass starts from the
+    /// next one in turn: when room opens for one read at a time, the same
+    /// dataflow would otherwise take it every time.
+    fn saturate_available_io(&mut self) {
+        if self.data_flows.is_empty() || !self.io.borrow().has_read_ahead_room() {
+            return;
+        }
+        let first = self.next_saturating_flow % self.data_flows.len();
+        self.next_saturating_flow = self.next_saturating_flow.wrapping_add(1);
+        let io = &self.io;
+        let mut issued = false;
+        let mut offer_room = |flow: &mut DataFlow| {
+            #[cfg(feature = "perf")]
+            if Self::paused_for_profiling(flow) {
+                return;
+            }
+            // Asked on its own line: the requester must not stay borrowed
+            // while the dataflow's operators borrow it to issue their reads.
+            let has_room = io.borrow().has_read_ahead_room();
+            if has_room && let WorkStatus::Ran = flow.saturate_available_io(io) {
+                issued = true;
+            }
+        };
+        self.data_flows
+            .values_mut()
+            .skip(first)
+            .for_each(&mut offer_room);
+        self.data_flows
+            .values_mut()
+            .take(first)
+            .for_each(&mut offer_room);
+        if issued {
+            self.did_work_last_iteration = true;
         }
     }
 
@@ -616,6 +661,8 @@ impl Worker {
             self.process_io_completions()?;
 
             self.maybe_spill();
+
+            self.saturate_available_io();
 
             self.step_run_ready_cpu_work();
 
