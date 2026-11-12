@@ -33,6 +33,23 @@ use crate::memory::cache::MissingExtent;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
+use crate::io::http::HTTP_TAG;
+#[cfg(target_os = "linux")]
+use crate::io::receive_rate::{ReceiveRateLimiter, process_receive_rate_limiter};
+#[cfg(target_os = "linux")]
+use io_uring::{opcode, types};
+#[cfg(target_os = "linux")]
+use std::collections::VecDeque;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
+
+/// The `user_data` of the timeout that wakes a worker's ring once the receive
+/// allowance covers its oldest held fetch. It carries [`HTTP_TAG`] so the
+/// requester routes it here, and a bit no exchange slot or step deadline uses.
+#[cfg(target_os = "linux")]
+const RECEIVE_ALLOWANCE_TIMER: u64 = HTTP_TAG | (1 << 61);
+
 type Result<T> = std::result::Result<T, Error>;
 
 /// One drained read result: a completion or a terminal failure, matching
@@ -68,6 +85,27 @@ pub(crate) struct CachedHttpEngine {
     /// Write-backs populating the cache file after an HTTP piece landed (backend
     /// disk-id space). Each holds the slot pin until the write has read it.
     cache_writes: HashMap<Identifier, CacheWrite>,
+
+    /// The process's receive allowance: every network fetch takes its length
+    /// from it before it is issued.
+    #[cfg(target_os = "linux")]
+    receive_limiter: Arc<ReceiveRateLimiter>,
+    /// Network fetches the allowance has not covered yet, oldest first. Each
+    /// is already tracked in `http_reads`; only its request is still to go out.
+    /// A cancelled dataflow's held fetches are issued in their turn all the
+    /// same, like its fetches already in flight.
+    #[cfg(target_os = "linux")]
+    held_fetches: VecDeque<(Identifier, RemoteRead)>,
+    /// How long the armed allowance timer waits. Boxed so the address its SQE
+    /// carries stays put.
+    #[cfg(target_os = "linux")]
+    allowance_wait: Box<types::Timespec>,
+    /// Whether a [`RECEIVE_ALLOWANCE_TIMER`] is in flight. Fetches are held
+    /// only while one is: the allowance grows with time, not with anything
+    /// completing, so a worker with nothing else in flight has only this to
+    /// bring it back to its held fetches.
+    #[cfg(target_os = "linux")]
+    allowance_timer_armed: bool,
 }
 
 /// The overarching record for one remote read an operator requested, in flight as
@@ -125,7 +163,22 @@ impl CachedHttpEngine {
             http_uploads: HashMap::new(),
             next_http_id: 0,
             cache_writes: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            receive_limiter: process_receive_rate_limiter(),
+            #[cfg(target_os = "linux")]
+            held_fetches: VecDeque::new(),
+            #[cfg(target_os = "linux")]
+            allowance_wait: Box::new(types::Timespec::new()),
+            #[cfg(target_os = "linux")]
+            allowance_timer_armed: false,
         })
+    }
+
+    /// Take network fetches from `limiter` instead of the process's allowance,
+    /// so a test controls the rate.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn force_receive_rate_limiter(&mut self, limiter: Arc<ReceiveRateLimiter>) {
+        self.receive_limiter = limiter;
     }
 
     pub fn with_default_config(disk_cache: Option<Arc<DiskCache>>) -> Result<Self> {
@@ -211,7 +264,7 @@ impl CachedHttpEngine {
                     dest: block.dest(),
                 };
                 let expected_body_len = remote_read.expected_body_len();
-                self.start_http(backend, id, remote_read)?;
+                self.issue_or_hold_fetch(backend, id, remote_read)?;
                 self.http_reads.insert(
                     id,
                     HttpRead {
@@ -240,6 +293,103 @@ impl CachedHttpEngine {
             },
         );
         Ok(split)
+    }
+
+    /// Issue a network fetch if the receive allowance covers it, and hold it
+    /// back otherwise. A fetch never overtakes one already held: the oldest
+    /// would wait on every later, smaller one that still fits.
+    #[cfg(target_os = "linux")]
+    fn issue_or_hold_fetch(
+        &mut self,
+        backend: &mut IOBackend,
+        id: Identifier,
+        read: RemoteRead,
+    ) -> Result<()> {
+        if !self.held_fetches.is_empty() {
+            self.held_fetches.push_back((id, read));
+            return Ok(());
+        }
+        match self.take_receive_allowance(&read) {
+            Ok(()) => self.start_http(backend, id, read),
+            Err(wait) => {
+                // Armed before the fetch is queued: a fetch left in the queue
+                // after its caller was told it failed would be issued later
+                // into a slot its caller has given up.
+                if !self.allowance_timer_armed {
+                    self.arm_allowance_timer(backend, wait)?;
+                }
+                self.held_fetches.push_back((id, read));
+                Ok(())
+            }
+        }
+    }
+
+    /// Off Linux nothing limits the receive rate, so every fetch is issued.
+    #[cfg(not(target_os = "linux"))]
+    fn issue_or_hold_fetch(
+        &mut self,
+        backend: &mut IOBackend,
+        id: Identifier,
+        read: RemoteRead,
+    ) -> Result<()> {
+        self.start_http(backend, id, read)
+    }
+
+    /// Take the bytes `read` will receive from the receive allowance, or
+    /// report how long until it covers them.
+    #[cfg(target_os = "linux")]
+    fn take_receive_allowance(&self, read: &RemoteRead) -> std::result::Result<(), Duration> {
+        self.receive_limiter
+            .try_take(read.expected_body_len(), Instant::now())
+    }
+
+    /// Issue held fetches, oldest first, for as long as the receive allowance
+    /// covers them, and wake the ring again when it will cover the next. A
+    /// fetch that cannot be started fails its read.
+    #[cfg(target_os = "linux")]
+    fn issue_held_fetches(
+        &mut self,
+        backend: &mut IOBackend,
+        out: &mut Vec<ReadResult>,
+    ) -> Result<()> {
+        while let Some((_, read)) = self.held_fetches.front() {
+            if let Err(wait) = self.take_receive_allowance(read) {
+                if !self.allowance_timer_armed {
+                    self.arm_allowance_timer(backend, wait)?;
+                }
+                break;
+            }
+            let (id, read) = self
+                .held_fetches
+                .pop_front()
+                .expect("the fetch just inspected at the front");
+            if let Err(error) = self.start_http(backend, id, read) {
+                self.fail_http_read(id, error, out);
+            }
+        }
+        Ok(())
+    }
+
+    /// Have the ring complete an entry after `wait`, so a worker blocked on it
+    /// with nothing else in flight comes back to its held fetches.
+    #[cfg(target_os = "linux")]
+    fn arm_allowance_timer(&mut self, backend: &mut IOBackend, wait: Duration) -> Result<()> {
+        *self.allowance_wait = types::Timespec::new()
+            .sec(wait.as_secs())
+            .nsec(wait.subsec_nanos());
+        let timer = opcode::Timeout::new(&*self.allowance_wait as *const types::Timespec)
+            .build()
+            .user_data(RECEIVE_ALLOWANCE_TIMER);
+        unsafe {
+            backend
+                .ring
+                .submission()
+                .push(&timer)
+                .map_err(|_| crate::io::backend::Error::SubmissionQueueFull)?;
+        }
+        backend.submit()?;
+        self.allowance_timer_armed = true;
+        Ok(())
     }
 
     /// Hand a remote read to the engine (ring-driven on Linux, synchronous else).
@@ -308,6 +458,11 @@ impl CachedHttpEngine {
         user_data: u64,
         result: i32,
     ) -> Result<()> {
+        if user_data == RECEIVE_ALLOWANCE_TIMER {
+            // The drain of this pass issues what the allowance now covers.
+            self.allowance_timer_armed = false;
+            return Ok(());
+        }
         self.http.on_cqe(&mut backend.ring, user_data, result)?;
         Ok(())
     }
@@ -345,6 +500,8 @@ impl CachedHttpEngine {
         disk_id: &mut Identifier,
         out: &mut Vec<ReadResult>,
     ) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        self.issue_held_fetches(backend, out)?;
         // Before the completions: a piece issued again and finished within one
         // pass is still tracked here, so its read is billed the re-issue. A read
         // a sibling piece already failed is gone, with nothing left to bill.
@@ -364,21 +521,8 @@ impl CachedHttpEngine {
             }
         }
         for (id, error) in self.http.take_failed() {
-            if let Some(http_read) = self.http_reads.remove(&id)
-                && let Some(request) = self.fail_read(http_read.read)
-            {
-                request
-                    .request
-                    .block
-                    .remove_from_cache(&crate::io::OpenFile::Remote(
-                        request.request.remote.clone(),
-                    ));
-                out.push(Err(FailedIO {
-                    data_flow_id: request.data_flow_id,
-                    operator_idx: request.operator_idx,
-                    pending_read_id: request.pending_read_id,
-                    error: error.into(),
-                }));
+            if self.http_reads.contains_key(&id) {
+                self.fail_http_read(id, error.into(), out);
             } else if let Some(upload) = self.http_uploads.remove(&id) {
                 out.push(Err(FailedIO {
                     data_flow_id: upload.data_flow_id,
@@ -391,7 +535,28 @@ impl CachedHttpEngine {
         Ok(())
     }
 
-    /// `true` while any HTTP GET or upload is in flight.
+    /// Fail the read the network piece `id` belongs to: its extent leaves the
+    /// cache so the next reader starts a fill of its own, and the owning
+    /// dataflow is told. A read a sibling piece already failed is gone, and
+    /// has been reported.
+    fn fail_http_read(&mut self, id: Identifier, error: Error, out: &mut Vec<ReadResult>) {
+        if let Some(http_read) = self.http_reads.remove(&id)
+            && let Some(request) = self.fail_read(http_read.read)
+        {
+            request
+                .request
+                .block
+                .remove_from_cache(&crate::io::OpenFile::Remote(request.request.remote.clone()));
+            out.push(Err(FailedIO {
+                data_flow_id: request.data_flow_id,
+                operator_idx: request.operator_idx,
+                pending_read_id: request.pending_read_id,
+                error,
+            }));
+        }
+    }
+
+    /// `true` while any HTTP GET or upload is in flight or held back.
     pub fn has_network_pending(&self) -> bool {
         self.http.has_active() || !self.http_reads.is_empty() || !self.http_uploads.is_empty()
     }

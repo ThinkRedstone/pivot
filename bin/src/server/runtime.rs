@@ -134,6 +134,7 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
         .workers
         .unwrap_or_else(dispatch::default_worker_count);
     info!(workers, "initialising dispatch");
+    crate::network::limit_remote_reads_to_network_bandwidth(config.network_bandwidth);
     let disk_cache = config
         .disk_cache
         .as_ref()

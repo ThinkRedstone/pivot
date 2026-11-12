@@ -318,6 +318,13 @@ impl IORequester {
         self.fs_queues.force(queue);
     }
 
+    /// Take remote reads from `limiter` instead of the process's receive
+    /// allowance, so a test controls the rate.
+    #[cfg(all(test, target_os = "linux"))]
+    fn force_receive_rate_limiter(&mut self, limiter: Arc<crate::io::ReceiveRateLimiter>) {
+        self.http.force_receive_rate_limiter(limiter);
+    }
+
     /// Resolve one logical read through the memory caches and immediately submit
     /// every physical cache fill it still needs.
     pub fn request_read(
@@ -1410,6 +1417,7 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
     use url::Url;
 
@@ -2324,6 +2332,33 @@ mod tests {
 
         fetch(&mut requester, &loc, 0, 4096);
 
+        assert_cached(&loc, 0, 4096);
+    }
+
+    /// Hold `requester`'s remote reads to a receive allowance that, as of
+    /// `now`, owes one 4 KiB read and takes `payoff_time` to pay it off.
+    #[cfg(target_os = "linux")]
+    fn owe_one_read(requester: &mut IORequester, payoff_time: Duration, now: Instant) {
+        let limiter = crate::io::ReceiveRateLimiter::new(4096 * 20, payoff_time);
+        limiter.try_take(2 * 4096, now).unwrap();
+        requester.force_receive_rate_limiter(Arc::new(limiter));
+    }
+
+    /// A read issued while the receive allowance is owing is held until the
+    /// allowance has grown back, and then completes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_read_past_the_receive_allowance_waits_for_it_to_refill() {
+        init_test_free_pool(16);
+        let loc = remote_loc(spawn_server(1));
+        let mut requester = IORequester::with_http_config(client_config());
+        let payoff_time = Duration::from_millis(50);
+        let started_at = Instant::now();
+        owe_one_read(&mut requester, payoff_time, started_at);
+
+        fetch(&mut requester, &loc, 0, 4096);
+
+        assert!(started_at.elapsed() >= payoff_time);
         assert_cached(&loc, 0, 4096);
     }
 

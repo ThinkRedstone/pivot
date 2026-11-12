@@ -17,5 +17,6 @@
 pub mod execution;
 pub mod logging;
 pub mod memory;
+pub mod network;
 pub mod server;
 pub mod shell;

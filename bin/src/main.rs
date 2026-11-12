@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use bin::memory::MemoryBudget;
+use bin::network::Bandwidth;
 use bin::shell::{ShellInput, ShellTarget};
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
@@ -83,6 +84,12 @@ enum PivotCommand {
         #[arg(long, value_name = "DIRECTORY")]
         spill_directory: Option<PathBuf>,
 
+        /// What the machine's network card may carry, such as 50gbit: remote
+        /// reads are requested no faster. Defaults to the rate published for
+        /// the instance type the shell runs on.
+        #[arg(long, value_name = "RATE")]
+        network_bandwidth: Option<Bandwidth>,
+
         /// Run COMMAND (SQL or a backslash command) and exit instead of
         /// starting the prompt. Repeatable; runs in order with every -f.
         #[arg(short = 'c', long = "command", value_name = "COMMAND")]
@@ -127,12 +134,14 @@ fn run() -> Result<(), Error> {
             memory,
             workers,
             spill_directory,
+            network_bandwidth,
             commands,
             files,
         } => {
             let (_, open_matches) = matches
                 .subcommand()
                 .expect("clap parsed the open subcommand");
+            bin::network::limit_remote_reads_to_network_bandwidth(network_bandwidth);
             bin::shell::run_with_limits(
                 build_shell_target(kind, datastore_location, warehouse)?,
                 bin::shell::ShellLimits {

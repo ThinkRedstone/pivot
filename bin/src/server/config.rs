@@ -14,6 +14,7 @@
 //! memory: 32g
 //! workers: 16
 //! spill_directory: /var/lib/pivot/spill
+//! network_bandwidth: 50gbit
 //! datastore_refresh_interval: 30s
 //! log: info
 //! disk_cache:
@@ -62,6 +63,7 @@ use metastore_disk::{
 use serde::Deserialize;
 
 use crate::memory::MemoryBudget;
+use crate::network::Bandwidth;
 
 /// The address the PostgreSQL endpoint binds to when `bind` is not set. Loopback
 /// so an unconfigured server is not exposed to the network.
@@ -94,6 +96,10 @@ pub struct Config {
     /// spills rows to. Omit it and nothing is spilled: such a query fails
     /// instead. The server checks at startup that spill files work in it.
     pub spill_directory: Option<PathBuf>,
+    /// What the machine's network card may carry, such as `50gbit`: remote
+    /// reads are requested no faster. Omitted, the server looks it up from the
+    /// instance type it runs on.
+    pub network_bandwidth: Option<Bandwidth>,
     /// How often every datastore brings itself up to date with its store:
     /// the tables it has, and each table's committed files. For shared remote
     /// stores, this bounds how stale a query's view of another process's
@@ -129,6 +135,7 @@ struct RawConfig {
     memory: MemoryBudget,
     workers: Option<usize>,
     spill_directory: Option<PathBuf>,
+    network_bandwidth: Option<Bandwidth>,
     #[serde(default = "default_datastore_refresh_interval")]
     datastore_refresh_interval: Interval,
     disk_cache: Option<DiskCacheConfig>,
@@ -159,6 +166,7 @@ impl From<RawConfig> for Config {
             memory: raw.memory,
             workers: raw.workers,
             spill_directory: raw.spill_directory,
+            network_bandwidth: raw.network_bandwidth,
             datastore_refresh_interval: raw.datastore_refresh_interval,
             disk_cache: raw.disk_cache,
             log: raw.log,
@@ -339,6 +347,25 @@ mod tests {
         let config = Config::from_yaml(yaml, "config.example.yaml").unwrap();
 
         assert_eq!(config.server.bind, "127.0.0.1:5432".parse().unwrap());
+    }
+
+    #[test]
+    fn a_network_bandwidth_is_read_in_decimal_bits_per_second() {
+        let config = from_yaml_with("network_bandwidth: 12.5gbit\n").unwrap();
+
+        assert_eq!(
+            config.network_bandwidth,
+            Some(Bandwidth {
+                bits_per_second: 12_500_000_000
+            })
+        );
+    }
+
+    #[test]
+    fn a_network_bandwidth_without_a_unit_is_rejected() {
+        let result = from_yaml_with("network_bandwidth: \"50\"\n");
+
+        assert!(result.is_err());
     }
 
     #[test]
