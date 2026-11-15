@@ -19,6 +19,12 @@
 //!
 //! The process's receive rate limit still decides when each read goes out (see
 //! [`super::receive_rate`]). This only decides how much a worker asks for.
+//!
+//! A worker has a second budget for what it reads from local disks, of
+//! [`DISK_READ_AHEAD_BYTES`]. A disk answers in far less time than a store,
+//! so there is little to hide: the budget is about one row group, the one
+//! read while the worker works on the one before it. Asking for more only
+//! queues work behind one worker that another could have taken.
 
 use crate::worker::WORKER_IDX;
 use std::sync::Arc;
@@ -31,7 +37,22 @@ use std::time::Duration;
 /// it shorter leaves the card idle. Read from `PIVOT_REMOTE_READ_TIME_MS`.
 const DEFAULT_REMOTE_READ_TIME_MILLIS: u64 = 100;
 
-/// One worker's budget of remote bytes asked for and not yet started on.
+/// What one worker may have asked for from local disks and not yet started
+/// on. A claim may take the worker past its budget, so this lets it hold one
+/// row group, or a few whose projected columns are smaller than this together.
+const DISK_READ_AHEAD_BYTES: usize = 1 << 20;
+
+/// Where a read's bytes come from, which decides the budget it counts against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadMedium {
+    /// A disk of the machine.
+    Disk,
+    /// Object storage, over the network.
+    Network,
+}
+
+/// One worker's budget of bytes asked for from one medium and not yet started
+/// on.
 pub struct ReadAheadBudget {
     budget_bytes: usize,
     /// The bytes charged and not yet released. Shared with every charge,
@@ -54,18 +75,24 @@ impl ReadAheadBudget {
         Self::of_bytes(card_bytes as usize / worker_count)
     }
 
-    /// The budget of the worker this runs on: its share of the rate the
-    /// process requests remote reads at.
-    pub(crate) fn for_this_worker() -> Self {
-        let read_time_millis = crate::env::get_env_var_with_default(
-            "PIVOT_REMOTE_READ_TIME_MS",
-            DEFAULT_REMOTE_READ_TIME_MILLIS,
-        );
-        Self::for_receive_rate(
-            super::receive_rate::process_receive_rate_limiter().bytes_per_second(),
-            Duration::from_millis(read_time_millis),
-            crate::worker::NUM_WORKERS.get(),
-        )
+    /// The budget of the worker this runs on for reads from `medium`: a
+    /// constant for disks, and its share of the rate the process requests
+    /// remote reads at for the network.
+    pub(crate) fn for_this_worker(medium: ReadMedium) -> Self {
+        match medium {
+            ReadMedium::Disk => Self::of_bytes(DISK_READ_AHEAD_BYTES),
+            ReadMedium::Network => {
+                let read_time_millis = crate::env::get_env_var_with_default(
+                    "PIVOT_REMOTE_READ_TIME_MS",
+                    DEFAULT_REMOTE_READ_TIME_MILLIS,
+                );
+                Self::for_receive_rate(
+                    super::receive_rate::process_receive_rate_limiter().bytes_per_second(),
+                    Duration::from_millis(read_time_millis),
+                    crate::worker::NUM_WORKERS.get(),
+                )
+            }
+        }
     }
 
     /// A budget of `budget_bytes` for the worker this runs on.

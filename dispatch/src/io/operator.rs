@@ -233,12 +233,21 @@ impl<'a> OperatorIO<'a> {
         Ok(id)
     }
 
-    /// Count `bytes` against this worker's read-ahead budget until the
-    /// returned charge is dropped. For an operator that issues its reads when
-    /// asked to saturate the available IO, which only a worker with a budget
-    /// asks.
-    pub fn charge_read_ahead(&self, bytes: usize) -> crate::io::ReadAheadCharge {
-        self.requester.borrow().charge_read_ahead(bytes)
+    /// Count `bytes` against this worker's read-ahead budget for `medium`
+    /// until the returned charge is dropped. For an operator that issues its
+    /// reads when asked to saturate the available IO.
+    pub fn charge_read_ahead(
+        &self,
+        medium: crate::io::ReadMedium,
+        bytes: usize,
+    ) -> crate::io::ReadAheadCharge {
+        self.requester.borrow().charge_read_ahead(medium, bytes)
+    }
+
+    /// Whether this worker has asked for less than its read-ahead budget for
+    /// `medium`.
+    pub fn has_read_ahead_room(&self, medium: crate::io::ReadMedium) -> bool {
+        self.requester.borrow().has_read_ahead_room(medium)
     }
 
     /// Write `data` to a local file or remote object. Returns the id the
@@ -339,19 +348,21 @@ impl TestOperatorIO {
         }
     }
 
-    /// A handle whose worker has a read-ahead budget of `budget_bytes`.
-    pub fn with_read_ahead_budget(budget_bytes: usize) -> Self {
+    /// A handle whose worker has a read-ahead budget of `budget_bytes` for
+    /// `medium`.
+    pub fn with_read_ahead_budget(medium: crate::io::ReadMedium, budget_bytes: usize) -> Self {
         let test_io = Self::default();
         test_io
             .requester
             .borrow_mut()
-            .force_read_ahead_budget(budget_bytes);
+            .force_read_ahead_budget(medium, budget_bytes);
         test_io
     }
 
-    /// Whether the worker has asked for less than its read-ahead budget.
-    pub fn has_read_ahead_room(&self) -> bool {
-        self.requester.borrow().has_read_ahead_room()
+    /// Whether the worker has asked for less than its read-ahead budget for
+    /// `medium`.
+    pub fn has_read_ahead_room(&self, medium: crate::io::ReadMedium) -> bool {
+        self.requester.borrow().has_read_ahead_room(medium)
     }
 
     pub fn io(&mut self) -> OperatorIO<'_> {

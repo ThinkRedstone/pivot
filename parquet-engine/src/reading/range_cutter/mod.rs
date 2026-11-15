@@ -35,10 +35,6 @@ pub struct RangeCutterFactory {
     pub projection: Projection,
     /// Pushed-down equality predicates for dictionary pruning (may be empty).
     pub eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
-    /// This worker's claimed-but-not-yet-cut row-group count, shared with
-    /// its fetcher; decremented as row groups are cut or pruned so the
-    /// fetcher's claim backpressure releases (see `RowGroupFetcher`).
-    pub pending_row_groups: Arc<AtomicUsize>,
     /// The scan's claimed-but-not-yet-decoded row-group count, shared with
     /// the row-group injector, which throttles the speculative claims of an
     /// unarmed Top-N scan against it. A row group counts until its last
@@ -56,7 +52,6 @@ impl UnaryFactory<DecompressedPage, DecodeRange> for RangeCutterFactory {
         Built::new(RangeCutter::new(
             self.projection,
             self.eq_predicates,
-            self.pending_row_groups,
             self.outstanding_row_groups,
             self.allocator,
         ))
@@ -84,7 +79,6 @@ pub struct RangeCutter {
     /// Row groups whose ranges are all emitted or that were pruned; a page
     /// arriving late for one is dropped.
     closed: HashSet<usize>,
-    pending_row_groups: Arc<AtomicUsize>,
     outstanding_row_groups: Arc<AtomicUsize>,
 }
 
@@ -92,7 +86,6 @@ impl RangeCutter {
     pub fn new(
         projection: Projection,
         eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
-        pending_row_groups: Arc<AtomicUsize>,
         outstanding_row_groups: Arc<AtomicUsize>,
         allocator: Arc<WorkerAllocator>,
     ) -> Self {
@@ -102,21 +95,8 @@ impl RangeCutter {
             allocator,
             open: HashMap::default(),
             closed: HashSet::default(),
-            pending_row_groups,
             outstanding_row_groups,
         }
-    }
-
-    /// Mark one claimed row group fully cut (or pruned), releasing its
-    /// share of the fetcher's claim backpressure.
-    fn release_claim(&self) {
-        let previous = self.pending_row_groups.fetch_sub(1, Ordering::Relaxed);
-        // An underflow means this cutter released a claim its own fetcher
-        // never made, i.e. the row group's pages landed on a different worker
-        // than its claimer. Besides breaking the accounting (the wrapped
-        // counter permanently stops the worker's claims), it would mean the
-        // claim/cut pairing contract broke.
-        debug_assert!(previous > 0, "released a row-group claim never made");
     }
 
     /// Forgets `row_group_index`: its pages from here on are dropped. A row
@@ -128,7 +108,6 @@ impl RangeCutter {
             .remove(&row_group_index)
             .expect("a row group is closed once");
         self.closed.insert(row_group_index);
-        self.release_claim();
         if open.pages.range_count() == 0 || open.pages.metadata().is_pruned() {
             self.outstanding_row_groups.fetch_sub(1, Ordering::Relaxed);
         }
@@ -372,46 +351,40 @@ mod tests {
         assert_eq!(ranges.len(), 1);
     }
 
-    /// The fetcher's claim is released once the row group is cut; the scan's
-    /// outstanding count once its last range is decoded.
+    /// The scan's outstanding count is released once the row group's last
+    /// range is decoded.
     #[test]
-    fn the_claim_is_released_after_the_last_range() {
+    fn the_outstanding_count_is_released_after_the_last_range_is_decoded() {
         init_test_free_pool(4);
         let table = make_test_table(i32_schema(&["a"]), 3);
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30]), 3, 0, 0);
-        let pending = Arc::new(AtomicUsize::new(1));
         let outstanding = Arc::new(AtomicUsize::new(1));
         let cutter = RangeCutter::new(
             Projection::all_from_schema(table.schema()),
             Arc::new(Vec::new()),
-            pending.clone(),
             outstanding.clone(),
             Arc::new(WorkerAllocator::new()),
         );
 
         let mut ranges = run_unary_to_completion(cutter, vec![page]);
 
-        assert_eq!(pending.load(Ordering::Relaxed), 0);
         let before_decode = outstanding.load(Ordering::Relaxed);
         ranges.remove(0).decoded();
         assert_eq!((before_decode, outstanding.load(Ordering::Relaxed)), (1, 0));
     }
 
     /// A dictionary that excludes the pushed-down constant prunes the row
-    /// group as soon as it arrives: no range is emitted and the claim is
-    /// released.
+    /// group as soon as it arrives, and no range is emitted.
     #[test]
     fn a_dictionary_excluding_the_constant_prunes_the_row_group() {
         init_test_free_pool(4);
         let table = i32_dictionary_table(3);
         let metadata = QueryRowGroupMetadata::new(&table, 0, RowSelection::All);
         let dict = i32_dict_page(metadata.clone(), &[10, 20]);
-        let pending = Arc::new(AtomicUsize::new(1));
         let cutter = RangeCutter::new(
             Projection::all_from_schema(table.schema()),
             Arc::new(vec![i32_eq_predicate(5)]),
-            pending.clone(),
             Arc::new(AtomicUsize::new(1)),
             Arc::new(WorkerAllocator::new()),
         );
@@ -420,7 +393,6 @@ mod tests {
 
         assert!(ranges.is_empty());
         assert!(metadata.is_pruned());
-        assert_eq!(pending.load(Ordering::Relaxed), 0);
     }
 
     /// The footer records no dictionary page, yet the chunk has one and a

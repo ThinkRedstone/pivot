@@ -324,8 +324,9 @@ impl Worker {
         }
     }
 
-    /// While this worker has asked for less than its read-ahead budget, have
-    /// each dataflow issue remote IO until the budget is full. It runs ahead of the
+    /// While this worker has asked for less than its read-ahead budget for
+    /// disks or for the network, have each dataflow issue reads until both
+    /// budgets are full. It runs ahead of the
     /// CPU work and whether or not there is any: what the worker asks for now
     /// is what it has to work on once a read's time has passed, so a worker
     /// that asked only when it ran out of work would then sit waiting.
@@ -334,7 +335,7 @@ impl Worker {
     /// next one in turn: when room opens for one read at a time, the same
     /// dataflow would otherwise take it every time.
     fn saturate_available_io(&mut self) {
-        if self.data_flows.is_empty() || !self.io.borrow().has_read_ahead_room() {
+        if self.data_flows.is_empty() || !self.io.borrow().has_any_read_ahead_room() {
             return;
         }
         let first = self.next_saturating_flow % self.data_flows.len();
@@ -348,7 +349,7 @@ impl Worker {
             }
             // Asked on its own line: the requester must not stay borrowed
             // while the dataflow's operators borrow it to issue their reads.
-            let has_room = io.borrow().has_read_ahead_room();
+            let has_room = io.borrow().has_any_read_ahead_room();
             if has_room && let WorkStatus::Ran = flow.saturate_available_io(io) {
                 issued = true;
             }

@@ -58,7 +58,7 @@ pub use disk_cache::{DiskCache, clear_disk_cache};
 pub mod http;
 
 mod read_ahead;
-pub use read_ahead::{ReadAheadBudget, ReadAheadCharge};
+pub use read_ahead::{ReadAheadBudget, ReadAheadCharge, ReadMedium};
 
 mod receive_rate;
 pub use receive_rate::{

@@ -702,10 +702,11 @@ impl DataFlow {
         })
     }
 
-    /// Have the operators that issue remote IO issue it until the worker's
-    /// read-ahead budget has no room left. They are asked in the order CPU
-    /// work visits them, and each one is asked again until it has nothing
-    /// more to issue before the next one is asked. Returns
+    /// Have the operators that issue reads issue them until the worker's
+    /// read-ahead budgets, for disks and for the network, are both full.
+    /// They are asked in the order CPU work visits them. Each one is asked
+    /// again until it issues nothing, because it has no more to issue or the
+    /// budget it draws on is full, and then the next one is asked. Returns
     /// [`WorkStatus::Ran`] if any of them issued something. A dataflow with
     /// no such operator (the common case) costs a single `is_empty` check.
     pub fn saturate_available_io(&mut self, requester: &RefCell<IORequester>) -> WorkStatus {
@@ -720,7 +721,7 @@ impl DataFlow {
                 loop {
                     // Asked on its own line: the requester must not stay
                     // borrowed while the operator borrows it to issue a read.
-                    let has_room = requester.borrow().has_read_ahead_room();
+                    let has_room = requester.borrow().has_any_read_ahead_room();
                     if !has_room {
                         return Ok(dataflow_status);
                     }
@@ -931,9 +932,11 @@ mod tests {
         )
     }
 
-    /// Asks for `read_bytes` of read-ahead every time it is told to saturate
-    /// the available IO, and keeps every charge so the budget stays taken.
+    /// Asks for `read_bytes` from `medium` every time it is told to saturate
+    /// the available IO while that medium's budget has room, and keeps every
+    /// charge so the budget stays taken.
     struct ReadingAheadOperator {
+        medium: crate::io::ReadMedium,
         read_bytes: usize,
         charges: Vec<crate::io::ReadAheadCharge>,
         reads_issued: Arc<AtomicUsize>,
@@ -964,7 +967,11 @@ mod tests {
             &mut self,
             io: &mut OperatorIO,
         ) -> crate::operations::Result<WorkStatus> {
-            self.charges.push(io.charge_read_ahead(self.read_bytes));
+            if !io.has_read_ahead_room(self.medium) {
+                return Ok(WorkStatus::Pending);
+            }
+            self.charges
+                .push(io.charge_read_ahead(self.medium, self.read_bytes));
             self.reads_issued.fetch_add(1, Ordering::Relaxed);
             Ok(WorkStatus::Ran)
         }
@@ -982,6 +989,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             err_tx,
             vec![Box::new(ReadingAheadOperator {
+                medium: crate::io::ReadMedium::Network,
                 read_bytes: 10,
                 charges: Vec::new(),
                 reads_issued: reads_issued.clone(),
@@ -993,11 +1001,49 @@ mod tests {
             false,
         );
         let mut requester = IORequester::default();
-        requester.force_read_ahead_budget(30);
+        requester.force_read_ahead_budget(crate::io::ReadMedium::Network, 30);
 
         flow.saturate_available_io(&RefCell::new(requester));
 
         assert_eq!(reads_issued.load(Ordering::Relaxed), 3);
+    }
+
+    /// A full network budget does not end the pass: an operator reading from
+    /// disk still issues its reads.
+    #[test]
+    fn saturating_the_available_io_goes_on_until_both_budgets_are_full() {
+        let disk_reads_issued = Arc::new(AtomicUsize::new(0));
+        let reading_ahead = |medium, reads_issued: &Arc<AtomicUsize>| {
+            Box::new(ReadingAheadOperator {
+                medium,
+                read_bytes: 10,
+                charges: Vec::new(),
+                reads_issued: reads_issued.clone(),
+            }) as Box<dyn Operator>
+        };
+        let (err_tx, _err_rx) = mpsc::channel();
+        let (stats_tx, _stats_rx) = mpsc::channel();
+        let mut flow = DataFlow::new(
+            0,
+            Arc::new(AtomicBool::new(false)),
+            err_tx,
+            vec![
+                reading_ahead(crate::io::ReadMedium::Network, &Arc::default()),
+                reading_ahead(crate::io::ReadMedium::Disk, &disk_reads_issued),
+            ],
+            vec![None, None],
+            vec![(0, 1)],
+            HashMap::default(),
+            stats_tx,
+            false,
+        );
+        let mut requester = IORequester::default();
+        requester.force_read_ahead_budget(crate::io::ReadMedium::Network, 10);
+        requester.force_read_ahead_budget(crate::io::ReadMedium::Disk, 20);
+
+        flow.saturate_available_io(&RefCell::new(requester));
+
+        assert_eq!(disk_reads_issued.load(Ordering::Relaxed), 2);
     }
 
     #[test]

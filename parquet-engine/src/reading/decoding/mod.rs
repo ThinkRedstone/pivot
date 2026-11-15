@@ -544,9 +544,8 @@ pub(crate) mod tests {
         (0..a.len()).map(|i| a.value(i).to_string()).collect()
     }
 
-    /// A cutter for `table` with no fetcher behind it: the claim counters
-    /// are seeded high enough that releases never hit the underflow
-    /// assertion.
+    /// A cutter for `table` with no scan behind it: the scan's outstanding
+    /// count is seeded high enough that releases never underflow it.
     pub(crate) fn new_cutter(
         table: &Arc<ParquetTable>,
         eq_predicates: Vec<ScanEqualityPredicate>,
@@ -554,7 +553,6 @@ pub(crate) mod tests {
         RangeCutter::new(
             Projection::all_from_schema(table.schema()),
             Arc::new(eq_predicates),
-            Arc::new(AtomicUsize::new(usize::MAX / 2)),
             Arc::new(AtomicUsize::new(usize::MAX / 2)),
             Arc::new(WorkerAllocator::new()),
         )

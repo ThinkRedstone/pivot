@@ -163,6 +163,14 @@ pub trait Unary<I, O> {
         false
     }
 
+    /// Whether the worker has room in the read-ahead budget this unary's
+    /// reads count against. Asked before an input is taken to saturate the
+    /// available IO, and only of a unary that
+    /// [takes its input then](Self::takes_input_to_saturate_io).
+    fn has_read_ahead_room(&self, _io: &OperatorIO) -> bool {
+        true
+    }
+
     /// Handle a completed logical read. Dispatch has already resolved cache
     /// hits and committed any physical reads.
     fn process_read_response(
@@ -389,7 +397,7 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
     }
 
     fn saturate_available_io(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
-        if !self.unary.ready_for_more_work() {
+        if !self.unary.ready_for_more_work() || !self.unary.has_read_ahead_room(io) {
             return Ok(WorkStatus::Pending);
         }
         // Its own input first, then a peer's: an input may be queued on one

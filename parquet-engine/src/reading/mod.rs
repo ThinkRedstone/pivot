@@ -14,7 +14,7 @@
 //! pipeline produced at `CREATE`/`ATTACH` time.
 
 mod fetching;
-pub use fetching::{RowGroupFetcherFactory, RowGroupInjectorFactory, pending_claim_bound};
+pub use fetching::{RowGroupFetcherFactory, RowGroupInjectorFactory};
 
 mod indexer;
 pub use indexer::IndexerFactory;

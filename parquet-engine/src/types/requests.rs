@@ -166,12 +166,12 @@ impl RowGroupRequest {
     /// admitted the request), so the buffer records it as the decode owner.
     ///
     /// `read_ahead_charge` is what the claim counts against its worker's
-    /// read-ahead budget, if the scan is bounded by one. The buffer carries it
-    /// to whichever worker starts on the row group.
+    /// read-ahead budget. The buffer carries it to whichever worker starts on
+    /// the row group.
     pub fn into_row_group_buffer(
         self,
         response: Option<ReadResponse>,
-        read_ahead_charge: Option<ReadAheadCharge>,
+        read_ahead_charge: ReadAheadCharge,
     ) -> RowGroupBuffer {
         let mut resolved = response
             .map(|response| response.into_locations())
@@ -226,9 +226,9 @@ pub struct RowGroupBuffer {
     /// the id is stamped at claim time, not by whoever runs a stage.
     pub worker_id: usize,
     /// What this row group counts against its claiming worker's read-ahead
-    /// budget, if the scan is bounded by one. It is given back when the
-    /// buffer is dropped, which is when a worker has started on the row group.
-    pub read_ahead_charge: Option<ReadAheadCharge>,
+    /// budget. It is given back when the buffer is dropped, which is when a
+    /// worker has started on the row group.
+    pub read_ahead_charge: ReadAheadCharge,
 }
 
 /// One projected column of a row group as the ring resolved it.

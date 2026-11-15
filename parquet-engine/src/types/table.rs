@@ -108,6 +108,21 @@ impl ParquetTable {
         &self.row_groups
     }
 
+    /// The medium this table's files are read from, which decides the
+    /// read-ahead budget a scan of it counts against: the network when its
+    /// first row group is in a remote file, disks otherwise. A table with no
+    /// row groups reads nothing, so which budget it names does not matter.
+    pub fn get_read_medium(&self) -> dispatch::io::ReadMedium {
+        match self
+            .row_groups
+            .first()
+            .map(|row_group| &row_group.open_file)
+        {
+            Some(dispatch::io::OpenFile::Remote(_)) => dispatch::io::ReadMedium::Network,
+            Some(dispatch::io::OpenFile::Local(_)) | None => dispatch::io::ReadMedium::Disk,
+        }
+    }
+
     /// Mutable access to this table's row groups. Used by callers that need
     /// to prune the row-group set in place (e.g. catalog-side filter pushdown).
     pub fn row_groups_mut(&mut self) -> &mut Vec<Arc<RowGroupMetadata>> {

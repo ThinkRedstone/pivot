@@ -23,7 +23,7 @@ use crate::{
     CompressedPage, DecodeRange, DecoderFactory, DecompressedPage, DecompressorFactory,
     IndexerFactory, MaterializerFactory, ParquetTable, RangeCutterFactory, RowGroupBuffer,
     RowGroupFetcherFactory, RowGroupInjectorFactory, ScanEqualityPredicate, ScanOrder,
-    WorkerAllocator, pending_claim_bound,
+    WorkerAllocator,
 };
 
 /// Append the index → decompress → cut → decode stages onto a source of
@@ -34,7 +34,6 @@ pub(crate) fn read_parquet<OF>(
     batch_size: usize,
     add_row_group_metadata: bool,
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
-    pending_row_groups: Vec<Arc<AtomicUsize>>,
     outstanding_row_groups: Arc<AtomicUsize>,
 ) -> RecordBatchOperatorSpec
 where
@@ -64,13 +63,11 @@ where
             return_to_worker_mpsc::<DecompressedPage>(n)
                 .into_iter()
                 .collect(),
-            pending_row_groups
+            dictionary_allocators
                 .into_iter()
-                .zip(dictionary_allocators)
-                .map(|(pending, allocator)| RangeCutterFactory {
+                .map(|allocator| RangeCutterFactory {
                     projection: projection.clone(),
                     eq_predicates: eq_predicates.clone(),
-                    pending_row_groups: pending,
                     outstanding_row_groups: outstanding_row_groups.clone(),
                     allocator,
                 })
@@ -93,14 +90,6 @@ where
                 .collect(),
         );
     RecordBatchOperatorSpec::from_spec(decoded)
-}
-
-/// One claimed-but-not-yet-cut row-group counter per worker, shared by the
-/// worker's fetcher (increments and gates claims) and its range cutter
-/// (decrements as row groups are cut or pruned). See `RowGroupFetcher` for
-/// why claims are bounded this way.
-fn pending_row_group_counters(n: usize) -> Vec<Arc<AtomicUsize>> {
-    (0..n).map(|_| Arc::new(AtomicUsize::new(0))).collect()
 }
 
 /// A [`RecordBatchOperatorSpec`] that scans a Parquet table.
@@ -177,20 +166,12 @@ pub fn table_input_with_filter_and_eq_predicates(
         dispatcher.topology().node_count,
     );
     let siblings = Arc::new(AtomicUsize::new(n));
-    let pending_row_groups = pending_row_group_counters(n);
-    // One fetcher handles disk and HTTP row groups, bounding each medium's
-    // in-flight count separately, plus its worker's undecoded-claims count.
-    let claim_bound = pending_claim_bound(table);
     let shared_projection = Arc::new(projection.clone());
-    let factories: Vec<_> = pending_row_groups
-        .iter()
-        .map(|pending| {
+    let read_medium = table.get_read_medium();
+    let factories: Vec<_> = (0..n)
+        .map(|_| {
             RootUnaryOperatorFactory::new(
-                RowGroupFetcherFactory::new(
-                    shared_projection.clone(),
-                    pending.clone(),
-                    claim_bound,
-                ),
+                RowGroupFetcherFactory::new(shared_projection.clone(), read_medium),
                 injector.clone(),
                 siblings.clone(),
             )
@@ -203,7 +184,6 @@ pub fn table_input_with_filter_and_eq_predicates(
         RECORD_BATCH_SIZE,
         add_row_group_metadata,
         eq_predicates,
-        pending_row_groups,
         outstanding_row_groups,
     )
 }
@@ -222,8 +202,6 @@ pub fn materialize(
     let siblings_materializer = Arc::new(AtomicUsize::new(n));
     let siblings_fetcher = Arc::new(AtomicUsize::new(n));
 
-    let pending_row_groups = pending_row_group_counters(n);
-    let claim_bound = pending_claim_bound(&table);
     // Every surviving-row batch funnels to ONE worker's materializer, so each
     // row group is emitted exactly once, holding all of its surviving rows.
     // The range cutter relies on that: it tracks row groups by index and
@@ -234,12 +212,12 @@ pub fn materialize(
     // materializes take turns hosting the merge, so concurrent queries do not
     // all pin one worker.
     let host = dispatcher.next_worker();
+    let read_medium = table.get_read_medium();
     let shared_projection = Arc::new(projection.clone());
     let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(n, host)
         .into_iter()
         .zip(stealable::<QueryRowGroupMetadata>(dispatcher.topology()))
-        .zip(pending_row_groups.iter())
-        .map(|((rb_ch, rq_ch), pending)| {
+        .map(|(rb_ch, rq_ch)| {
             UnaryOperatorFactory::new(
                 UnaryOperatorFactory::new(
                     heads.pop_front().unwrap(),
@@ -247,11 +225,7 @@ pub fn materialize(
                     rb_ch,
                     siblings_materializer.clone(),
                 ),
-                RowGroupFetcherFactory::new(
-                    shared_projection.clone(),
-                    pending.clone(),
-                    claim_bound,
-                ),
+                RowGroupFetcherFactory::new(shared_projection.clone(), read_medium),
                 rq_ch,
                 siblings_fetcher.clone(),
             )
@@ -264,7 +238,6 @@ pub fn materialize(
         RECORD_BATCH_SIZE,
         false,
         Arc::new(Vec::new()),
-        pending_row_groups,
         // The materializer path claims by explicit row-group requests, not the
         // injector, so this count is never consulted.
         Arc::new(AtomicUsize::new(0)),
