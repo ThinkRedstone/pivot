@@ -329,6 +329,18 @@ impl IORequester {
         self.http.force_receive_rate_limiter(limiter);
     }
 
+    /// Keep the step deadlines of remote reads, before any doubling, between
+    /// `shortest` and `longest`, so a test controls how soon a silent peer is
+    /// given up on.
+    #[cfg(all(test, target_os = "linux"))]
+    fn force_step_deadline_bounds(
+        &mut self,
+        shortest: std::time::Duration,
+        longest: std::time::Duration,
+    ) {
+        self.http.force_step_deadline_bounds(shortest, longest);
+    }
+
     /// Resolve one logical read through the memory caches and immediately submit
     /// every physical cache fill it still needs.
     pub fn request_read(
@@ -2162,6 +2174,19 @@ mod tests {
         port
     }
 
+    /// Spawn a server that accepts every connection and never answers on any.
+    #[cfg(target_os = "linux")]
+    fn spawn_silent_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let _silent_connections: Vec<_> = listener.incoming().collect();
+        });
+
+        port
+    }
+
     /// Shared log of the `[start, end]` ranges a recording server was asked for.
     type RangeLog = Arc<Mutex<Vec<(usize, usize)>>>;
 
@@ -2457,6 +2482,21 @@ mod tests {
         fetch(&mut requester, &loc, 0, 4096);
 
         assert_cached(&loc, 0, 4096);
+    }
+
+    /// A read against a peer that never answers fails once its deadline has
+    /// stopped growing, instead of being issued again without end.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_read_on_a_peer_that_never_answers_fails() {
+        init_test_free_pool(16);
+        let loc = remote_loc(spawn_silent_server());
+        let mut requester = IORequester::with_http_config(client_config());
+        requester.force_step_deadline_bounds(Duration::from_millis(1), Duration::from_millis(1));
+
+        let results = fetch_results(&mut requester, &loc, 0, 4096);
+
+        assert!(results.iter().all(|result| result.is_err()));
     }
 
     /// Hold `requester`'s remote reads to a receive allowance that, as of

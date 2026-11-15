@@ -31,7 +31,8 @@ pub struct DataFlowStats {
     /// Wall time HTTP GETs were in flight.
     pub http_get_time: Duration,
     /// HTTP fetches issued again because their connection stalled. A count of
-    /// these well above zero means packets are being lost on the way in.
+    /// these well above zero means packets are being lost on the way in or the
+    /// store is slow to answer.
     pub http_reissues: u64,
     /// Wall time HTTP uploads were in flight.
     pub http_upload_time: Duration,

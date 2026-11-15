@@ -558,14 +558,59 @@ mod uring_engine {
     /// Each time a read is issued again for missing its step deadline, its
     /// deadline doubles, up to this many times. A peer that is slow for every
     /// attempt is then waited for rather than hammered with new connections.
+    /// A read that misses the deadline after the last doubling is no longer
+    /// issued again for free. That miss is an error and uses one of the read's
+    /// [`MAX_HTTP_RETRIES`], so a peer that never answers fails the read.
     const MAX_STEP_DEADLINE_DOUBLINGS: u32 = 6;
 
-    /// How long one connect or recv of a read may take before the read is
-    /// issued again, given what reads on this engine typically take and how
-    /// often this read has already missed its deadline.
-    fn compute_step_deadline(typical_read_time: Duration, deadline_reissues: u32) -> Duration {
-        let base = (typical_read_time * STEP_DEADLINE_MULTIPLIER)
-            .clamp(MIN_STEP_DEADLINE, MAX_STEP_DEADLINE);
+    /// The shortest and the longest deadline a step gets before any doubling.
+    #[derive(Clone, Copy)]
+    struct StepDeadlineBounds {
+        shortest: Duration,
+        longest: Duration,
+    }
+
+    /// How long one connect or recv of a read may take before the attempt is
+    /// abandoned, given what reads on this engine typically take and how often
+    /// this read has already missed its deadline.
+    ///
+    /// The rule follows the retransmission timer of TCP
+    /// ([RFC 6298](https://www.rfc-editor.org/rfc/rfc6298)). TCP keeps a
+    /// running average of the round-trip time in which each new sample weighs
+    /// one eighth, derives its timeout from that average, never lets the
+    /// timeout fall under a floor (200 ms on Linux), doubles it after every
+    /// expiry, and reports an error after a fixed number of expiries. The
+    /// engine does the same one level up. It averages whole reads the same
+    /// way, allows a step [`STEP_DEADLINE_MULTIPLIER`] average read times,
+    /// keeps that within the bounds ([`MIN_STEP_DEADLINE`] to
+    /// [`MAX_STEP_DEADLINE`]), and doubles it each time the read misses it, up
+    /// to [`MAX_STEP_DEADLINE_DOUBLINGS`] times. A read that misses even the
+    /// longest deadline uses one of its [`MAX_HTTP_RETRIES`] per miss and then
+    /// fails, so a store that has stopped answering ends in an error.
+    ///
+    /// TCP alone recovers slowly from a packet lost while connecting. It has no
+    /// round-trip time for the new connection yet, so it waits a fixed second,
+    /// then two, then four. A deadline learned from earlier reads is far
+    /// shorter than that.
+    ///
+    /// Abandoning a slow request early and sending it again on another
+    /// connection is what AWS recommends for latency-sensitive S3 clients
+    /// ([Timeouts and retries for latency-sensitive
+    /// applications](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-design-patterns.html#optimizing-performance-timeouts-retries)):
+    /// the new request is likely to take a different path and succeed quickly.
+    /// Hedged requests, from [The Tail at
+    /// Scale](https://research.google/pubs/the-tail-at-scale/), are the related
+    /// technique. There, a request that has run longer than is typical is sent
+    /// a second time and whichever copy finishes first is used. The engine
+    /// differs in that it cancels the first attempt instead of letting both
+    /// run.
+    fn compute_step_deadline(
+        typical_read_time: Duration,
+        deadline_reissues: u32,
+        bounds: StepDeadlineBounds,
+    ) -> Duration {
+        let base =
+            (typical_read_time * STEP_DEADLINE_MULTIPLIER).clamp(bounds.shortest, bounds.longest);
         base * 2u32.pow(deadline_reissues.min(MAX_STEP_DEADLINE_DOUBLINGS))
     }
 
@@ -573,6 +618,8 @@ mod uring_engine {
     /// before it's reported as failed. Covers the common case — a pooled
     /// keep-alive connection the server closed on its idle timeout — plus a few
     /// genuinely flaky reconnects, without spinning forever on a real outage.
+    /// A step that misses its longest deadline counts here like any other
+    /// connection error.
     const MAX_HTTP_RETRIES: u32 = 3;
 
     /// Whether a transport error is worth retrying on a fresh connection. Socket
@@ -655,7 +702,8 @@ mod uring_engine {
         retries: u32,
         /// How many times this read has been issued again because a connect or
         /// recv missed its step deadline. Counted apart from `retries`: a slow
-        /// step is not an error, so it never brings the read closer to failing.
+        /// step is not an error until the deadline has stopped doubling, so up
+        /// to [`MAX_STEP_DEADLINE_DOUBLINGS`] misses leave `retries` alone.
         deadline_reissues: u32,
         /// When this attempt started, to learn what a read typically takes.
         started_at: Instant,
@@ -663,6 +711,9 @@ mod uring_engine {
         /// counts down. Boxed so the address the SQE carries stays put while
         /// the exchange slab grows.
         step_deadline: Box<types::Timespec>,
+        /// The length of the deadline in `step_deadline`, kept to report it
+        /// when the step misses it.
+        armed_step_deadline: Duration,
 
         // Cursor into the connection's pending send buffer (TLS ciphertext, or
         // the request head for plain HTTP).
@@ -709,6 +760,7 @@ mod uring_engine {
                 deadline_reissues: 0,
                 started_at: Instant::now(),
                 step_deadline: Box::new(types::Timespec::new()),
+                armed_step_deadline: Duration::ZERO,
                 out_pos: 0,
                 upload_pos: 0,
                 sending_upload_direct: false,
@@ -937,15 +989,34 @@ mod uring_engine {
         fn arm_step_deadline(
             &mut self,
             typical_read_time: Duration,
+            bounds: StepDeadlineBounds,
         ) -> Option<*const types::Timespec> {
             if matches!(self.request, RemoteRequest::Upload(_)) {
                 return None;
             }
-            let deadline = compute_step_deadline(typical_read_time, self.deadline_reissues);
+            let deadline = compute_step_deadline(typical_read_time, self.deadline_reissues, bounds);
+            self.armed_step_deadline = deadline;
             *self.step_deadline = types::Timespec::new()
                 .sec(deadline.as_secs())
                 .nsec(deadline.subsec_nanos());
             Some(&*self.step_deadline as *const types::Timespec)
+        }
+
+        /// Build the error for a connect or recv that missed its step deadline
+        /// after the deadline had stopped doubling.
+        fn build_missed_deadline_error(&self) -> Error {
+            let step = match self.state {
+                State::Connecting => "connect",
+                State::Receiving => "recv",
+                State::Sending => unreachable!("a send carries no step deadline"),
+            };
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "the {step} of a remote read completed nothing within {:?}, its longest deadline",
+                    self.armed_step_deadline
+                ),
+            ))
         }
     }
 
@@ -1011,6 +1082,8 @@ mod uring_engine {
         /// successful attempt to its last body byte. Step deadlines scale with
         /// it, so they follow the store and the network instead of a constant.
         typical_read_time: Duration,
+        /// The bounds of a step deadline before any doubling.
+        step_deadline_bounds: StepDeadlineBounds,
     }
 
     impl HttpEngine {
@@ -1025,7 +1098,18 @@ mod uring_engine {
                 failed: Vec::new(),
                 reissued: Vec::new(),
                 typical_read_time: INITIAL_TYPICAL_READ_TIME,
+                step_deadline_bounds: StepDeadlineBounds {
+                    shortest: MIN_STEP_DEADLINE,
+                    longest: MAX_STEP_DEADLINE,
+                },
             })
+        }
+
+        /// Keep step deadlines, before any doubling, between `shortest` and
+        /// `longest`, so a test controls how soon a silent peer is given up on.
+        #[cfg(test)]
+        pub fn force_step_deadline_bounds(&mut self, shortest: Duration, longest: Duration) {
+            self.step_deadline_bounds = StepDeadlineBounds { shortest, longest };
         }
 
         /// Ids of the reads issued again for a missed step deadline since the
@@ -1112,8 +1196,10 @@ mod uring_engine {
         /// fail just the owning dataflow.
         ///
         /// A read's connect or recv that outlives its step deadline comes back
-        /// cancelled by the timeout linked to it. That is a stalled attempt
-        /// rather than a failed one, and the read is issued again.
+        /// cancelled by the timeout linked to it. While the read's deadline can
+        /// still double, that is a stalled attempt rather than a failed one, and
+        /// the read is issued again. A miss of the longest deadline is a
+        /// transport error like the others.
         pub fn on_cqe(&mut self, ring: &mut IoUring, user_data: u64, result: i32) -> Result<()> {
             if user_data & STEP_DEADLINE_TAG != 0 {
                 return Ok(());
@@ -1124,7 +1210,11 @@ mod uring_engine {
                 && let Some(exchange) = &self.exchanges[idx]
                 && matches!(exchange.request, RemoteRequest::Read(_))
             {
-                return self.reissue_stalled_read(ring, idx);
+                if exchange.deadline_reissues < MAX_STEP_DEADLINE_DOUBLINGS {
+                    return self.reissue_stalled_read(ring, idx);
+                }
+                let missed_deadline = exchange.build_missed_deadline_error();
+                return self.retry_or_fail(ring, idx, missed_deadline);
             }
 
             // Negative result = socket-level error (connect refused, reset,
@@ -1215,7 +1305,8 @@ mod uring_engine {
         /// points into the attempt's buffers or its destination.
         ///
         /// The read keeps its error budget, and its next deadline is twice as
-        /// long, so a store that is slow for every attempt is waited for.
+        /// long, so a store that is slow for every attempt is waited for. Only
+        /// a read whose deadline can still double comes here.
         fn reissue_stalled_read(&mut self, ring: &mut IoUring, idx: usize) -> Result<()> {
             let stalled = self.exchanges[idx]
                 .take()
@@ -1343,6 +1434,7 @@ mod uring_engine {
 
         fn start_connect(&mut self, ring: &mut IoUring, idx: usize) -> Result<()> {
             let typical_read_time = self.typical_read_time;
+            let step_deadline_bounds = self.step_deadline_bounds;
             let exchange = self.exchanges[idx].as_mut().unwrap();
             exchange.state = State::Connecting;
             let fd = exchange.conn.fd.as_raw_fd();
@@ -1352,7 +1444,7 @@ mod uring_engine {
             let entry = opcode::Connect::new(types::Fd(fd), addr_ptr, len)
                 .build()
                 .user_data(HTTP_TAG | idx as u64);
-            match exchange.arm_step_deadline(typical_read_time) {
+            match exchange.arm_step_deadline(typical_read_time, step_deadline_bounds) {
                 Some(deadline) => push_with_step_deadline(ring, entry, deadline, idx),
                 None => push(ring, &entry),
             }
@@ -1362,6 +1454,7 @@ mod uring_engine {
         /// current send buffer.
         fn pump(&mut self, ring: &mut IoUring, idx: usize) -> Result<()> {
             let typical_read_time = self.typical_read_time;
+            let step_deadline_bounds = self.step_deadline_bounds;
             let (is_send, addr, len, fd) = {
                 let exchange = self.exchanges[idx].as_mut().unwrap();
                 exchange.fill_out();
@@ -1445,7 +1538,7 @@ mod uring_engine {
                 .build()
                 .user_data(HTTP_TAG | idx as u64);
             let exchange = self.exchanges[idx].as_mut().unwrap();
-            match exchange.arm_step_deadline(typical_read_time) {
+            match exchange.arm_step_deadline(typical_read_time, step_deadline_bounds) {
                 Some(deadline) => push_with_step_deadline(ring, entry, deadline, idx),
                 None => push(ring, &entry),
             }

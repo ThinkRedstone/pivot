@@ -219,6 +219,18 @@ impl CachedHttpEngine {
         self.receive_limiter = limiter;
     }
 
+    /// Keep the step deadlines of network fetches, before any doubling, between
+    /// `shortest` and `longest`, so a test controls how soon a silent peer is
+    /// given up on.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn force_step_deadline_bounds(
+        &mut self,
+        shortest: std::time::Duration,
+        longest: std::time::Duration,
+    ) {
+        self.http.force_step_deadline_bounds(shortest, longest);
+    }
+
     /// Join ranges with up to `bytes` between them into one request, so a
     /// test controls what is dropped.
     #[cfg(test)]
