@@ -14,6 +14,7 @@
 //! closed slabs and the allocator's own record has no open slab left.
 
 use crate::io::{IORequesterError, LocalFile};
+use crate::memory::slab::SlabBacking;
 use crate::memory::spill::codec::{compress_spilled_rows, get_most_compressed_len};
 use crate::memory::spill::layout::Layout;
 use crate::memory::spill::partition_tree::{
@@ -107,7 +108,11 @@ impl CompressedRowsBuffers {
                 .add(compressed_rows_buffer.taken)
         };
         compressed_rows_buffer.taken += len;
-        Slab::new(start, len, compressed_rows_buffer.buffer.clone())
+        Slab::new(
+            start,
+            len,
+            SlabBacking::Working(compressed_rows_buffer.buffer.clone()),
+        )
     }
 }
 
@@ -298,7 +303,7 @@ impl PartitionGroupSlot {
         // `start..end` lies inside the 2MB buffer, checked just above.
         let ptr = unsafe { current.ptr.add(start) };
         SlabAllocation::Allocated(AllocatedSlab {
-            slab: Slab::new(ptr, size, current.clone()),
+            slab: Slab::new(ptr, size, SlabBacking::Working(current.clone())),
             buffer_slot_idx: current.slot_idx,
         })
     }

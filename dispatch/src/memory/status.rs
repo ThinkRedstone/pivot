@@ -1,9 +1,10 @@
 //! The memory ring consists of fixed-size blocks.
-//! Each block is cached by one of two caches, pinned by an operator, or free.
+//! Each block is held by one of the caches, pinned by an operator, or free.
 //! Because every block is the same size, counting rows measures memory usage.
 
 use crate::memory::BUFFER_SIZE;
-use crate::memory::clock::{Clock, Owner};
+use crate::memory::cache::Caches;
+use crate::memory::clock::Clock;
 use crate::memory::layout::RingLayout;
 use crate::memory::ring::{Ring, SlotUsage};
 
@@ -18,10 +19,8 @@ pub enum MemoryBlockState {
     /// run, a read in flight. Not evictable: it is released when the work that
     /// took it finishes.
     Pinned,
-    /// Lent to the compressed cache, holding file bytes as they were read.
-    CompressedCache,
-    /// Lent to the decompressed cache, holding pages as they were decoded.
-    DecompressedCache,
+    /// Lent to the cache named, holding whatever form of data that cache keeps.
+    Cached { cache: &'static str },
 }
 
 /// What one block of the ring currently holds.
@@ -55,6 +54,7 @@ pub fn block_size_bytes() -> usize {
 pub(crate) fn read_block_status(
     ring: &Ring,
     clock: &Clock,
+    caches: &Caches,
     layout: &RingLayout,
     slot: usize,
 ) -> MemoryBlockStatus {
@@ -65,8 +65,9 @@ pub(crate) fn read_block_status(
     // cache owns is the free pool's or an operator's, and there the holder
     // decides.
     let state = match (clock.owner(slot), usage) {
-        (Some(Owner::Compressed), _) => MemoryBlockState::CompressedCache,
-        (Some(Owner::Decompressed), _) => MemoryBlockState::DecompressedCache,
+        (Some(cache), _) => MemoryBlockState::Cached {
+            cache: caches.name(cache),
+        },
         (None, SlotUsage::Idle) => MemoryBlockState::Free,
         (None, SlotUsage::Writing | SlotUsage::Reading(_)) => MemoryBlockState::Pinned,
     };
@@ -88,7 +89,23 @@ mod tests {
     //! own thread, so nothing is shared and no lock is needed.
 
     use super::*;
+    use crate::memory::cache::RingCache;
     use crate::memory::{WriteBuffer, init_test_free_pool, memory_ctx};
+
+    const COMPRESSED: MemoryBlockState = MemoryBlockState::Cached {
+        cache: "compressed_cache",
+    };
+    const DECOMPRESSED: MemoryBlockState = MemoryBlockState::Cached {
+        cache: "decompressed_cache",
+    };
+
+    fn get_compressed_cache_id() -> crate::memory::cache::CacheId {
+        memory_ctx().page_caches().compressed.id()
+    }
+
+    fn get_decompressed_cache_id() -> crate::memory::cache::CacheId {
+        memory_ctx().page_caches().decompressed.id()
+    }
 
     /// Every block of the ring, in ring order.
     fn blocks() -> Vec<MemoryBlockStatus> {
@@ -154,27 +171,21 @@ mod tests {
     fn a_block_reports_the_cache_that_owns_it() {
         init_test_free_pool(0);
 
-        memory_ctx().clock().bind(0, Owner::Compressed);
-        memory_ctx().clock().bind(1, Owner::Decompressed);
+        memory_ctx().clock().bind(0, get_compressed_cache_id());
+        memory_ctx().clock().bind(1, get_decompressed_cache_id());
 
-        assert_eq!(
-            states()[0..2],
-            [
-                MemoryBlockState::CompressedCache,
-                MemoryBlockState::DecompressedCache,
-            ],
-        );
+        assert_eq!(states()[0..2], [COMPRESSED, DECOMPRESSED]);
     }
 
     #[test]
     fn a_cached_block_being_read_still_counts_as_cached() {
         init_test_free_pool(0);
-        memory_ctx().clock().bind(0, Owner::Decompressed);
+        memory_ctx().clock().bind(0, get_decompressed_cache_id());
 
         let _reader = memory_ctx().ring().try_read(0).unwrap();
 
         let block = blocks()[0];
-        assert_eq!(block.state, MemoryBlockState::DecompressedCache);
+        assert_eq!(block.state, DECOMPRESSED);
         assert_eq!(block.readers, 1);
     }
 
@@ -191,7 +202,7 @@ mod tests {
     #[test]
     fn a_block_a_cache_gives_back_is_free_again() {
         init_test_free_pool(0);
-        memory_ctx().clock().bind(0, Owner::Compressed);
+        memory_ctx().clock().bind(0, get_compressed_cache_id());
 
         memory_ctx().clock().release(0);
 

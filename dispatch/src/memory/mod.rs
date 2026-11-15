@@ -12,7 +12,7 @@
 //! allocate on initialization half the system memory for [`WriteBuffer`]s, as this will be our main
 //! usage of memory. Every worker upon initialization faults in all [`WriteBuffer`]s and pushes equal
 //! amounts to local pools for use afterward. These [`WriteBuffer`]s will be used for any disk access
-//! (and subsequently saved in the [`CompressedCache`](compressed_cache::CompressedCache)) as well as large allocations.
+//! (and subsequently saved in the [`CompressedCache`](cache::CompressedCache)) as well as large allocations.
 //!
 //! [`WriteBuffer`]s can also be used for many miscellaneous things, such as Vectors and HashTables. It
 //! is generally preferred to use [`WriteBuffer`]s as the memory is easily accounted for. See [`SlabAllocator`].
@@ -34,20 +34,18 @@ pub use status::{MemoryBlockState, MemoryBlockStatus, block_size_bytes};
 mod layout;
 pub use layout::RingLayout;
 
-pub mod compressed_cache;
-pub use compressed_cache::CacheLookup;
-
-pub mod decompressed_cache;
-pub use decompressed_cache::{BlockKey, DecompressedCache, Segment};
+pub mod cache;
+pub use cache::{
+    Cache, CacheFill, CacheId, CacheKey, CacheLookup, Cached, Caches, CompressedCache,
+    DecompressedPage, DecompressedPageMeta, MissingExtent, PageCaches, RingCache, Segment,
+    SourceRange,
+};
 
 pub mod clock;
-pub use clock::{Clock, Owner};
+pub use clock::Clock;
 
 mod file_bytes;
 pub use file_bytes::FileBytes;
-
-mod fill_cursor;
-pub use fill_cursor::FillCursor;
 
 mod free_pool;
 

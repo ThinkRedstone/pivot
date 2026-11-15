@@ -1,11 +1,9 @@
 use crate::Identifier;
 use crate::WriteRequestId;
 use crate::io::{Completion, IORequester};
-use crate::memory::clock::{Clock, Owner, Sweep};
-use crate::memory::compressed_cache::CompressedCache;
-use crate::memory::decompressed_cache::DecompressedCache;
+use crate::memory::cache::{CacheId, CacheSetup, Caches, FillCursor, PageCaches};
+use crate::memory::clock::{Clock, Sweep};
 use crate::memory::evict::DataflowEvict;
-use crate::memory::fill_cursor::FillCursor;
 use crate::memory::free_pool::{FreePool, PoolFactory};
 use crate::memory::status::{MemoryBlockStatus, read_block_status};
 use crate::memory::{BUFFER_SIZE, Ring, RingLayout, WriteBuffer};
@@ -99,8 +97,7 @@ type BuffersWritesInFlight = Vec<Arc<AtomicUsize>>;
 
 pub struct MemoryContextFactory {
     ring: Arc<Ring>,
-    compressed_cache: Arc<CompressedCache>,
-    decompressed_cache: Arc<DecompressedCache>,
+    caches: CacheSetup,
     clock: Arc<Clock>,
     dirty_pool_factory: PoolFactory,
     zeroed_pool_factory: PoolFactory,
@@ -113,7 +110,7 @@ pub struct MemoryContextFactory {
 
 impl MemoryContextFactory {
     /// Build one factory per worker (global worker order) over a single shared
-    /// ring, both caches, and the clock, partitioned per `layout`: each worker
+    /// ring, the caches, and the clock, partitioned per `layout`: each worker
     /// prefaults, acquires, and evicts only its own node's slot region, so its
     /// memory placement stays node-local, while all cached data remains
     /// readable (and releasable) from every worker.
@@ -126,11 +123,11 @@ impl MemoryContextFactory {
         let buffers = layout.total_slots();
         let topology = layout.topology();
         let ring = Arc::new(Ring::new(buffers).unwrap());
-        let compressed_cache = Arc::new(CompressedCache::new(buffers));
-        let decompressed_cache = Arc::new(DecompressedCache::new(buffers));
+        let caches = CacheSetup::standard(buffers);
         let clock = Arc::new(Clock::with_regions(
             topology.node_count,
             buffers / topology.node_count,
+            caches.caches.policies(),
         ));
         let zeroed_pool_factories = PoolFactory::create_for_layout(layout);
         let dirty_pool_factories = PoolFactory::create_for_layout(layout);
@@ -149,8 +146,7 @@ impl MemoryContextFactory {
             .enumerate()
             .map(|(worker, (zeroed_pool_factory, dirty_pool_factory))| Self {
                 ring: ring.clone(),
-                compressed_cache: compressed_cache.clone(),
-                decompressed_cache: decompressed_cache.clone(),
+                caches: caches.clone(),
                 clock: clock.clone(),
                 dirty_pool_factory,
                 zeroed_pool_factory,
@@ -169,15 +165,20 @@ impl MemoryContextFactory {
     }
 
     pub fn create_memory_ctx(self) -> MemoryContext {
+        let fill_cursors = self
+            .caches
+            .caches
+            .ids()
+            .map(|_| UnsafeCell::new(FillCursor::empty()))
+            .collect();
         MemoryContext {
             ring: self.ring,
-            compressed_cache: self.compressed_cache,
-            decompressed_cache: self.decompressed_cache,
+            caches: self.caches.caches,
+            page_caches: self.caches.pages,
             clock: self.clock,
             dirty_pool: self.dirty_pool_factory.create_pool(),
             zeroed_pool: self.zeroed_pool_factory.create_pool(),
-            compressed_fill_cursor: UnsafeCell::new(FillCursor::empty()),
-            decompressed_fill_cursor: UnsafeCell::new(FillCursor::empty()),
+            fill_cursors,
             layout: self.layout,
             evictors: RefCell::new(HashMap::new()),
             buffers_spilled: self.buffers_spilled,
@@ -193,23 +194,24 @@ impl MemoryContextFactory {
 
 pub struct MemoryContext {
     ring: Arc<Ring>,
-    compressed_cache: Arc<CompressedCache>,
-    decompressed_cache: Arc<DecompressedCache>,
-    /// The CLOCK eviction policy over all ring slots, shared by both caches.
+    /// Every cache, as the evictor sees them.
+    caches: Arc<Caches>,
+    /// The same caches, typed, for the readers that fill and consult them.
+    page_caches: PageCaches,
+    /// The CLOCK eviction policy over all ring slots, shared by every cache.
     clock: Arc<Clock>,
     dirty_pool: FreePool,
     zeroed_pool: FreePool,
-    /// This worker's bump cursors for packing entries into shared fill slots, one
-    /// per cache (see [`CompressedCache`] and [`DecompressedCache`]). Per-thread, so
-    /// interior-mutable without a lock - the `&'static MemoryContext` is really
-    /// thread-local, so there is never a second accessor. Mirrors the `UnsafeCell`
-    /// discipline the caches use for their per-slot metadata.
-    compressed_fill_cursor: UnsafeCell<FillCursor>,
-    decompressed_fill_cursor: UnsafeCell<FillCursor>,
+    /// This worker's bump cursors for packing entries into shared fill slots,
+    /// one per cache, indexed by [`CacheId`]. Per-thread, so interior-mutable
+    /// without a lock - the `&'static MemoryContext` is really thread-local, so
+    /// there is never a second accessor. Mirrors the `UnsafeCell` discipline
+    /// the caches use for their per-slot metadata.
+    fill_cursors: Box<[UnsafeCell<FillCursor>]>,
     /// How ring slots map to nodes and home workers (shared by all contexts).
     layout: RingLayout,
     /// Each dataflow's operators that keep ring slots outside the caches and can
-    /// give them back, keyed by dataflow id. Consulted only after both caches
+    /// give them back, keyed by dataflow id. Consulted only after the caches
     /// have swept their whole region without finding a slot nobody holds. A
     /// `RefCell` because the context is reached through a shared reference; it
     /// is per worker thread, so the borrow never contends.
@@ -274,16 +276,18 @@ impl MemoryContext {
     /// freely, and reading is all this does.
     pub fn read_all_blocks(&self) -> Vec<MemoryBlockStatus> {
         (0..self.ring.len())
-            .map(|slot| read_block_status(&self.ring, &self.clock, &self.layout, slot))
+            .map(|slot| {
+                read_block_status(&self.ring, &self.clock, &self.caches, &self.layout, slot)
+            })
             .collect()
     }
 
-    pub fn compressed_cache(&self) -> &CompressedCache {
-        self.compressed_cache.as_ref()
+    pub fn caches(&self) -> &Caches {
+        self.caches.as_ref()
     }
 
-    pub fn decompressed_cache(&self) -> &DecompressedCache {
-        self.decompressed_cache.as_ref()
+    pub fn page_caches(&self) -> &PageCaches {
+        &self.page_caches
     }
 
     pub fn clock(&self) -> &Clock {
@@ -294,20 +298,13 @@ impl MemoryContext {
         self.ring.as_ref()
     }
 
-    /// This worker's compressed-cache fill cursor (the bump allocator missed reads
-    /// are packed into). Sound because the context is per-thread, so the returned
-    /// `&mut` never aliases another accessor on the same thread.
+    /// This worker's fill cursor for `cache`: the bump pointer its entries are
+    /// packed through. Sound because the context is per-thread, so the
+    /// returned `&mut` never aliases another accessor on the same thread; a
+    /// caller must still not hold two of them for the same cache at once.
     #[allow(clippy::mut_from_ref)] // interior mutability; per-thread, single accessor
-    pub(crate) fn compressed_fill_cursor(&self) -> &mut FillCursor {
-        unsafe { &mut *self.compressed_fill_cursor.get() }
-    }
-
-    /// This worker's decompressed-cache fill cursor (the bump allocator pages are
-    /// packed into). Same soundness argument as
-    /// [`compressed_fill_cursor`](Self::compressed_fill_cursor).
-    #[allow(clippy::mut_from_ref)] // interior mutability; per-thread, single accessor
-    pub(crate) fn decompressed_fill_cursor(&self) -> &mut FillCursor {
-        unsafe { &mut *self.decompressed_fill_cursor.get() }
+    pub(crate) fn fill_cursor(&self, cache: CacheId) -> &mut FillCursor {
+        unsafe { &mut *self.fill_cursors[cache.index()].get() }
     }
 
     /// Return a buffer index to the pool.
@@ -419,9 +416,7 @@ impl MemoryContext {
             }
             contended.release();
 
-            // Evict via the shared clock, which takes from whichever tier is
-            // over its target share (decompressed, in the common case of a
-            // large decompressed working set).
+            // Evict via the shared clock.
             let evicted = self.evict();
             self.note_buffer_taken();
             return evicted;
@@ -456,56 +451,66 @@ impl MemoryContext {
         }
     }
 
-    /// Evict a ring slot via the shared CLOCK and return it writable. Each
-    /// iteration re-picks which tier to take from - compressed while its share
-    /// of cached slots exceeds the target percentage, decompressed otherwise
-    /// (see [`Clock::preferred_victim_tier`]) - advances that tier's hand, and
-    /// routes the victim to its cache's reclaim.
+    /// Evict a ring slot via the shared CLOCK and return it writable.
     ///
-    /// A tier with no slot to give in this region, because it owns none or
+    /// Every cache has a hand of its own over this worker's region, and each
+    /// family with a slot to give moves one of them a step at a time: that of
+    /// the member holding more than its target share of the family's slots
+    /// (see [`FamilySpec::choose_member_to_evict`]). A slot that hand passes
+    /// spends a life or, at zero, is reclaimed from its cache, which then
+    /// reinforces its siblings over what it dropped. The families' hands move
+    /// in step, so between families a slot goes sooner the fewer lives it
+    /// holds.
+    ///
+    /// A member with no slot to give in this region, because it owns none or
     /// because readers hold every slot it owns, is not swept at all, and when
-    /// neither tier has one the registered
-    /// [`Evict`](crate::memory::evict::Evict) operators are asked at
-    /// once. When both caches have swept their region without giving a slot,
-    /// the operators are asked before the caches are swept again.
+    /// no cache has one the registered [`Evict`](crate::memory::evict::Evict)
+    /// operators are asked at once. A member swept without giving a slot
+    /// hands over to the next member of its family; once every member has
+    /// been swept that way, the operators are asked before the caches are
+    /// swept again.
+    ///
+    /// [`FamilySpec::choose_member_to_evict`]: crate::memory::cache::FamilySpec::choose_member_to_evict
     pub(crate) fn evict(&self) -> WriteBuffer {
+        let ring_len = self.layout.node_slots(self.node).len() as u64;
+        let max_lives = self.clock.max_lives() as u64;
+        // A full drain is the most revolutions a hand needs to reach any
+        // victim of its cache: one per life a slot can hold, plus the
+        // revolution that finds it at zero. A hand that swept that much
+        // without a slot being reclaimed has nothing to give, so the next
+        // member of its family gets a full drain of its own, regardless of
+        // share, and the members keep taking turns in whole drains. Anything
+        // shorter for the next hand cannot reach a slot that still holds
+        // lives.
+        //
+        // A revolution that aged nothing cannot produce a victim by going on:
+        // the caches being swept have no lives left to drain in this region,
+        // so their zero-life slots (all held by readers or writers, since the
+        // revolution ended without a victim) will look the same next time
+        // round. Such a revolution hands over at once instead of repeating
+        // itself for the rest of the drain.
+        let drain = (max_lives + 1) * ring_len;
+        let members_to_try = self.caches.count_members_of_largest_family();
         // Livelock guard. When a query's working set exceeds the ring, every
         // worker spins here finding nothing evictable (near-100% CPU, ~0 forward
         // progress, and the loop has no cancellation point). A healthy hand finds
         // a victim within the lives ceiling's worth of revolutions (a counter
-        // reaches zero in at most that many), so more than both hands' worth
-        // combined is abnormal: warn and sleep to let peer workers / ingest
-        // release slots; if it still finds nothing, the cache is genuinely
-        // exhausted, so panic to abort the offending query. The sweep covers
-        // only this worker's node region, so every bound is region-sized.
-        let ring_len = self.layout.node_slots(self.node).len() as u64;
-        let max_lives = self.clock.max_lives() as u64;
-        let warn_at = (2 * max_lives + 2) * ring_len;
+        // reaches zero in at most that many), so more than a full drain of
+        // every member of a family in turn is abnormal: warn and sleep to let
+        // peer workers / ingest release slots; if it still finds nothing, the
+        // cache is genuinely exhausted, so panic to abort the offending query.
+        // The sweep covers only this worker's node region, so every bound is
+        // region-sized.
+        let warn_at = members_to_try as u64 * drain;
         let mut iterations: u64 = 0;
         let mut panic_at: Option<u64> = None;
-        // A full drain is the most revolutions a hand needs to reach any
-        // victim in its tier: one per life a slot can hold, plus the revolution
-        // that finds it at zero. A hand that swept that much without reclaiming
-        // anything has nothing to give, so the other tier gets a full drain of
-        // its own, regardless of share, and the two keep alternating in whole
-        // drains. Anything shorter for the other hand cannot reach a slot that
-        // still holds lives.
-        //
-        // A revolution that aged nothing cannot produce a victim by going on:
-        // the tier has no lives left to drain in this region, so its zero-life
-        // slots (all held by readers or writers, since the revolution ended
-        // without a victim) or its absence from the region will look the same
-        // next time round. Such a revolution hands over at once instead of
-        // repeating itself for the rest of the drain.
-        let drain = (max_lives + 1) * ring_len;
-        let mut ticks_without_success: u64 = 0;
+        let mut rounds_without_a_slot: u64 = 0;
         let mut aged_this_revolution: u64 = 0;
-        let mut sweeping_other_tier = false;
-        // How many times a tier's sweep ended with nothing to give. Once both
-        // tiers have, the caches hold nothing unpinned right now, and the
-        // operators keeping slots outside the caches are the only remaining
-        // source.
-        let mut tiers_exhausted: u32 = 0;
+        // How many times a sweep ended with nothing to give. Once that has
+        // happened for every member of a family, the caches hold nothing
+        // unpinned right now, and the operators keeping slots outside the
+        // caches are the only remaining source.
+        let mut sweeps_given_up: usize = 0;
         loop {
             iterations += 1;
             if panic_at.is_none() && iterations == warn_at {
@@ -520,16 +525,33 @@ impl MemoryContext {
                 );
             }
 
-            // A hand can only take a slot its tier owns and no reader holds.
-            // The counts of those are shared with peer workers, so a slot may
-            // be bound or let go of between reading them and sweeping. Skipping
-            // a tier that has none is still safe: at worst such a slot waits
-            // until the next time round to be found.
-            let compressed_unpinned = self.clock.unpinned_in_region(Owner::Compressed, self.node);
-            let decompressed_unpinned = self
-                .clock
-                .unpinned_in_region(Owner::Decompressed, self.node);
-            if compressed_unpinned == 0 && decompressed_unpinned == 0 {
+            // One round: a step of one hand for each family with a slot to
+            // give. A hand can only take a slot its cache owns and no reader
+            // holds. The counts of those are shared with peer workers, so a
+            // slot may be bound or let go of between reading them and
+            // sweeping. Passing over a member that has none is still safe: at
+            // worst such a slot waits until the next time round to be found.
+            let mut moved_a_hand = false;
+            for family in self.caches.families() {
+                let Some(cache) = family.choose_member_to_evict(
+                    |member| self.clock.count_owned_in_region(member, self.node),
+                    |member| self.clock.count_unpinned_in_region(member, self.node) > 0,
+                    sweeps_given_up,
+                ) else {
+                    continue;
+                };
+                moved_a_hand = true;
+                let step = self.clock.sweep(cache, self.node);
+                if let Sweep::Candidate(slot) = step
+                    && let Some(write_buffer) = self.caches.reclaim(cache, slot)
+                {
+                    return write_buffer;
+                }
+                if step == Sweep::Aged {
+                    aged_this_revolution += 1;
+                }
+            }
+            if !moved_a_hand {
                 // Whatever is cached in this region is held by readers, so the
                 // caches have nothing to give back and only the operators can.
                 if let Some(buffer) = self.evict_from_dataflow_operators() {
@@ -542,43 +564,13 @@ impl MemoryContext {
                 continue;
             }
 
-            let mut tier = self.clock.preferred_victim_tier(self.node);
-            if sweeping_other_tier {
-                tier = match tier {
-                    Owner::Compressed => Owner::Decompressed,
-                    Owner::Decompressed => Owner::Compressed,
-                };
-            }
-            // A tier with nothing a hand could take is not worth sweeping; take
-            // from the other one.
-            tier = match tier {
-                Owner::Compressed if compressed_unpinned == 0 => Owner::Decompressed,
-                Owner::Decompressed if decompressed_unpinned == 0 => Owner::Compressed,
-                tier => tier,
-            };
-
-            let step = self.clock.sweep(tier, self.node);
-            let reclaimed = match step {
-                Sweep::Candidate(slot) => match tier {
-                    Owner::Compressed => self.compressed_cache.reclaim(slot),
-                    Owner::Decompressed => self.decompressed_cache.reclaim(slot),
-                },
-                Sweep::Skipped | Sweep::Aged => None,
-            };
-            if let Some(write_buffer) = reclaimed {
-                return write_buffer;
-            }
-            ticks_without_success += 1;
-            if step == Sweep::Aged {
-                aged_this_revolution += 1;
-            }
-            if ticks_without_success.is_multiple_of(ring_len) {
-                let drained = ticks_without_success.is_multiple_of(drain);
+            rounds_without_a_slot += 1;
+            if rounds_without_a_slot.is_multiple_of(ring_len) {
+                let drained = rounds_without_a_slot.is_multiple_of(drain);
                 let nothing_left_to_drain = aged_this_revolution == 0;
                 if drained || nothing_left_to_drain {
-                    sweeping_other_tier = !sweeping_other_tier;
-                    tiers_exhausted += 1;
-                    if tiers_exhausted >= 2 {
+                    sweeps_given_up += 1;
+                    if sweeps_given_up >= members_to_try {
                         if let Some(buffer) = self.evict_from_dataflow_operators() {
                             return buffer;
                         }
@@ -621,8 +613,7 @@ impl MemoryContext {
     /// leaves out this worker's own spilled slots, which only it can count.
     pub fn slots_to_spill(&self) -> usize {
         let free = self.dirty_pool.free_slots() + self.zeroed_pool.free_slots();
-        let cached = self.clock.owned_in_region(Owner::Compressed, self.node)
-            + self.clock.owned_in_region(Owner::Decompressed, self.node);
+        let cached = self.clock.count_cached_in_region(self.node);
         let spilled = self.buffers_spilled[self.node].load(Ordering::Relaxed);
         let slots = self.layout.node_slots(self.node).len();
         let start = slots * get_reclaimable_slots_start_percent() / 100;
@@ -886,14 +877,14 @@ mod tests {
     //! Tests for [`MemoryContext`] - the zeroed/dirty pair, fallback rules,
     //! and the buffer accessors. Single-pool routing lives in
     //! [`crate::memory::free_pool`]'s tests; here we only exercise behaviour
-    //! that comes from owning *both* pools (plus the ring and compressed cache).
+    //! that comes from owning *both* pools (plus the ring and the caches).
     //!
     //! Each test installs a fresh [`MemoryContext`] on its own thread via
     //! [`init_test_free_pool`], so there's no shared state and no lock.
 
     use super::*;
-    use crate::memory::ReadBuffer;
     use crate::memory::evict::{Evict, HandOverEvictor};
+    use crate::memory::{ReadBuffer, RingCache};
     use std::rc::Rc;
 
     #[test]
@@ -920,9 +911,8 @@ mod tests {
     fn evict_asks_the_operators_without_sweeping_when_readers_hold_every_cached_slot() {
         init_test_free_pool(2);
         let cached = memory_ctx().get_write_buffer(false);
-        memory_ctx()
-            .clock()
-            .bind(cached.slot_idx, Owner::Decompressed);
+        let decompressed = memory_ctx().page_caches().decompressed.id();
+        memory_ctx().clock().bind(cached.slot_idx, decompressed);
         let _reader = ReadBuffer::from(cached);
         let held = memory_ctx().get_write_buffer(false);
         let held_slot = held.slot_idx;
@@ -936,10 +926,7 @@ mod tests {
         let evicted = memory_ctx().evict();
 
         assert_eq!(evicted.slot_idx, held_slot);
-        assert_eq!(
-            memory_ctx().clock().hand_position(Owner::Decompressed, 0),
-            0
-        );
+        assert_eq!(memory_ctx().clock().hand_position(decompressed, 0), 0);
         memory_ctx().unregister_dataflow_evictors(7);
     }
 
@@ -948,21 +935,22 @@ mod tests {
         init_test_free_pool(1);
         let cached = memory_ctx().get_write_buffer(false);
         let cached_slot = cached.slot_idx;
-        memory_ctx().clock().bind(cached_slot, Owner::Decompressed);
+        let decompressed = memory_ctx().page_caches().decompressed.id();
+        memory_ctx().clock().bind(cached_slot, decompressed);
         let first_reader = ReadBuffer::from(cached);
         let second_reader = memory_ctx().ring().try_read(cached_slot).unwrap();
 
         let with_two_readers = memory_ctx()
             .clock()
-            .unpinned_in_region(Owner::Decompressed, 0);
+            .count_unpinned_in_region(decompressed, 0);
         drop(first_reader);
         let with_one_reader = memory_ctx()
             .clock()
-            .unpinned_in_region(Owner::Decompressed, 0);
+            .count_unpinned_in_region(decompressed, 0);
         drop(second_reader);
         let with_no_reader = memory_ctx()
             .clock()
-            .unpinned_in_region(Owner::Decompressed, 0);
+            .count_unpinned_in_region(decompressed, 0);
 
         assert_eq!(
             (with_two_readers, with_one_reader, with_no_reader),
@@ -975,8 +963,9 @@ mod tests {
         // 128 slots, so spilling starts under 12 reclaimable; 5 free plus 10
         // cached.
         init_test_free_pool(5);
+        let compressed = memory_ctx().page_caches().compressed.id();
         for idx in 5..15 {
-            memory_ctx().clock().bind(idx, Owner::Compressed);
+            memory_ctx().clock().bind(idx, compressed);
         }
 
         let shortfall = memory_ctx().slots_to_spill();

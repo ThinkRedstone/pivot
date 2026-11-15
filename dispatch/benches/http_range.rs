@@ -55,6 +55,7 @@ use url::Url;
 use dispatch::io::{
     FileRange, IORequester, OpenFile, PendingReadRequest, ReadRequestId, RemoteFile,
 };
+use dispatch::memory::RingCache;
 use dispatch::memory::init_test_free_pool;
 use dispatch::{BUFFER_SIZE, StatsCollector, memory_ctx};
 
@@ -283,6 +284,7 @@ fn run_batch(
                     id: ReadRequestId(off),
                     open_file: loc.clone(),
                     locations: vec![FileRange::new(off, block)],
+                    cache: memory_ctx().page_caches().compressed.id(),
                 },
                 stats,
             )
@@ -303,7 +305,7 @@ fn bench_transport(c: &mut Criterion, name: &str, tls: bool) {
     let url = Url::parse(&format!("{scheme}://127.0.0.1:{port}/obj")).unwrap();
     let remote = Arc::new(RemoteFile::open(url, None, 1_000_000_000_000).unwrap());
     let loc = OpenFile::Remote(remote.clone());
-    memory_ctx().compressed_cache().open_entry(loc.clone());
+    memory_ctx().caches().invalidate_reopened_file(&loc);
 
     let mut requester = IORequester::with_http_config(client_config());
     let mut stats = StatsCollector::disabled();
@@ -324,7 +326,7 @@ fn bench_transport(c: &mut Criterion, name: &str, tls: bool) {
         // amortised and we measure the steady-state request hot path.
         b.iter_batched(
             || {
-                memory_ctx().compressed_cache().clear();
+                memory_ctx().page_caches().compressed.clear();
             },
             |_| {
                 let bytes = run_batch(&mut requester, &mut stats, &loc, reads, block, &offset);

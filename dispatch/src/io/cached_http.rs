@@ -29,7 +29,7 @@ use crate::io::{
     Completion, DataFlowRequest, FailedIO, HttpGetRequest, HttpUploadRequest, OpenFile,
     RemoteReadTime, RemoteSplit,
 };
-use crate::memory::compressed_cache::MissingExtent;
+use crate::memory::cache::MissingExtent;
 use std::collections::HashMap;
 use std::sync::Arc;
 

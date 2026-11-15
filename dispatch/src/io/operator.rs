@@ -7,6 +7,7 @@
 
 use super::{LocalFile, OpenFile};
 use crate::io::requester::resolve_read_through_cache;
+use crate::memory::cache::{CacheId, CompressedCache, RingCache};
 use crate::memory::{FileBytes, Slab};
 use bytes::Bytes;
 use std::cell::RefCell;
@@ -116,6 +117,9 @@ pub struct PendingReadRequest {
     pub id: ReadRequestId,
     pub open_file: OpenFile,
     pub locations: Vec<FileRange>,
+    /// The compressed cache the bytes are read through: the one of the family
+    /// the data belongs to, so they are balanced against its derived forms.
+    pub cache: CacheId,
 }
 
 /// One range of a direct read: the `slab.size()` bytes at `offset` of the
@@ -179,8 +183,11 @@ impl<'a> OperatorIO<'a> {
         }
     }
 
+    /// Read file bytes through the compressed cache `cache`, so what the read
+    /// brings in is cached beside that cache's family.
     pub fn read(
         &mut self,
+        cache: &CompressedCache,
         open_file: OpenFile,
         locations: impl IntoIterator<Item = FileRange>,
     ) -> Result<ReadRequestId, crate::io::IORequesterError> {
@@ -190,6 +197,7 @@ impl<'a> OperatorIO<'a> {
             id,
             open_file,
             locations: locations.into_iter().collect(),
+            cache: cache.id(),
         };
         // Resolving may allocate cache slots, and so evict, before the borrow.
         let cache_lookups = resolve_read_through_cache(&request);

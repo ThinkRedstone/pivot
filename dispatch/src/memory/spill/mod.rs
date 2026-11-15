@@ -183,6 +183,7 @@ impl<'a> Spiller<'a> {
 mod tests {
     use super::*;
     use crate::io::IORequester;
+    use crate::memory::slab::SlabBacking;
     use crate::memory::{BUFFER_SIZE, FrozenSlab, Slab, init_test_free_pool};
     use crate::stats::StatsCollector;
     use std::cell::RefCell;
@@ -228,7 +229,7 @@ mod tests {
             Slab::new(
                 unsafe { buffer.ptr.add(offset) },
                 SPILL_BLOCK_SIZE,
-                buffer.clone(),
+                SlabBacking::Working(buffer.clone()),
             )
             .freeze()
         };

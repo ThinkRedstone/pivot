@@ -4,7 +4,7 @@
 //! slots of their own, such as a group-by's partition buffers, are outside that
 //! sweep, so each dataflow registers the operators that can give slots back in
 //! a [`DataflowEvict`] with the worker's memory context. The context turns to
-//! those only after both caches have swept their whole region and found every
+//! those only after the caches have swept their whole region and found every
 //! slot pinned.
 
 use crate::graph::Graph;

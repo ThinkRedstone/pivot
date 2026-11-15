@@ -282,17 +282,16 @@ impl Function {
             Function::TemporalConvert(c) => c.compile(),
             Function::NormalizedInterval(n) => n.compile(),
             Function::VariantGet(v) => v.compile(),
-            // `drop_cache()` evicts pivot's in-memory compressed cache *and* the on-disk
-            // cache (so remote reads go cold to the network) as a side effect, then
+            // `drop_cache()` evicts every in-memory cache *and* the on-disk cache
+            // (so remote reads go cold to the network) as a side effect, then
             // returns the total entries dropped. Evaluated over the single
             // `DummyScan` row on a worker thread (where `memory_ctx` and the
             // worker's disk-cache handle are valid), so the eviction happens
             // exactly once; the returned array matches the (one-row) batch.
             Function::DropCache => Ok(stateless_expr(|batch: &RecordBatch| {
-                let extents = dispatch::memory_ctx().compressed_cache().clear();
-                let decompressed = dispatch::memory_ctx().decompressed_cache().clear();
+                let in_memory = dispatch::memory_ctx().caches().clear_all();
                 let objects = dispatch::io::clear_disk_cache();
-                let evicted = (extents + decompressed + objects) as i64;
+                let evicted = (in_memory + objects) as i64;
                 ExprResult::Array(Arc::new(Int64Array::from(vec![evicted; batch.num_rows()])))
             })),
         }

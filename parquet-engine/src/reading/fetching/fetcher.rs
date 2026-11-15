@@ -19,6 +19,7 @@ use crate::types::requests::{RowGroupBuffer, RowGroupRequest};
 use dispatch::Sender;
 use dispatch::Unary;
 use dispatch::io::{OperatorIO, ReadRequestId, ReadResponse};
+use dispatch::memory::memory_ctx;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -104,7 +105,11 @@ impl Unary<QueryRowGroupMetadata, RowGroupBuffer> for RowGroupFetcher {
             sender.send(request.into_row_group_buffer(None))?;
             return Ok(());
         }
-        let id = io.read(request.open_file().clone(), request.file_ranges())?;
+        let id = io.read(
+            &memory_ctx().page_caches().compressed,
+            request.open_file().clone(),
+            request.file_ranges(),
+        )?;
         self.in_flight.insert(id, request);
         Ok(())
     }

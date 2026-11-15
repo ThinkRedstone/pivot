@@ -58,7 +58,7 @@ pub struct CompressedPage {
     /// `decompressed` is `Some` - the page's bytes live there instead.
     pub data: Vec<Bytes>,
     /// This page's bytes, already decompressed - set when a
-    /// [`DecompressedCache`](dispatch::memory::DecompressedCache) range lookup found
+    /// decompressed page cache range lookup found
     /// it before any IO was issued (see
     /// [`requests::CachedColumnChunk`](crate::types::requests::CachedColumnChunk)).
     /// `None` for a normal compressed page.

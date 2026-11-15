@@ -90,20 +90,20 @@ impl RowGroupRequest {
                 ColumnReference::InFile {
                     codec: meta.codec,
                     parts: memory_ctx()
-                        .decompressed_cache()
+                        .page_caches()
+                        .decompressed
                         .get_range(&open_file, offset, len)
                         .into_iter()
                         .map(|segment| match segment {
                             Segment::Cached {
                                 offset,
                                 span,
-                                header,
-                                data,
+                                value: page,
                             } => ColumnChunkReference::Cached(CachedColumnChunk::Decompressed {
                                 offset,
                                 span,
-                                header: Box::new(Self::parse_page_header(&header)),
-                                data,
+                                header: Box::new(Self::parse_page_header(&page.header)),
+                                data: page.data,
                             }),
                             Segment::Gap { offset, len } => {
                                 ColumnChunkReference::ToRead(FileRange::new(offset, len))

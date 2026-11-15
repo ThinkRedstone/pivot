@@ -162,6 +162,7 @@ impl Evict for SharedPartitionEvictor {
 mod tests {
     use super::*;
     use crate::io::FileRange;
+    use crate::memory::slab::SlabBacking;
     use crate::memory::{Slab, init_test_free_pool};
     use std::sync::atomic::AtomicUsize;
 
@@ -172,7 +173,7 @@ mod tests {
     fn spilled(partition_group_slot: usize, writes_in_flight: usize) -> SpilledBuffer {
         memory_ctx().record_buffers_spilled(1);
         let buffer = Arc::new(memory_ctx().get_write_buffer(false));
-        let slab = Slab::new(buffer.ptr, 1024, buffer.clone()).freeze();
+        let slab = Slab::new(buffer.ptr, 1024, SlabBacking::Working(buffer.clone())).freeze();
         SpilledBuffer {
             writes_in_flight: Arc::new(AtomicUsize::new(writes_in_flight)),
             slabs: vec![SpilledSlab {

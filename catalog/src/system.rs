@@ -549,15 +549,14 @@ fn memory_block_arrays(blocks: &[MemoryBlockStatus]) -> Vec<ArrayRef> {
     ]
 }
 
-/// The name a block's state answers to in the `state` column. These are the
-/// values queries compare against, so they are spelled here, with the relation
-/// serving them, rather than by the memory subsystem being described.
+/// The name a block's state answers to in the `state` column. A cached block
+/// answers to its cache's registered name (`compressed_cache`,
+/// `decompressed_cache`, ...).
 fn state_name(state: MemoryBlockState) -> &'static str {
     match state {
         MemoryBlockState::Free => "free",
         MemoryBlockState::Pinned => "pinned",
-        MemoryBlockState::CompressedCache => "compressed_cache",
-        MemoryBlockState::DecompressedCache => "decompressed_cache",
+        MemoryBlockState::Cached { cache } => cache,
     }
 }
 

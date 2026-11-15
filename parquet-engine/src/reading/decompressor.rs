@@ -18,7 +18,7 @@ use bytes::Bytes;
 use dispatch::DefaultUnaryFactory;
 use dispatch::Sender;
 use dispatch::Unary;
-use dispatch::memory::{BlockKey, memory_ctx};
+use dispatch::memory::{CacheKey, DecompressedPageMeta, memory_ctx};
 use snap::raw::Decoder;
 use thiserror::Error;
 use zstd::zstd_safe::{DCtx, InBuffer, OutBuffer, ResetDirective, get_error_name};
@@ -96,13 +96,14 @@ impl Decompressor {
             // The decompressed bytes depend only on the compressed input, not on the
             // per-query filter mask, so a cache hit reuses them across queries; the
             // mask is attached to the `DataPage` below either way.
-            let key = BlockKey {
-                open_file: page.row_group.get_metadata().open_file.clone(),
-                offset: page.file_offset,
-                len: page.span,
-            };
-            match memory_ctx().decompressed_cache().get(&key) {
-                Some(cached) => cached,
+            let key = CacheKey::new(
+                page.row_group.get_metadata().open_file.clone(),
+                page.file_offset,
+                page.span,
+            );
+            let cache = &memory_ctx().page_caches().decompressed;
+            match cache.get(&key) {
+                Some(cached) => cached.data,
                 // An empty page decompresses to no bytes, and the decoders
                 // reject zero input/output buffers. This happens for the
                 // dictionary page of an all-null column, e.g. the unused `value`
@@ -110,52 +111,50 @@ impl Decompressor {
                 // its typed leaf). Nothing to cache either.
                 None if page.header.uncompressed_page_size == 0 => Vec::new(),
                 None => {
-                    // Reserve the page's output region in the cache (packed into
-                    // shared slots via this worker's fill cursor), decompress
-                    // straight into it, and insert. The header is stored
-                    // alongside it, opaque to the cache, so a later `get_range`
-                    // hit can hand a caller a full page identity without touching
-                    // disk (see `requests::parse_page_header`).
+                    // Decompress straight into the cache's fill region and
+                    // publish. The header is stored alongside the bytes, opaque
+                    // to the cache, so a later range lookup can hand a caller a
+                    // full page without touching disk (see
+                    // `requests::parse_page_header`).
                     let uncompressed_size = page.header.uncompressed_page_size as usize;
-                    let mut reservation = memory_ctx()
-                        .decompressed_cache()
-                        .reserve(&key, uncompressed_size);
                     let input: Vec<&[u8]> = page.data.iter().map(|b: &Bytes| b.as_ref()).collect();
-                    let written = match page.codec {
-                        CompressionCodec::SNAPPY => self
-                            .snappy_decoder
-                            .decompress_scattered(&input, reservation.as_mut_slices())?,
-                        CompressionCodec::LZ4_RAW => lz4_flex::block::decompress_scattered(
-                            &input,
-                            &mut reservation.as_mut_slices(),
-                        )?,
-                        CompressionCodec::ZSTD => decompress_zstd_scattered(
-                            &mut self.zstd_decoder,
-                            &input,
-                            &mut reservation.as_mut_slices(),
-                        )?,
-                        // UNCOMPRESSED took the zero-copy passthrough above.
-                        other => return Err(Error::UnsupportedCodec(other)),
-                    };
-                    // The reservation's capacity says nothing about the true
-                    // page length (a disabled cache hands out whole pooled
-                    // slots), so verify the decoded byte count against the
-                    // footer's recorded size.
-                    if written != uncompressed_size {
-                        return Err(Error::DecompressedLength {
-                            written,
-                            expected: uncompressed_size,
-                        });
-                    }
-                    memory_ctx().decompressed_cache().insert(
-                        key,
-                        serialize_header(&page.header),
-                        reservation,
-                        page.row_group
-                            .get_metadata()
-                            .live_decompressed_pages
-                            .clone(),
-                    )
+                    let header = serialize_header(&page.header);
+                    let live_pages = page
+                        .row_group
+                        .get_metadata()
+                        .live_decompressed_pages
+                        .clone();
+                    let codec = page.codec;
+                    let snappy_decoder = &mut self.snappy_decoder;
+                    let zstd_decoder = &mut self.zstd_decoder;
+                    let decompressed_page = cache.insert(key, |fill| {
+                        let mut slabs = fill.get_bytes(uncompressed_size);
+                        let mut outputs: Vec<&mut [u8]> =
+                            slabs.iter_mut().map(|slab| slab.as_mut_slice()).collect();
+                        let written = match codec {
+                            CompressionCodec::SNAPPY => {
+                                snappy_decoder.decompress_scattered(&input, outputs)?
+                            }
+                            CompressionCodec::LZ4_RAW => {
+                                lz4_flex::block::decompress_scattered(&input, &mut outputs)?
+                            }
+                            CompressionCodec::ZSTD => {
+                                decompress_zstd_scattered(zstd_decoder, &input, &mut outputs)?
+                            }
+                            // UNCOMPRESSED took the zero-copy passthrough above.
+                            other => return Err(Error::UnsupportedCodec(other)),
+                        };
+                        // Verify the decoded byte count against the footer's
+                        // recorded size before publishing anything.
+                        if written != uncompressed_size {
+                            return Err(Error::DecompressedLength {
+                                written,
+                                expected: uncompressed_size,
+                            });
+                        }
+                        Ok(DecompressedPageMeta::new(header, live_pages))
+                    })?;
+                    decompressed_page.data
                 }
             }
         };

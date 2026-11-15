@@ -156,12 +156,10 @@ impl Unary<FileSlice, LoadedObject> for ObjectFetcher {
             .map_err(|error| dispatch::UnaryError::Operator(Box::new(error)))?;
         // Register the freshly opened descriptor, so a reused fd cannot serve
         // stale extents of whatever it named before.
-        memory_ctx()
-            .compressed_cache()
-            .open_entry(open_file.clone());
+        memory_ctx().caches().invalidate_reopened_file(&open_file);
         // One range, however large: the ring tiles it into cache slots
         // itself, as it does a column chunk of any size.
-        let id = io.read(open_file, [range])?;
+        let id = io.read(&memory_ctx().page_caches().compressed, open_file, [range])?;
         self.in_flight.insert(id, (file, range));
         Ok(())
     }
