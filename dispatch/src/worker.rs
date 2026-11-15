@@ -325,7 +325,7 @@ impl Worker {
     }
 
     /// While this worker has asked for less than its read-ahead budget, have
-    /// each dataflow issue one more piece of remote IO. It runs ahead of the
+    /// each dataflow issue remote IO until the budget is full. It runs ahead of the
     /// CPU work and whether or not there is any: what the worker asks for now
     /// is what it has to work on once a read's time has passed, so a worker
     /// that asked only when it ran out of work would then sit waiting.

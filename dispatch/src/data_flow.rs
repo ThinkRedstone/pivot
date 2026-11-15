@@ -702,29 +702,40 @@ impl DataFlow {
         })
     }
 
-    /// Have one operator issue one more piece of remote IO, asking those that
-    /// can in the order CPU work visits them. Returns [`WorkStatus::Ran`] if
-    /// one did. A dataflow with no such operator (the common case) costs a
-    /// single `is_empty` check.
+    /// Have the operators that issue remote IO issue it until the worker's
+    /// read-ahead budget has no room left. They are asked in the order CPU
+    /// work visits them, and each one is asked again until it has nothing
+    /// more to issue before the next one is asked. Returns
+    /// [`WorkStatus::Ran`] if any of them issued something. A dataflow with
+    /// no such operator (the common case) costs a single `is_empty` check.
     pub fn saturate_available_io(&mut self, requester: &RefCell<IORequester>) -> WorkStatus {
         if self.io_saturators.is_empty() {
             return WorkStatus::Pending;
         }
         self.try_run_or(WorkStatus::Pending, |d| {
             let mut io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_request_id);
+            let mut dataflow_status = WorkStatus::Pending;
             for &node_id in &d.io_saturators {
                 io.set_operator_idx(node_id);
-                let issued = d.graph.node_mut(node_id).run(&mut |_, operator| {
-                    Ok(match operator.saturate_available_io(&mut io)? {
-                        WorkStatus::Ran => ControlFlow::Break(()),
-                        WorkStatus::Pending => ControlFlow::Continue(()),
-                    })
-                })?;
-                if matches!(issued, Some(ControlFlow::Break(()))) {
-                    return Ok(WorkStatus::Ran);
+                loop {
+                    // Asked on its own line: the requester must not stay
+                    // borrowed while the operator borrows it to issue a read.
+                    let has_room = requester.borrow().has_read_ahead_room();
+                    if !has_room {
+                        return Ok(dataflow_status);
+                    }
+                    let node_status = d.graph.node_mut(node_id).run(&mut |_, operator| {
+                        Ok(ControlFlow::Break(operator.saturate_available_io(&mut io)?))
+                    })?;
+                    match node_status {
+                        Some(ControlFlow::Break(WorkStatus::Ran)) => {
+                            dataflow_status = WorkStatus::Ran;
+                        }
+                        _ => break,
+                    }
                 }
             }
-            Ok(WorkStatus::Pending)
+            Ok(dataflow_status)
         })
     }
 
@@ -918,6 +929,75 @@ mod tests {
             stats_tx,
             false,
         )
+    }
+
+    /// Asks for `read_bytes` of read-ahead every time it is told to saturate
+    /// the available IO, and keeps every charge so the budget stays taken.
+    struct ReadingAheadOperator {
+        read_bytes: usize,
+        charges: Vec<crate::io::ReadAheadCharge>,
+        reads_issued: Arc<AtomicUsize>,
+    }
+    impl Operator for ReadingAheadOperator {
+        fn run_cpu_work(&mut self, _io: &mut OperatorIO) -> crate::operations::Result<WorkStatus> {
+            Ok(WorkStatus::Pending)
+        }
+        fn process_fs_write_response(
+            &mut self,
+            _request: FsWriteRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn process_http_upload_response(
+            &mut self,
+            _request: HttpUploadRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
+            Ok(FinishStatus::Pending)
+        }
+        fn saturates_available_io(&self) -> bool {
+            true
+        }
+        fn saturate_available_io(
+            &mut self,
+            io: &mut OperatorIO,
+        ) -> crate::operations::Result<WorkStatus> {
+            self.charges.push(io.charge_read_ahead(self.read_bytes));
+            self.reads_issued.fetch_add(1, Ordering::Relaxed);
+            Ok(WorkStatus::Ran)
+        }
+    }
+
+    /// One pass has an operator issue reads until the worker's read-ahead
+    /// budget is full, not a single read.
+    #[test]
+    fn saturating_the_available_io_issues_reads_until_the_budget_is_full() {
+        let reads_issued = Arc::new(AtomicUsize::new(0));
+        let (err_tx, _err_rx) = mpsc::channel();
+        let (stats_tx, _stats_rx) = mpsc::channel();
+        let mut flow = DataFlow::new(
+            0,
+            Arc::new(AtomicBool::new(false)),
+            err_tx,
+            vec![Box::new(ReadingAheadOperator {
+                read_bytes: 10,
+                charges: Vec::new(),
+                reads_issued: reads_issued.clone(),
+            })],
+            vec![None],
+            Vec::new(),
+            HashMap::default(),
+            stats_tx,
+            false,
+        );
+        let mut requester = IORequester::default();
+        requester.force_read_ahead_budget(30);
+
+        flow.saturate_available_io(&RefCell::new(requester));
+
+        assert_eq!(reads_issued.load(Ordering::Relaxed), 3);
     }
 
     #[test]
