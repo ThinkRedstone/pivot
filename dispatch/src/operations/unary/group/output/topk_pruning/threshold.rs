@@ -59,13 +59,23 @@ impl TopKThreshold {
     }
 
     /// Offers one fully merged group's weight.
-    #[inline]
+    #[inline(always)]
     pub fn offer(&self, weight: u64) {
         // Full and not an improvement: the common case after warmup.
         let kth = self.kth_best.load(Ordering::Relaxed);
         if kth != 0 && weight <= kth {
             return;
         }
+        self.offer_under_lock(weight);
+    }
+
+    /// Adds a weight that may raise the k-th best.
+    ///
+    /// Never inlined. The caller is a loop over every group of a table, and
+    /// the lock and the heap inside it would otherwise take the registers the
+    /// loop keeps its own values in.
+    #[inline(never)]
+    fn offer_under_lock(&self, weight: u64) {
         let mut top = self.top.lock().unwrap();
         if top.len() < self.cap {
             top.push(Reverse(weight));
