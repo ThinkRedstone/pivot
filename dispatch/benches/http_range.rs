@@ -276,6 +276,8 @@ fn run_batch(
 ) -> usize {
     for _ in 0..reads {
         let off = offset.fetch_add(block as u64, Ordering::Relaxed) as usize;
+        let compressed = &memory_ctx().page_caches().compressed;
+        let cache_lookups = vec![compressed.get(loc, off, block)];
         requester
             .request_read(
                 0,
@@ -284,8 +286,9 @@ fn run_batch(
                     id: ReadRequestId(off),
                     open_file: loc.clone(),
                     locations: vec![FileRange::new(off, block)],
-                    cache: memory_ctx().page_caches().compressed.id(),
+                    cache: compressed.id(),
                 },
+                cache_lookups,
                 stats,
             )
             .unwrap();
