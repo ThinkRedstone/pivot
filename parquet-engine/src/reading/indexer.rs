@@ -393,7 +393,7 @@ mod tests {
                 })
                 .collect(),
             worker_id: 0,
-            read_ahead_charge: dispatch::io::ReadAheadBudget::of_bytes(0).charge(0),
+            read_ahead_charge: None,
         }
     }
 

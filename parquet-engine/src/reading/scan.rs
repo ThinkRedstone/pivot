@@ -16,7 +16,7 @@ use arrow_array::RecordBatch;
 use dispatch::{
     DataFlowDispatcher, OperatorFactory, OperatorSpec, Projection, RECORD_BATCH_SIZE,
     RecordBatchOperatorSpec, RootUnaryOperatorFactory, UnaryOperatorFactory, return_to_worker_mpsc,
-    stealable, stealable_fifo, to_single_worker_mpsc,
+    shared_work_queue, stealable, stealable_fifo, to_single_worker_mpsc,
 };
 
 use crate::{
@@ -157,22 +157,33 @@ pub fn table_input_with_filter_and_eq_predicates(
     // decrement it, and a Top-N scan throttles its claims against it while
     // its boundary converges (see `RowGroupInjector`).
     let outstanding_row_groups = Arc::new(AtomicUsize::new(0));
-    let injector = RowGroupInjectorFactory::new(
-        table,
-        projection.clone(),
-        filter,
-        scan_order,
-        outstanding_row_groups.clone(),
-        dispatcher.topology().node_count,
-    );
+    // A Top-N scan asks for no read ahead of its CPU work: a row group asked
+    // for early is judged against a boundary that has not tightened yet.
+    let reads_ahead_of_cpu_work = scan_order.is_none();
+    let (in_memory_injector, io_row_groups_injector) =
+        RowGroupInjectorFactory::create_by_expected_need(
+            table,
+            projection.clone(),
+            filter,
+            scan_order,
+            outstanding_row_groups.clone(),
+            dispatcher.topology().node_count,
+        );
     let siblings = Arc::new(AtomicUsize::new(n));
     let shared_projection = Arc::new(projection.clone());
     let read_medium = table.get_read_medium();
-    let factories: Vec<_> = (0..n)
-        .map(|_| {
+    let factories: Vec<_> = shared_work_queue::<QueryRowGroupMetadata>(n)
+        .into_iter()
+        .map(|uncached_row_groups_channel| {
             RootUnaryOperatorFactory::new(
-                RowGroupFetcherFactory::new(shared_projection.clone(), read_medium),
-                injector.clone(),
+                RowGroupFetcherFactory::new(
+                    shared_projection.clone(),
+                    read_medium,
+                    reads_ahead_of_cpu_work,
+                    io_row_groups_injector.clone(),
+                    uncached_row_groups_channel,
+                ),
+                in_memory_injector.clone(),
                 siblings.clone(),
             )
         })
@@ -217,19 +228,33 @@ pub fn materialize(
     let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(n, host)
         .into_iter()
         .zip(stealable::<QueryRowGroupMetadata>(dispatcher.topology()))
-        .map(|(rb_ch, rq_ch)| {
-            UnaryOperatorFactory::new(
+        // The row groups the materializer expects to need a read go to one
+        // queue every worker's fetcher takes from.
+        .zip(shared_work_queue::<QueryRowGroupMetadata>(n))
+        // The row groups a fetcher expected to be in memory and found to need a
+        // read go to another queue every worker's fetcher takes from.
+        .zip(shared_work_queue::<QueryRowGroupMetadata>(n))
+        .map(
+            |(((rb_ch, rq_ch), io_row_groups_channel), uncached_row_groups_channel)| {
                 UnaryOperatorFactory::new(
-                    heads.pop_front().unwrap(),
-                    MaterializerFactory::new(table.clone()),
-                    rb_ch,
-                    siblings_materializer.clone(),
-                ),
-                RowGroupFetcherFactory::new(shared_projection.clone(), read_medium),
-                rq_ch,
-                siblings_fetcher.clone(),
-            )
-        })
+                    UnaryOperatorFactory::new(
+                        heads.pop_front().unwrap(),
+                        MaterializerFactory::new(table.clone(), io_row_groups_channel.clone()),
+                        rb_ch,
+                        siblings_materializer.clone(),
+                    ),
+                    RowGroupFetcherFactory::new(
+                        shared_projection.clone(),
+                        read_medium,
+                        true,
+                        io_row_groups_channel,
+                        uncached_row_groups_channel,
+                    ),
+                    rq_ch,
+                    siblings_fetcher.clone(),
+                )
+            },
+        )
         .collect();
     let input = OperatorSpec::new(dispatcher, factories);
     read_parquet(

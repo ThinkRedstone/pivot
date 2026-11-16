@@ -11,7 +11,7 @@
 //! justify those costs.
 
 use crate::operations::channels;
-use crate::operations::channels::{ChannelFactory, Receiver, Sender};
+use crate::operations::channels::{ChannelFactory, Receiver, RootChannelFactory, Sender};
 use crate::waker::worker_waker;
 use crossbeam_deque::{Injector, Steal};
 use std::sync::Arc;
@@ -19,6 +19,36 @@ use std::sync::Arc;
 /// Builds one worker's sender and receiver for the shared queue.
 pub struct SharedWorkQueueChannelFactory<T: Send> {
     queue: Arc<Injector<T>>,
+}
+
+// `Injector<T>` is shared through the `Arc`, so cloning the factory needs no
+// `T: Clone`, which a derive would ask for.
+impl<T: Send> Clone for SharedWorkQueueChannelFactory<T> {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+        }
+    }
+}
+
+impl<T: Send> SharedWorkQueueChannelFactory<T> {
+    /// A sender into the queue, for an operator that sends to it beside its
+    /// own output channel.
+    pub fn build_sender(&self) -> SharedWorkQueueSender<T> {
+        SharedWorkQueueSender {
+            queue: self.queue.clone(),
+        }
+    }
+}
+
+/// The receiving side alone, for an operator that takes from the queue beside
+/// its own input channel.
+impl<T: Send + 'static> RootChannelFactory<T> for SharedWorkQueueChannelFactory<T> {
+    type Receiver = SharedWorkQueueReceiver<T>;
+
+    fn build(self) -> Self::Receiver {
+        SharedWorkQueueReceiver { queue: self.queue }
+    }
 }
 
 impl<T: Send + 'static> ChannelFactory<T> for SharedWorkQueueChannelFactory<T> {

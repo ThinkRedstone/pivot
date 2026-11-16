@@ -7,6 +7,12 @@
 //! one [`QueryRowGroupMetadata`] per row group with sorted indices so that the
 //! downstream Parquet reader can fetch only the rows that passed a filter,
 //! reading them sequentially within each row group for optimal IO.
+//!
+//! A row group goes one of two ways, as in a table scan. One the decompressed
+//! cache holds pages of is expected to be in memory, and is sent down the
+//! channel for a fetcher to take when its worker has no other work. Any other
+//! is expected to need a read, and is pushed to a queue the fetchers take
+//! from ahead of their workers' CPU work.
 
 use crate::ParquetTable;
 use crate::reading::record_batch_metadata::{global_row_group, row_index};
@@ -16,9 +22,11 @@ use arrow_array::{Array, RecordBatch, UInt32Array};
 use dispatch::BuildContext;
 use dispatch::Sender;
 use dispatch::{Built, BuiltUnary};
+use dispatch::{SharedWorkQueueChannelFactory, SharedWorkQueueSender};
 use dispatch::{Unary, UnaryFactory};
 use std::mem;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 /// Factory for creating [`Materializer`] instances within the unary pipeline.
 ///
@@ -27,14 +35,23 @@ use std::sync::Arc;
 /// Consumed once via [`UnaryFactory::build_unary`].
 pub struct MaterializerFactory {
     table: Arc<ParquetTable>,
+    io_row_groups_channel: SharedWorkQueueChannelFactory<QueryRowGroupMetadata>,
 }
 
 impl MaterializerFactory {
     /// Creates a new factory.
     ///
     /// * `table` – shared handle to the Parquet table metadata.
-    pub fn new(table: Arc<ParquetTable>) -> Self {
-        Self { table }
+    /// * `io_row_groups_channel` – the queue the row groups expected to need a
+    ///   read are sent to, shared with every worker's fetcher.
+    pub fn new(
+        table: Arc<ParquetTable>,
+        io_row_groups_channel: SharedWorkQueueChannelFactory<QueryRowGroupMetadata>,
+    ) -> Self {
+        Self {
+            table,
+            io_row_groups_channel,
+        }
     }
 }
 
@@ -42,7 +59,10 @@ impl UnaryFactory<RecordBatch, QueryRowGroupMetadata> for MaterializerFactory {
     type Unary = Materializer;
 
     fn build_unary(self, _context: &mut BuildContext) -> BuiltUnary<Materializer> {
-        Built::new(Materializer::new(self.table))
+        Built::new(Materializer::new(
+            self.table,
+            self.io_row_groups_channel.build_sender(),
+        ))
     }
 }
 
@@ -58,6 +78,8 @@ pub struct Materializer {
     /// Row group ID -> collected row indices within that group.
     pending_row_groups: HashMap<u32, Vec<u32>>,
     table: Arc<ParquetTable>,
+    /// Where the row groups expected to need a read are sent.
+    io_row_groups_sender: SharedWorkQueueSender<QueryRowGroupMetadata>,
 }
 
 impl Materializer {
@@ -65,10 +87,16 @@ impl Materializer {
     ///
     /// * `table` – shared Parquet table metadata used to build each row
     ///   group's metadata.
-    pub fn new(table: Arc<ParquetTable>) -> Self {
+    /// * `io_row_groups_sender` – the queue the row groups expected to need a read are
+    ///   pushed to.
+    pub fn new(
+        table: Arc<ParquetTable>,
+        io_row_groups_sender: SharedWorkQueueSender<QueryRowGroupMetadata>,
+    ) -> Self {
         Self {
             pending_row_groups: HashMap::default(),
             table,
+            io_row_groups_sender,
         }
     }
 }
@@ -115,8 +143,10 @@ impl Unary<RecordBatch, QueryRowGroupMetadata> for Materializer {
         Ok(())
     }
 
-    /// Drains accumulated row groups and sends each one. Indices are sorted so
-    /// downstream IO can read them sequentially.
+    /// Drains accumulated row groups and hands each one on: down the channel
+    /// when it is expected to be in memory, to the queue of those expected to
+    /// need a read otherwise. Indices are sorted so downstream IO can read
+    /// them sequentially.
     fn finish(
         &mut self,
         sender: &mut dyn Sender<QueryRowGroupMetadata>,
@@ -124,11 +154,21 @@ impl Unary<RecordBatch, QueryRowGroupMetadata> for Materializer {
         let pending_row_groups = mem::take(&mut self.pending_row_groups);
         for (group, mut indices) in pending_row_groups {
             indices.sort_unstable();
-            sender.send(QueryRowGroupMetadata::new(
+            let row_group = QueryRowGroupMetadata::new(
                 &self.table,
                 group as usize,
                 RowSelection::Indices(indices.into()),
-            ))?;
+            );
+            let is_expected_in_memory = row_group
+                .get_metadata()
+                .live_decompressed_pages
+                .load(Ordering::Relaxed)
+                > 0;
+            if is_expected_in_memory {
+                sender.send(row_group)?;
+            } else {
+                self.io_row_groups_sender.send(row_group)?;
+            }
         }
         Ok(true)
     }
@@ -163,7 +203,14 @@ mod tests {
     /// it grouped by row group. The table is unused by `consume` (only `finish`
     /// reads it), so a dummy empty one suffices.
     fn consume(batch: RecordBatch) -> HashMap<u32, Vec<u32>> {
-        let mut materializer = Materializer::new(Arc::new(ParquetTable::new(vec![])));
+        let mut materializer = Materializer::new(
+            Arc::new(ParquetTable::new(vec![])),
+            dispatch::shared_work_queue::<QueryRowGroupMetadata>(1)
+                .into_iter()
+                .next()
+                .unwrap()
+                .build_sender(),
+        );
         let mut sink = CollectSender::<QueryRowGroupMetadata>::default();
         dispatch::Unary::consume(
             &mut materializer,

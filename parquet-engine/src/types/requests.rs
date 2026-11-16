@@ -152,6 +152,13 @@ impl RowGroupRequest {
             })
     }
 
+    /// Give the row group back, dropping the cached pages taken for it. For a
+    /// request that will be built again later, by whichever worker asks for
+    /// its read.
+    pub fn into_metadata(self) -> QueryRowGroupMetadata {
+        self.metadata
+    }
+
     /// Whether nothing is left to read: every projected leaf is absent from
     /// the file or entirely held by the decompressed cache, so the buffer is
     /// built with no response
@@ -166,12 +173,13 @@ impl RowGroupRequest {
     /// admitted the request), so the buffer records it as the decode owner.
     ///
     /// `read_ahead_charge` is what the claim counts against its worker's
-    /// read-ahead budget. The buffer carries it to whichever worker starts on
-    /// the row group.
+    /// read-ahead budget, `None` for a row group that was expected to be in
+    /// memory and was. The buffer carries it to whichever worker starts on the
+    /// row group.
     pub fn into_row_group_buffer(
         self,
         response: Option<ReadResponse>,
-        read_ahead_charge: ReadAheadCharge,
+        read_ahead_charge: Option<ReadAheadCharge>,
     ) -> RowGroupBuffer {
         let mut resolved = response
             .map(|response| response.into_locations())
@@ -226,9 +234,10 @@ pub struct RowGroupBuffer {
     /// the id is stamped at claim time, not by whoever runs a stage.
     pub worker_id: usize,
     /// What this row group counts against its claiming worker's read-ahead
-    /// budget. It is given back when the buffer is dropped, which is when a
-    /// worker has started on the row group.
-    pub read_ahead_charge: ReadAheadCharge,
+    /// budget, `None` for one that was expected to be in memory and was. It is
+    /// given back when the buffer is dropped, which is when a worker has
+    /// started on the row group.
+    pub read_ahead_charge: Option<ReadAheadCharge>,
 }
 
 /// One projected column of a row group as the ring resolved it.

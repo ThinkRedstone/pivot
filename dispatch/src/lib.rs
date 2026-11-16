@@ -128,9 +128,9 @@ pub use stats::StatsCollector;
 pub use operations::channels::{
     ChannelFactory, FanInChannelFactory, MpscReceiver, NodeIdOutput, NodeWorkQueueChannelFactory,
     Receiver, ReturnToWorkerMpscFactory, RootChannelFactory, SharedWorkQueueChannelFactory,
-    StealableChannelFactory, WorkerAwareSender, WorkerIdOutput, fan_in, mpsc_channel,
-    node_work_queue, return_to_worker_mpsc, shared_work_queue, stealable, stealable_fifo,
-    to_single_worker_mpsc,
+    SharedWorkQueueReceiver, SharedWorkQueueSender, StealableChannelFactory, WorkerAwareSender,
+    WorkerIdOutput, fan_in, mpsc_channel, node_work_queue, return_to_worker_mpsc,
+    shared_work_queue, stealable, stealable_fifo, to_single_worker_mpsc,
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use operations::unary::test_utils;

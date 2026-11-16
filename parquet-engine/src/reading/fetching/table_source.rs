@@ -1,9 +1,19 @@
 //! Work-stealing source that feeds row groups into the fetching pipeline.
 //!
 //! [`RowGroupInjectorFactory`] pre-loads every row group from a
-//! [`ParquetTable`] into one shared [`Injector`] queue per NUMA node. Each
-//! worker gets its own [`RowGroupInjector`] (via [`RootChannelFactory`]) that
-//! claims row groups from its node's queue on demand.
+//! [`ParquetTable`] into shared [`Injector`] queues, one per NUMA node for the
+//! row groups expected to be in memory and one per node for those expected to
+//! need a read, with one factory per kind (see
+//! [`RowGroupInjectorFactory::create_by_expected_need`]). Each worker gets a
+//! [`RowGroupInjector`] over each kind (via [`RootChannelFactory`]), which
+//! claims row groups from its node's queue on demand: the in-memory ones as
+//! the scan's input channel, taken when the worker has no other work, and the
+//! others for its fetcher to ask for ahead of the worker's CPU work.
+//!
+//! A row group is expected to be in memory when the decompressed cache holds
+//! pages of it at the time the scan is planned. That is a guess: the pages
+//! may be of columns the scan does not read, or evicted before the claim. The
+//! fetcher handles a row group that turns out the other way.
 //!
 //! Row groups are assigned to nodes by a stable hash of their identity (file +
 //! index within the file), so the *same* row group lands on the *same* node
@@ -121,12 +131,18 @@ fn plain_scan_order(table: &ParquetTable, projection: &Projection) -> Vec<usize>
     order
 }
 
-/// Factory that populates one [`Injector`] per NUMA node with the table's row
-/// groups (split by [`affinity_node`]) and produces [`RowGroupInjector`]
-/// receivers for each worker.
+/// The per-node queues of one kind of row group.
+type RowGroupQueues = Arc<Vec<Injector<QueryRowGroupMetadata>>>;
+
+/// Factory over the per-NUMA-node queues of one kind of a table's row groups
+/// (split by [`affinity_node`]), producing a [`RowGroupInjector`] receiver for
+/// each worker.
 #[derive(Clone)]
 pub struct RowGroupInjectorFactory {
-    row_group_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>>,
+    row_group_queues: RowGroupQueues,
+    /// Queues whose row groups are all claimed before any of this factory's
+    /// (see [`RowGroupInjector::queues_claimed_first`]).
+    queues_claimed_first: Option<RowGroupQueues>,
     filter: Option<RowGroupFilter>,
     speculation: Option<Arc<SpeculationGate>>,
 }
@@ -196,23 +212,30 @@ impl SpeculationGate {
 }
 
 impl RowGroupInjectorFactory {
-    /// Creates a new factory, pushing each of `table`'s row groups into its
-    /// affinity node's queue (`node_count` queues in total). When `filter` is
+    /// Creates the two factories of a scan of `table`: the first over the
+    /// row groups expected to be in memory, the second over those expected to
+    /// need a read. Each row group is pushed into its affinity node's queue
+    /// of its kind (`node_count` queues of each kind): expected to be in
+    /// memory when the decompressed cache holds pages of it, expected to need
+    /// a read otherwise. The two share the filter and the Top-N throttle, so
+    /// a scan is pruned and throttled as one. When `filter` is
     /// set, each row group is offered to it on claim and skipped if it returns
     /// `false`. When `scan_order` is set (a Top-N boundary on one key), row
     /// groups are pushed in that key's order so the most-promising are claimed
     /// first and the boundary prunes the rest; otherwise decompressed-cache-covered
     /// row groups go first, largest-first within a tie (see
     /// [`plain_scan_order`]).
-    pub fn new(
+    pub fn create_by_expected_need(
         table: &Arc<ParquetTable>,
         projection: Projection,
         filter: Option<RowGroupFilter>,
         scan_order: Option<ScanOrder>,
         outstanding_row_groups: Arc<AtomicUsize>,
         node_count: usize,
-    ) -> Self {
-        let row_group_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>> =
+    ) -> (Self, Self) {
+        let in_memory_queues: RowGroupQueues =
+            Arc::new((0..node_count).map(|_| Injector::new()).collect());
+        let io_row_group_queues: RowGroupQueues =
             Arc::new((0..node_count).map(|_| Injector::new()).collect());
         let order = match &scan_order {
             Some(order) => steal_order(table, order),
@@ -230,14 +253,34 @@ impl RowGroupInjectorFactory {
             })
         });
         for row_group in row_groups {
-            let node = affinity_node(row_group.get_metadata(), node_count);
-            row_group_queues[node].push(row_group);
+            let metadata = row_group.get_metadata();
+            let node = affinity_node(metadata, node_count);
+            let is_expected_in_memory =
+                metadata.live_decompressed_pages.load(Ordering::Relaxed) > 0;
+            if is_expected_in_memory {
+                in_memory_queues[node].push(row_group);
+            } else {
+                io_row_group_queues[node].push(row_group);
+            }
         }
-        Self {
-            row_group_queues,
+        // In a Top-N scan no row group expected to need a read is claimed
+        // while one expected to be in memory is left. The in-memory ones are
+        // the cheap way to tighten the boundary, and a row group claimed
+        // before it has tightened is read for nothing.
+        let queues_claimed_first = speculation.is_some().then(|| in_memory_queues.clone());
+        let in_memory_row_groups = Self {
+            row_group_queues: in_memory_queues,
+            queues_claimed_first: None,
+            filter: filter.clone(),
+            speculation: speculation.clone(),
+        };
+        let io_row_groups = Self {
+            row_group_queues: io_row_group_queues,
+            queues_claimed_first,
             filter,
             speculation,
-        }
+        };
+        (in_memory_row_groups, io_row_groups)
     }
 }
 
@@ -250,6 +293,7 @@ impl RootChannelFactory<QueryRowGroupMetadata> for RowGroupInjectorFactory {
         RowGroupInjector {
             numa_node_idx: dispatch::worker::current_node(),
             row_group_queues: self.row_group_queues,
+            queues_claimed_first: self.queues_claimed_first,
             filter: self.filter,
             speculation: self.speculation,
         }
@@ -260,7 +304,12 @@ impl RootChannelFactory<QueryRowGroupMetadata> for RowGroupInjectorFactory {
 /// queues: its own node's queue on the hot path, other nodes' queues only
 /// when its own runs dry.
 pub struct RowGroupInjector {
-    row_group_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>>,
+    row_group_queues: RowGroupQueues,
+    /// Queues that must be empty before this injector hands a row group out.
+    /// A receiver that returns nothing has not said its queue is empty (the
+    /// throttle may have refused, or another worker may have been at the
+    /// queue), so the queues themselves are asked.
+    queues_claimed_first: Option<RowGroupQueues>,
     /// Index of this worker's node's queue in `row_group_queues`.
     numa_node_idx: usize,
     filter: Option<RowGroupFilter>,
@@ -285,7 +334,7 @@ impl Receiver<QueryRowGroupMetadata> for RowGroupInjector {
         // for the rest of the query) it avoids an epoch-pinning steal per
         // call.
         let queue = &self.row_group_queues[self.numa_node_idx];
-        if queue.is_empty() {
+        if queue.is_empty() || self.must_wait_for_queues_claimed_first() {
             return None;
         }
         let ticket = self.acquire_speculation_ticket()?;
@@ -301,6 +350,9 @@ impl Receiver<QueryRowGroupMetadata> for RowGroupInjector {
     /// to other nodes' queues so a node that finished its share keeps its
     /// CPUs busy instead of waiting out the tail.
     fn steal(&self) -> Option<QueryRowGroupMetadata> {
+        if self.must_wait_for_queues_claimed_first() {
+            return None;
+        }
         let queue_count = self.row_group_queues.len();
         // A ticket is acquired only once a non-empty queue is found; a lost
         // steal race or a queue drained under us carries it to the next
@@ -364,6 +416,14 @@ impl SpeculationTicket<'_> {
 }
 
 impl RowGroupInjector {
+    /// Whether a queue that is claimed before this injector's still holds a
+    /// row group.
+    fn must_wait_for_queues_claimed_first(&self) -> bool {
+        self.queues_claimed_first
+            .as_ref()
+            .is_some_and(|queues| queues.iter().any(|queue| !queue.is_empty()))
+    }
+
     /// Admit a claimed row group, or `None` (and release the ticket) when the
     /// row-group filter proves it holds no matching row.
     fn admit_unless_pruned(

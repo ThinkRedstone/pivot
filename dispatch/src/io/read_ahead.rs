@@ -22,9 +22,9 @@
 //!
 //! A worker has a second budget for what it reads from local disks, of
 //! [`DISK_READ_AHEAD_BYTES`]. A disk answers in far less time than a store,
-//! so there is little to hide: the budget is about one row group, the one
-//! read while the worker works on the one before it. Asking for more only
-//! queues work behind one worker that another could have taken.
+//! so there is little to hide: the budget is about what a disk delivers to
+//! one worker in the time a read takes. Asking for more only queues work
+//! behind one worker that another could have taken.
 
 use crate::worker::WORKER_IDX;
 use std::sync::Arc;
@@ -40,7 +40,7 @@ const DEFAULT_REMOTE_READ_TIME_MILLIS: u64 = 100;
 /// What one worker may have asked for from local disks and not yet started
 /// on. A claim may take the worker past its budget, so this lets it hold one
 /// row group, or a few whose projected columns are smaller than this together.
-const DISK_READ_AHEAD_BYTES: usize = 1 << 20;
+const DISK_READ_AHEAD_BYTES: usize = 50_000;
 
 /// Where a read's bytes come from, which decides the budget it counts against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

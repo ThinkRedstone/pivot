@@ -153,22 +153,26 @@ pub trait Unary<I, O> {
         true
     }
 
-    /// Whether this unary takes its input only when the worker asks its
-    /// operator to saturate the available IO (see
-    /// [`Operator::saturate_available_io`]), because consuming an input is
-    /// what issues its remote reads. Such a unary is fed neither on its CPU
-    /// turn nor by stealing: how much it has asked for is the worker's to
-    /// bound, not how idle the worker is. Fixed for the unary's lifetime.
-    fn takes_input_to_saturate_io(&self) -> bool {
+    /// Whether this unary issues reads when the worker saturates the
+    /// available IO (see [`saturate_available_io`](Self::saturate_available_io)).
+    /// Fixed for the unary's lifetime: the dataflow asks once, when it is
+    /// built, and from then on asks only the unaries that said yes.
+    fn saturates_available_io(&self) -> bool {
         false
     }
 
-    /// Whether the worker has room in the read-ahead budget this unary's
-    /// reads count against. Asked before an input is taken to saturate the
-    /// available IO, and only of a unary that
-    /// [takes its input then](Self::takes_input_to_saturate_io).
-    fn has_read_ahead_room(&self, _io: &OperatorIO) -> bool {
-        true
+    /// Issue one more read from a source the unary holds itself, beside its
+    /// input channel. The worker calls this ahead of its CPU work, while it
+    /// has asked for less than its read-ahead budgets (see
+    /// [`crate::io::ReadAheadBudget`]), so the unary's reads are on their way
+    /// before the worker needs them. Returns [`WorkStatus::Ran`] if it issued
+    /// something, and is then asked again.
+    fn saturate_available_io(
+        &mut self,
+        _sender: &mut dyn Sender<O>,
+        _io: &mut OperatorIO,
+    ) -> Result<WorkStatus> {
+        Ok(WorkStatus::Pending)
     }
 
     /// Handle a completed logical read. Dispatch has already resolved cache
@@ -297,7 +301,7 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
     fn run_cpu_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
         // A transform that is not taking input may still have work of its own
         // to advance, e.g. a job it steps through one batch per turn.
-        if self.unary.takes_input_to_saturate_io() || !self.unary.ready_for_more_work() {
+        if !self.unary.ready_for_more_work() {
             return Ok(self.unary.run(&mut *self.sender, io)?);
         }
 
@@ -393,25 +397,15 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
     }
 
     fn saturates_available_io(&self) -> bool {
-        self.unary.takes_input_to_saturate_io()
+        self.unary.saturates_available_io()
     }
 
     fn saturate_available_io(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
-        if !self.unary.ready_for_more_work() || !self.unary.has_read_ahead_room(io) {
-            return Ok(WorkStatus::Pending);
-        }
-        // Its own input first, then a peer's: an input may be queued on one
-        // worker for all of them to take.
-        let item = match self.receiver.try_recv().or_else(|| self.receiver.steal()) {
-            Some(item) => item,
-            None => return Ok(WorkStatus::Pending),
-        };
-        self.unary.consume(item, &mut *self.sender, io)?;
-        Ok(WorkStatus::Ran)
+        Ok(self.unary.saturate_available_io(&mut *self.sender, io)?)
     }
 
     fn try_steal_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
-        if self.unary.takes_input_to_saturate_io() || !self.unary.ready_for_more_work() {
+        if !self.unary.ready_for_more_work() {
             return Ok(WorkStatus::Pending);
         }
         match self.receiver.steal() {
@@ -460,43 +454,49 @@ mod tests {
         }
     }
 
-    /// A transform whose input issues remote reads.
+    /// A transform that issues reads from a source of its own.
     struct Reader {
-        consumed: usize,
+        reads_issued: usize,
     }
 
     impl Unary<(), ()> for Reader {
         fn consume(&mut self, _: (), _: &mut dyn Sender<()>, _: &mut OperatorIO) -> Result<()> {
-            self.consumed += 1;
             Ok(())
         }
 
-        fn takes_input_to_saturate_io(&self) -> bool {
+        fn saturates_available_io(&self) -> bool {
             true
+        }
+
+        fn saturate_available_io(
+            &mut self,
+            _: &mut dyn Sender<()>,
+            _: &mut OperatorIO,
+        ) -> Result<WorkStatus> {
+            self.reads_issued += 1;
+            Ok(WorkStatus::Ran)
         }
     }
 
-    /// A transform that takes its input to saturate the available IO is fed
-    /// when its operator is asked to, and not on its CPU turn.
+    /// Asking the operator to saturate the available IO asks its transform,
+    /// and leaves the input channel alone.
     #[test]
-    fn a_transform_taking_input_to_saturate_io_is_fed_only_when_asked_to() {
+    fn saturating_the_available_io_asks_the_transform() {
         let (mut input, receiver) = mpsc_channel::<()>();
         input.send(()).unwrap();
         let mut operator = UnaryOperator::new(
-            Reader { consumed: 0 },
+            Reader { reads_issued: 0 },
             receiver,
             Box::new(CollectSender::<()>::new()),
             Arc::new(AtomicUsize::new(1)),
         );
         let mut test_io = TestOperatorIO::default();
 
-        operator.run_cpu_work(&mut test_io.io()).unwrap();
-        let consumed_on_cpu_turn = operator.unary.consumed;
         let status = operator.saturate_available_io(&mut test_io.io()).unwrap();
 
-        assert_eq!(consumed_on_cpu_turn, 0);
         assert!(matches!(status, WorkStatus::Ran));
-        assert_eq!(operator.unary.consumed, 1);
+        assert_eq!(operator.unary.reads_issued, 1);
+        assert!(!operator.receiver.is_empty());
     }
 
     /// A transform that is not ready for input still gets its turn through
