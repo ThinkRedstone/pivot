@@ -51,6 +51,10 @@ static LIVE_DATAFLOWS: AtomicUsize = AtomicUsize::new(0);
 /// through to a park. Large queries keep workers busy and rarely reach this path.
 const IN_FLIGHT_SPIN_LIMIT: u32 = 120_000;
 
+/// How many iterations go without a pass that offers read-ahead room after
+/// one in which no dataflow had a read to issue.
+const IDLE_SATURATING_PASSES_SKIPPED: u32 = 15;
+
 /// The spin budget, overridable through `PIVOT_SPIN_LIMIT` (`0` parks
 /// immediately). Instrumented (PGO) profiling runs set `0`. Profiling runs
 /// on a small dataset where waits are short, so the spin usually catches the
@@ -144,6 +148,9 @@ pub struct Worker {
     data_flows: HashMap<Identifier, DataFlow>,
     /// Which dataflow is offered read-ahead room first on the next pass.
     next_saturating_flow: usize,
+    /// How many of the coming passes that offer read-ahead room are skipped.
+    /// Set after a pass in which no dataflow had a read to issue.
+    idle_saturating_passes_to_skip: u32,
     /// Did the worker do work on last iteration? This is used to decide whether the worker should
     /// do background tasks, just as cleaning
     did_work_last_iteration: bool,
@@ -232,6 +239,7 @@ impl Worker {
                     id: core.id,
                     data_flows: Default::default(),
                     next_saturating_flow: 0,
+                    idle_saturating_passes_to_skip: 0,
                     data_flow_queue: receiver,
                     did_work_last_iteration: false,
                     should_exit,
@@ -334,7 +342,16 @@ impl Worker {
     /// The dataflows share the worker's budget, so each pass starts from the
     /// next one in turn: when room opens for one read at a time, the same
     /// dataflow would otherwise take it every time.
+    ///
+    /// A pass in which there was room and no dataflow had a read to issue is
+    /// followed by [`IDLE_SATURATING_PASSES_SKIPPED`] iterations without one,
+    /// as long as the worker keeps finding CPU work. A scan whose data is all
+    /// in memory would otherwise pay for an empty pass on every iteration.
     fn saturate_available_io(&mut self) {
+        if self.idle_saturating_passes_to_skip > 0 {
+            self.idle_saturating_passes_to_skip -= 1;
+            return;
+        }
         if self.data_flows.is_empty() || !self.io.borrow().has_any_read_ahead_room() {
             return;
         }
@@ -364,6 +381,8 @@ impl Worker {
             .for_each(&mut offer_room);
         if issued {
             self.did_work_last_iteration = true;
+        } else {
+            self.idle_saturating_passes_to_skip = IDLE_SATURATING_PASSES_SKIPPED;
         }
     }
 
@@ -670,6 +689,9 @@ impl Worker {
             self.try_finishing_dataflows();
 
             if !self.did_work_last_iteration {
+                // A worker with nothing to do asks for reads on its very next
+                // iteration, so it never parks on a skipped pass.
+                self.idle_saturating_passes_to_skip = 0;
                 // Don't clear buffers or sleep on IO while there is work to steal.
                 self.try_steal_work();
                 if self.did_work_last_iteration {
