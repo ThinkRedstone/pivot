@@ -863,6 +863,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2",
+ "socket2",
  "sysinfo",
  "tempfile",
  "testcontainers",

@@ -7,6 +7,8 @@
 //!    [`pgwire::tokio::process_socket`], which drives the full wire-protocol
 //!    state machine (startup handshake, query loop, message framing) and
 //!    calls back into the [`PivotHandlers`] bundle for each phase.
+//!    Each connection's handlers also watch for its client going away, and
+//!    cancel the statement it is running when it does.
 //! 2. **Watch the dispatch worker pool.** Every worker `JoinHandle` returned by
 //!    [`Dispatch::into_parts`] is moved into a [`JoinSet`] of blocking tasks.
 //!    Workers are designed to run forever, so a join ordinarily only completes
@@ -20,6 +22,7 @@
 //! tasks watch that same exit flag and self-exit, so the server no longer
 //! orchestrates them.
 
+use crate::server::peer_hang_up::PeerHangUp;
 use crate::server::query_handler::PivotHandlers;
 use catalog::PivotCatalog;
 use catalog::metastore::Metastore;
@@ -27,12 +30,14 @@ use catalog::metastore::Metastore;
 use dispatch::DataFlowDispatcher;
 use dispatch::{Dispatch, Shutdown};
 use pgwire::tokio::{TlsAcceptor, process_socket};
+use socket2::{SockRef, TcpKeepalive};
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinError, JoinSet};
 use tracing::{error, info, warn};
 
@@ -239,10 +244,9 @@ impl Server {
                             let tls = tls.clone();
                             tokio::spawn(async move {
                                 info!(?peer, "connection accepted");
-                                if let Err(e) = process_socket(socket, tls, handlers).await {
-                                    warn!(?e, ?peer, "connection error");
-                                } else {
-                                    info!(?peer, "connection closed");
+                                match serve_connection(socket, tls, handlers).await {
+                                    Ok(()) => info!(?peer, "connection closed"),
+                                    Err(e) => warn!(?e, ?peer, "connection error"),
                                 }
                             });
                         }
@@ -253,6 +257,38 @@ impl Server {
         }
     }
 }
+
+/// Serve one connection until its session ends.
+///
+/// pgwire reads the socket only between statements, so a client that
+/// disconnects mid-statement would otherwise go unnoticed until the result is
+/// written back. The connection's handlers get a [`PeerHangUp`] to race each
+/// statement against instead.
+async fn serve_connection(
+    socket: TcpStream,
+    tls: Option<TlsAcceptor>,
+    handlers: Arc<PivotHandlers>,
+) -> io::Result<()> {
+    // The kernel probes a silent client and fails the socket once it stops
+    // answering, so a client that vanishes without closing its end (power
+    // loss, a dropped network path) hangs up like any other, two minutes later.
+    let keepalive = TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_PROBE_INTERVAL)
+        .with_retries(KEEPALIVE_PROBE_COUNT);
+    SockRef::from(&socket).set_tcp_keepalive(&keepalive)?;
+
+    let handlers = handlers.for_connection(PeerHangUp::watch(&socket)?);
+    process_socket(socket, tls, handlers).await
+}
+
+/// How long a connection may stay silent before the kernel starts probing its
+/// client.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+/// The gap between two probes of a silent client.
+const KEEPALIVE_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+/// How many unanswered probes mark the client as gone.
+const KEEPALIVE_PROBE_COUNT: u32 = 6;
 
 /// Recover a printable message from a [`JoinHandle::join`](std::thread::JoinHandle::join) `Err` payload
 /// (`Box<dyn Any + Send>`). Best-effort: non-string payloads degrade to a

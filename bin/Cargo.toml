@@ -31,6 +31,8 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "macros"
 serde = { workspace = true }
 serde_yaml_ng = { workspace = true }
 pgwire = { workspace = true }
+# Turns on TCP keepalive for accepted connections (see `server::listener`).
+socket2 = { version = "0.6", features = ["all"] }
 # The INTERVAL value handed to pgwire; must resolve to the same version pgwire
 # depends on, since that is the one its binary encoding is implemented for.
 pg_interval_2 = "0.5"

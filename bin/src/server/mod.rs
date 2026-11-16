@@ -67,6 +67,7 @@ mod copy_session;
 mod limits;
 mod listener;
 mod mapped_files;
+mod peer_hang_up;
 #[cfg(feature = "perf")]
 mod perf;
 mod query_handler;

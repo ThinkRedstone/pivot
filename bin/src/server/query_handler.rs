@@ -7,6 +7,7 @@ use crate::execution::{Command, ExecuteOptions, Execution, StatementOutput, is_t
 use crate::server::arrow_to_pgwire::{PGRowBatch, build_field_info, encode_batch};
 use crate::server::auth::Authenticator;
 use crate::server::copy_session;
+use crate::server::peer_hang_up::PeerHangUp;
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 use catalog::metastore::Metastore;
@@ -45,6 +46,16 @@ fn into_pgwire_error(error: crate::execution::Error) -> PgWireError {
 
 fn user_error(message: String) -> PgWireError {
     let info = ErrorInfo::new("ERROR".to_string(), "XX000".to_string(), message);
+    PgWireError::UserError(Box::new(info))
+}
+
+/// The fatal error that ends a session whose client is gone.
+fn client_lost_error() -> PgWireError {
+    let info = ErrorInfo::new(
+        "FATAL".to_string(),
+        "08006".to_string(),
+        "connection to client lost".to_string(),
+    );
     PgWireError::UserError(Box::new(info))
 }
 
@@ -93,14 +104,19 @@ fn build_command_response(command: Command) -> Response {
     }
 }
 
-/// The pgwire simple-query frontend for one shared executor.
+/// One connection's pgwire query frontend for the shared executor.
 pub struct PivotQueryHandler {
     executor: Arc<crate::execution::Executor>,
+    /// Tells when this connection's client has gone away.
+    peer_hang_up: PeerHangUp,
 }
 
 impl PivotQueryHandler {
-    pub fn new(executor: Arc<crate::execution::Executor>) -> Self {
-        Self { executor }
+    pub fn new(executor: Arc<crate::execution::Executor>, peer_hang_up: PeerHangUp) -> Self {
+        Self {
+            executor,
+            peer_hang_up,
+        }
     }
 
     async fn run_query(
@@ -291,13 +307,19 @@ impl PivotQueryHandler {
         let with_perf = false;
 
         info!(sql = %query, "query received");
-        let execution = self
-            .run_query(query, format, with_stats, with_perf)
-            .await
-            .map_err(|error| {
-                warn!(%error, sql = %query, "query failed");
-                into_pgwire_error(error)
-            })?;
+        // A statement nobody is waiting for is dropped, which cancels it.
+        let execution = tokio::select! {
+            execution = self.run_query(query, format, with_stats, with_perf) => execution,
+            hung_up = self.peer_hang_up.wait() => {
+                hung_up?;
+                info!(sql = %query, "client disconnected, query cancelled");
+                return Err(client_lost_error());
+            }
+        }
+        .map_err(|error| {
+            warn!(%error, sql = %query, "query failed");
+            into_pgwire_error(error)
+        })?;
 
         if with_stats {
             let notice = NoticeResponse::from(ErrorInfo::new(
@@ -472,10 +494,9 @@ impl ExtendedQueryHandler for PivotQueryHandler {
     }
 }
 
-/// The startup, query, cancel, and unsupported-protocol handlers handed to
-/// pgwire for each connection.
+/// What every connection's handlers are built from.
 pub struct PivotHandlers {
-    query_handler: Arc<PivotQueryHandler>,
+    query_executor: Arc<crate::execution::Executor>,
     cancel_handler: Arc<DefaultCancelHandler>,
     authenticator: Authenticator,
 }
@@ -487,24 +508,43 @@ impl PivotHandlers {
     ) -> Self {
         let manager = Arc::new(ConnectionManager::new());
         Self {
-            query_handler: Arc::new(PivotQueryHandler::new(query_executor)),
+            query_executor,
             cancel_handler: Arc::new(DefaultCancelHandler::new(manager.clone())),
             authenticator: Authenticator::new(metastore, manager),
         }
     }
+
+    /// The handlers for one connection, whose statements stop when
+    /// `peer_hang_up` reports its client gone.
+    pub fn for_connection(self: Arc<Self>, peer_hang_up: PeerHangUp) -> ConnectionHandlers {
+        ConnectionHandlers {
+            query_handler: Arc::new(PivotQueryHandler::new(
+                self.query_executor.clone(),
+                peer_hang_up,
+            )),
+            shared: self,
+        }
+    }
 }
 
-impl PgWireServerHandlers for PivotHandlers {
+/// The startup, query, cancel, and unsupported-protocol handlers handed to
+/// pgwire for one connection.
+pub struct ConnectionHandlers {
+    query_handler: Arc<PivotQueryHandler>,
+    shared: Arc<PivotHandlers>,
+}
+
+impl PgWireServerHandlers for ConnectionHandlers {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
         self.query_handler.clone()
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        self.authenticator.startup_handler()
+        self.shared.authenticator.startup_handler()
     }
 
     fn cancel_handler(&self) -> Arc<impl CancelHandler> {
-        self.cancel_handler.clone()
+        self.shared.cancel_handler.clone()
     }
 
     fn extended_query_handler(&self) -> Arc<impl pgwire::api::query::ExtendedQueryHandler> {
