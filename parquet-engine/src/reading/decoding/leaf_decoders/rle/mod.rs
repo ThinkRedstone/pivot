@@ -272,6 +272,14 @@ impl Run {
         match self {
             Run::Rle { value, mut count } => {
                 let emit = count.min(limit);
+                // A run's value fills whole bytes, so it can exceed both the
+                // bit width and the dictionary, and slab-backed dictionaries
+                // index with no bounds check of their own.
+                assert!(
+                    (value as usize) < dict.len(),
+                    "dictionary key {value} out of range ({} entries)",
+                    dict.len()
+                );
                 let entry = dict.entry(value as usize);
                 builder.push(&entry, emit);
                 count -= emit;
@@ -444,7 +452,8 @@ impl RleDecoder {
         let bytes: &[u8] = buffer;
         let value_bytes = byte_width(self.bit_width) as usize;
         let value_mask = ((1u64 << (8 * value_bytes)) - 1) as u32;
-        let keys_in_range = (1u64 << self.bit_width) as usize <= dict.len();
+        let entries = dict.len();
+        let keys_in_range = (1u64 << self.bit_width) as usize <= entries;
         let mut offset = self.position.offset;
         let mut wanted = target - builder.len();
 
@@ -467,6 +476,13 @@ impl RleDecoder {
                     break;
                 }
                 let key = u32::from_le_bytes(value) & value_mask;
+                // The value fills whole bytes, so it can exceed both the bit
+                // width and the dictionary, and slab-backed dictionaries
+                // index with no bounds check of their own.
+                assert!(
+                    (key as usize) < entries,
+                    "dictionary key {key} out of range ({entries} entries)"
+                );
                 fill_run(builder.spare_mut(count), dict.entry(key as usize));
                 offset += 1 + value_bytes;
                 wanted -= count;
@@ -726,6 +742,100 @@ mod tests {
         let group = ["AA", "BB", "CC", "DD", "AA", "BB", "CC", "DD"];
         let expected = [&["DD"; 2][..], &["BB"; 70], &group, &["CC"; 3], &group].concat();
         assert_eq!(result, expected);
+    }
+
+    /// A bit-packed run of two groups whose last byte is the buffer's last.
+    #[test]
+    fn reads_bitpacked_run_ending_at_buffer_end() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        let mut dec = new_decoder(vec![5, 0xE4, 0xE4, 0xE4, 0xE4], 2);
+
+        let result = push_all(&mut allocator, &mut dec, &dict, 16);
+
+        let expected: Vec<&str> = ["AA", "BB", "CC", "DD"]
+            .iter()
+            .copied()
+            .cycle()
+            .take(16)
+            .collect();
+        assert_eq!(result, expected);
+    }
+
+    /// Short runs in one buffer, a bit-packed run of two groups that starts
+    /// in it and ends in the next, then short runs in that next buffer.
+    #[test]
+    fn short_runs_around_a_run_split_across_buffers() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        let data = make_data_multi_buffer(vec![
+            vec![10, 2, 3, 0xE4, 0xE4, 6, 1, 5, 0xE4],
+            vec![0xE4, 0xE4, 0xE4, 4, 0, 3, 0xE4, 0xE4, 6, 3, 4, 1],
+        ]);
+        let mut dec = RleDecoder::new(data, ReaderPosition::default(), 2);
+
+        let result = push_all(&mut allocator, &mut dec, &dict, 47);
+
+        let group = ["AA", "BB", "CC", "DD", "AA", "BB", "CC", "DD"];
+        let expected = [
+            &["CC"; 5][..],
+            &group,
+            &["BB"; 3],
+            &group,
+            &group,
+            &["AA"; 2],
+            &group,
+            &["DD"; 3],
+            &["BB"; 2],
+        ]
+        .concat();
+        assert_eq!(result, expected);
+    }
+
+    /// At a bit width of 12 a repeated run's value takes two bytes: keys 258
+    /// and 299 need both, and each value is followed directly by the next
+    /// run's header.
+    #[test]
+    fn reads_repeated_runs_with_two_byte_values() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let names: Vec<String> = (0..300).map(|key| format!("v{key:03}")).collect();
+        let dict = make_dict(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let data = vec![10, 0x02, 0x01, 6, 0x2B, 0x01, 4, 0, 0, 2, 5, 0];
+        let mut dec = new_decoder(data, 12);
+
+        let result = push_all(&mut allocator, &mut dec, &dict, 11);
+
+        let expected = [&["v258"; 5][..], &["v299"; 3], &["v000"; 2], &["v005"; 1]].concat();
+        assert_eq!(result, expected);
+    }
+
+    /// A repeated run's value is a whole byte even at a bit width of 2, so it
+    /// can name a key the dictionary does not hold. Here the run has room
+    /// after it in the buffer.
+    #[test]
+    #[should_panic(expected = "dictionary key 255 out of range (4 entries)")]
+    fn rejects_repeated_run_key_past_dictionary() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        let mut dec = new_decoder(vec![10, 0xFF, 4, 0, 0], 2);
+
+        push_all(&mut allocator, &mut dec, &dict, 5);
+    }
+
+    /// The same out-of-range key in a run that ends the buffer.
+    #[test]
+    #[should_panic(expected = "dictionary key 255 out of range (4 entries)")]
+    fn rejects_repeated_run_key_past_dictionary_at_buffer_end() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        let mut dec = new_decoder(vec![10, 0xFF], 2);
+
+        push_all(&mut allocator, &mut dec, &dict, 5);
     }
 
     /// Skipping into the middle of a bit-packed run leaves the decoder at the
