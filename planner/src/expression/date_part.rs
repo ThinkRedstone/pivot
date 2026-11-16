@@ -20,7 +20,7 @@ const MICROS_PER_SEC: i64 = 1_000_000;
 /// `(year, month, day)` civil date. Howard Hinnant's `civil_from_days`
 /// (<http://howardhinnant.github.io/date_algorithms.html>); valid for the full
 /// proleptic Gregorian range, including negative (pre-epoch) day counts.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub(super) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // day of era, [0, 146096]
@@ -35,7 +35,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 
 /// Inverse of [`civil_from_days`]: the epoch-relative day count for a civil
 /// date. Used to derive day-of-year and ISO week.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub(super) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400; // [0, 399]

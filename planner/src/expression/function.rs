@@ -4,7 +4,7 @@
 use super::{
     Arithmetic, Concat, Contains, DatePart, DateTrunc, Divide, FormatBytes, IntervalArithmetic,
     Length, Like, NormalizedInterval, Prefix, RegexpFullMatch, RegexpJitReplace, RegexpReplace,
-    Substring, Suffix, TemporalConvert, VariantGet,
+    Substring, Suffix, TemporalConvert, TimeBucket, VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
@@ -78,6 +78,9 @@ pub enum Function {
     /// `substring(string, start[, length])` with constant positions.
     Substring(Substring),
     DateTrunc(DateTrunc),
+    /// `time_bucket(bucket_width, source[, offset | origin])` — a date or
+    /// timestamp floored to the start of its bucket.
+    TimeBucket(TimeBucket),
     DatePart(DatePart),
     /// `date`/`timestamp` ± `INTERVAL` (e.g. `now() - interval '5 days'`).
     IntervalArithmetic(IntervalArithmetic),
@@ -138,6 +141,7 @@ impl Function {
             }
             Function::Substring(s) => visit(&s.input),
             Function::DateTrunc(d) => visit(&d.source),
+            Function::TimeBucket(t) => visit(&t.source),
             Function::DatePart(d) => visit(&d.source),
             Function::IntervalArithmetic(i) => visit(&i.operand),
             Function::TemporalConvert(t) => visit(&t.source),
@@ -184,6 +188,7 @@ impl Function {
             }
             Function::Substring(s) => visit(&mut s.input),
             Function::DateTrunc(d) => visit(&mut d.source),
+            Function::TimeBucket(t) => visit(&mut t.source),
             Function::DatePart(d) => visit(&mut d.source),
             Function::IntervalArithmetic(i) => visit(&mut i.operand),
             Function::TemporalConvert(t) => visit(&mut t.source),
@@ -211,6 +216,7 @@ impl Display for Function {
             Function::Concat(c) => write!(f, "{c}"),
             Function::Substring(s) => write!(f, "{s}"),
             Function::DateTrunc(dt) => write!(f, "{dt}"),
+            Function::TimeBucket(t) => write!(f, "{t}"),
             Function::DatePart(d) => write!(f, "{d}"),
             Function::IntervalArithmetic(i) => write!(f, "{i}"),
             Function::TemporalConvert(c) => write!(f, "{c}"),
@@ -247,6 +253,8 @@ impl Function {
             // `date_trunc` keeps its source's timestamp type (with or without
             // a zone), as DuckDB bound it.
             Function::DateTrunc(d) => d.result.clone(),
+            // `time_bucket` yields its source's date or timestamp type.
+            Function::TimeBucket(t) => t.result.clone(),
             // Canonicalising a span rewrites its fields, not its type.
             Function::NormalizedInterval(_) => Type::Interval,
             // `date`/`timestamp` ± interval keeps the temporal operand's type,
@@ -277,6 +285,7 @@ impl Function {
             Function::Concat(c) => c.compile(),
             Function::Substring(s) => s.compile(),
             Function::DateTrunc(dt) => dt.compile(),
+            Function::TimeBucket(t) => t.compile(),
             Function::DatePart(d) => d.compile(),
             Function::IntervalArithmetic(i) => i.compile(),
             Function::TemporalConvert(c) => c.compile(),

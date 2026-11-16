@@ -21,13 +21,16 @@ use duckdb_planner::handle::{
 use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 
 use crate::expression::{
-    AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Concat,
-    Conjunction, ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide,
-    Error, Expression, FormatBytes, Function, InList, IntervalArithmetic, IsNull, Length, Like,
-    MaybeError, NormalizedInterval, Not, NumericAggregate, Prefix, Ref, RegexpFullMatch,
-    RegexpJitReplace, RegexpReplace, Substring, Suffix, TemporalConvert, VariantGet,
+    AggregateFunc, Arithmetic, ArithmeticOp, Between, BucketGrid, Case, CaseCheck, Cast, Compare,
+    Concat, Conjunction, ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc,
+    Divide, Error, Expression, FormatBytes, Function, InList, IntervalArithmetic, IsNull, Length,
+    Like, MaybeError, NormalizedInterval, Not, NumericAggregate, Prefix, Ref, RegexpFullMatch,
+    RegexpJitReplace, RegexpReplace, Substring, Suffix, TemporalConvert, TimeBucket, VariantGet,
+    count_epoch_months,
 };
-use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
+use crate::types::{
+    MICROS_PER_DAY, Type, build_scalar_value, physical_arrow_type, type_from_logical,
+};
 
 impl Expression {
     /// Build a Pivot [`Expression`] (and its whole subtree) from a borrowed DuckDB
@@ -380,6 +383,7 @@ impl Function {
             )?)),
             "/" => Ok(Function::Divide(Divide::from_handle(func)?)),
             "date_trunc" => Ok(Function::DateTrunc(DateTrunc::from_handle(func)?)),
+            "time_bucket" => Ok(Function::TimeBucket(TimeBucket::from_handle(func)?)),
             "make_date" => Ok(Function::TemporalConvert(TemporalConvert::make_date(func)?)),
             "make_timestamp" => Ok(Function::TemporalConvert(TemporalConvert::make_timestamp(
                 func,
@@ -603,6 +607,150 @@ impl DateTrunc {
     }
 }
 
+impl TimeBucket {
+    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<TimeBucket, Error> {
+        let has_third_argument = func.children()?.len() == 3;
+        let params = function_args(func, if has_third_argument { 3 } else { 2 })?;
+        let ScalarValue::Interval {
+            months,
+            days,
+            micros,
+        } = read_constant_value(params[0])?
+        else {
+            return Err(reject_time_bucket("the bucket width has to be an INTERVAL"));
+        };
+        // DuckDB types the call, and casts the source to the result type.
+        let result = type_from_logical(func.return_type()?)?;
+        // A bucket is either a fixed length or a whole number of calendar
+        // months, never a blend of the two.
+        let is_month_width = months != 0;
+        if is_month_width && (days != 0 || micros != 0) {
+            return Err(reject_time_bucket(
+                "a bucket width in months cannot have a day or time component",
+            ));
+        }
+        // A zoned day is a calendar day, not a fixed 24 hours, so it does not
+        // blend with a time component either.
+        if result == Type::TimestampTz && days != 0 && micros != 0 {
+            return Err(reject_time_bucket(
+                "a bucket width in days cannot have a time component on a TIMESTAMP WITH TIME ZONE",
+            ));
+        }
+        let width_micros = count_interval_micros(days, micros)?;
+        if months < 0 || (!is_month_width && width_micros <= 0) {
+            return Err(reject_time_bucket(
+                "the bucket width must be greater than 0",
+            ));
+        }
+        let third_argument = match has_third_argument {
+            true => Some(read_constant_value(params[2])?),
+            false => None,
+        };
+        let grid = match is_month_width {
+            true => BucketGrid::from_months(i64::from(months), read_origin_months(third_argument)?),
+            false => BucketGrid::from_micros(width_micros, read_origin_micros(third_argument)?),
+        };
+        Ok(TimeBucket {
+            grid,
+            source: Box::new(Expression::from_handle(params[1])?),
+            result,
+        })
+    }
+}
+
+/// The start of the fixed-length bucket grid `time_bucket` uses when the query
+/// names none: Monday 2000-01-03, so week-long buckets start on Mondays.
+const DEFAULT_BUCKET_ORIGIN_MICROS: i64 = 10_959 * MICROS_PER_DAY;
+
+/// The start of the month bucket grid `time_bucket` uses when the query names
+/// none: January 2000, counted in months since January 1970.
+const DEFAULT_BUCKET_ORIGIN_MONTHS: i64 = 360;
+
+fn reject_time_bucket(reason: &str) -> Error {
+    Error::InvalidTimeBucket(reason.to_string())
+}
+
+/// Count the microseconds in an interval's day and time fields, taking a day
+/// as a fixed 24 hours.
+fn count_interval_micros(days: i32, micros: i64) -> Result<i64, Error> {
+    i64::from(days)
+        .checked_mul(MICROS_PER_DAY)
+        .and_then(|day_micros| day_micros.checked_add(micros))
+        .ok_or_else(|| reject_time_bucket("the interval is too long to count in microseconds"))
+}
+
+/// Read a `time_bucket` origin `DATE` as days since the epoch. An infinite
+/// date starts no bucket.
+fn read_origin_days(days: i32) -> Result<i64, Error> {
+    if days == i32::MAX || days == -i32::MAX {
+        return Err(reject_time_bucket("the origin cannot be infinite"));
+    }
+    Ok(i64::from(days))
+}
+
+/// Read a `time_bucket` origin timestamp as microseconds since the epoch. An
+/// infinite timestamp starts no bucket.
+fn read_origin_instant(micros: i64) -> Result<i64, Error> {
+    if micros == i64::MAX || micros == -i64::MAX {
+        return Err(reject_time_bucket("the origin cannot be infinite"));
+    }
+    Ok(micros)
+}
+
+/// The instant a fixed-length bucket grid starts at, in microseconds since the
+/// epoch, given `time_bucket`'s optional third argument: an `origin` to start
+/// at, or an `offset` that shifts the default start.
+fn read_origin_micros(third_argument: Option<ScalarValue>) -> Result<i64, Error> {
+    match third_argument {
+        None => Ok(DEFAULT_BUCKET_ORIGIN_MICROS),
+        Some(ScalarValue::Date(days)) => read_origin_days(days)?
+            .checked_mul(MICROS_PER_DAY)
+            .ok_or_else(|| reject_time_bucket("the origin is out of range for a TIMESTAMP")),
+        Some(ScalarValue::Timestamp(micros) | ScalarValue::TimestampTz(micros)) => {
+            read_origin_instant(micros)
+        }
+        Some(ScalarValue::Interval {
+            months: 0,
+            days,
+            micros,
+        }) => count_interval_micros(days, micros)?
+            .checked_add(DEFAULT_BUCKET_ORIGIN_MICROS)
+            .ok_or_else(|| reject_time_bucket("the offset is too long to count in microseconds")),
+        Some(ScalarValue::Interval { .. }) => Err(reject_time_bucket(
+            "an offset in months needs a bucket width in months",
+        )),
+        Some(other) => Err(reject_bucket_origin(other)),
+    }
+}
+
+/// The month a calendar-month bucket grid starts at, in months since January
+/// 1970, given `time_bucket`'s optional third argument. An `origin` counts by
+/// the month it falls in.
+fn read_origin_months(third_argument: Option<ScalarValue>) -> Result<i64, Error> {
+    match third_argument {
+        None => Ok(DEFAULT_BUCKET_ORIGIN_MONTHS),
+        Some(ScalarValue::Date(days)) => Ok(count_epoch_months(read_origin_days(days)?)),
+        Some(ScalarValue::Timestamp(micros) | ScalarValue::TimestampTz(micros)) => Ok(
+            count_epoch_months(read_origin_instant(micros)?.div_euclid(MICROS_PER_DAY)),
+        ),
+        Some(ScalarValue::Interval {
+            months,
+            days: 0,
+            micros: 0,
+        }) => Ok(DEFAULT_BUCKET_ORIGIN_MONTHS + i64::from(months)),
+        Some(ScalarValue::Interval { .. }) => Err(reject_time_bucket(
+            "an offset in days or time needs a bucket width in days or time",
+        )),
+        Some(other) => Err(reject_bucket_origin(other)),
+    }
+}
+
+fn reject_bucket_origin(third_argument: ScalarValue) -> Error {
+    Error::InvalidTimeBucket(format!(
+        "{third_argument:?} is neither an offset nor an origin"
+    ))
+}
+
 impl DatePart {
     pub(crate) fn from_handle(
         kind: DatePartKind,
@@ -805,6 +953,18 @@ fn function_args(func: FunctionHandle<'_>, expected: usize) -> Result<Vec<Expr<'
         });
     }
     Ok(params)
+}
+
+/// Read the value of an argument that has to be a constant, such as
+/// `time_bucket`'s bucket width.
+fn read_constant_value(param: Expr<'_>) -> Result<ScalarValue, Error> {
+    match param.expression()? {
+        DuckExpression::Constant(constant) => Ok(constant.value()?),
+        _ => Err(Error::UnsupportedScalarFunction(format!(
+            "expected a constant, got {}",
+            Expression::from_handle(param)?
+        ))),
+    }
 }
 
 /// Extract a constant string argument (e.g. a regex pattern or a `date_trunc`
