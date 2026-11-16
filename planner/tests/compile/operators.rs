@@ -2513,3 +2513,21 @@ fn count_over_grouped_subquery_with_pruned_aggregates(mut testing_planner: Testi
 
     assert_eq!(rows[0]["count_star()"], 4);
 }
+
+// The key is NULL for some rows although the column it is computed from has no
+// NULLs, so those rows have to form their own group.
+#[rstest]
+fn group_by_a_function_of_a_null_producing_case(mut testing_planner: TestingPlanner) {
+    let rows = run(
+        &mut testing_planner,
+        "SELECT a + CASE WHEN a > 2 THEN NULL ELSE a END AS doubled, count(*) AS row_count \
+         FROM example_table GROUP BY 1",
+    );
+
+    let mut groups: Vec<(Option<i64>, i64)> = rows
+        .iter()
+        .map(|row| (row["doubled"].as_i64(), row["row_count"].as_i64().unwrap()))
+        .collect();
+    groups.sort();
+    assert_eq!(groups, vec![(None, 3), (Some(2), 1), (Some(4), 1)]);
+}

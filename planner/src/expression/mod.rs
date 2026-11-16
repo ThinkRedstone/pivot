@@ -325,10 +325,7 @@ impl Expression {
     /// of each input column (`input[i]` = column `i` can hold NULLs). The
     /// planner uses this to route between the branch-free and the null-aware
     /// execution paths, so `false` must be sound: a `true` merely costs the
-    /// fast path. Functions are folded conservatively (any nullable input
-    /// column makes a function nullable) since a function of an entirely
-    /// NULL-free input produces no NULLs (an operation that introduces its own
-    /// NULLs, if one is ever added, must be special-cased here).
+    /// fast path. A function call is asked through [`Function::nullability`].
     pub fn nullability(&self, input: &[bool]) -> bool {
         match self {
             Expression::Ref(r) => input.get(r.column_idx).copied().unwrap_or(true),
@@ -361,7 +358,7 @@ impl Expression {
                     | AggregateFunc::Count(_)
                     | AggregateFunc::CountDistinct(_)
             ),
-            Expression::Function(_) => input.iter().any(|&nullable| nullable),
+            Expression::Function(f) => f.nullability(input),
         }
     }
 

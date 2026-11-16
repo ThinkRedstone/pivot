@@ -228,6 +228,28 @@ impl Display for Function {
 }
 
 impl Function {
+    /// Whether a call to this function can yield SQL NULL, given the
+    /// nullability of each input column (see [`Expression::nullability`]).
+    ///
+    /// A function yields NULL when one of its arguments is NULL, so it can be
+    /// NULL when any argument can. The arguments are asked themselves, not
+    /// the columns they read: an argument such as `CASE ... THEN NULL` can
+    /// be NULL over columns that never are. A function that yields NULL over
+    /// arguments that are not NULL has to say so here.
+    pub fn nullability(&self, input: &[bool]) -> bool {
+        match self {
+            // A path that a document does not have reads as NULL.
+            Function::VariantGet(_) => true,
+            _ => {
+                let mut any_argument_nullable = false;
+                self.for_each_argument(&mut |argument| {
+                    any_argument_nullable |= argument.nullability(input);
+                });
+                any_argument_nullable
+            }
+        }
+    }
+
     /// The type a call to this function yields.
     pub fn result_type(&self) -> Type {
         match self {
