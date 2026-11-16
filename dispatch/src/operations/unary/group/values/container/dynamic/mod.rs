@@ -237,13 +237,22 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool, S:
             4 => self.merge_fixed::<4>(source, context),
             _ => {
                 let (slots, shared) = context;
-                for ((destination_cell, &source_cell), slot) in
-                    self.1.iter_mut().zip(source.1.iter()).zip(slots.iter())
-                {
+                // Indexing keeps this loop free of function calls. An
+                // iterator adapter that the compiler does not inline is a
+                // call, and a call here makes every caller's row loop keep
+                // its values on the stack and reload them for each row.
+                let cell_count = self.1.len();
+                let source_cells = &source.1[..cell_count];
+                let slots = &slots[..cell_count];
+                for slot_index in 0..cell_count {
                     if ONLY_ADDITIVE {
-                        *destination_cell = *destination_cell + source_cell;
+                        self.1[slot_index] = self.1[slot_index] + source_cells[slot_index];
                     } else {
-                        destination_cell.merge_cells(source_cell, slot, shared);
+                        self.1[slot_index].merge_cells(
+                            source_cells[slot_index],
+                            &slots[slot_index],
+                            shared,
+                        );
                     }
                 }
             }
