@@ -138,18 +138,18 @@ impl<I: Receiver<QueryRowGroupMetadata>> RowGroupFetcher<I> {
                 .push_back(request.into_row_group_buffer(None, Some(read_ahead_charge)));
         } else {
             let id = io.read(
-            &memory_ctx().page_caches().compressed,
-            request.open_file().clone(),
-            request.file_ranges(),
-        )?;
-        self.in_flight.insert(id, (request, read_ahead_charge));
+                &memory_ctx().page_caches().compressed,
+                request.open_file().clone(),
+                request.file_ranges(),
+            )?;
+            self.in_flight.insert(id, (request, read_ahead_charge));
         }
         Ok(WorkStatus::Ran)
     }
 }
 
-impl<I: Receiver<QueryRowGroupMetadata>>
-    Unary<QueryRowGroupMetadata, RowGroupBuffer> for RowGroupFetcher<I>
+impl<I: Receiver<QueryRowGroupMetadata>> Unary<QueryRowGroupMetadata, RowGroupBuffer>
+    for RowGroupFetcher<I>
 {
     /// Take a row group expected to be in memory. One that is builds its
     /// buffer straight away and counts against no budget. One that needs a

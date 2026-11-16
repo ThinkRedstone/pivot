@@ -227,6 +227,10 @@ impl Run {
     /// The header's LSB distinguishes RLE (0) from bit-packed (1). For RLE
     /// runs the repeated value follows; for bit-packed runs only the group
     /// count is recorded — actual decoding happens in [`read_into`](Self::read_into).
+    ///
+    /// Always inlined, because it runs once per run inside the decode loop and
+    /// the compiler otherwise makes it a call in some builds.
+    #[inline(always)]
     pub fn parse_from_header(bit_width: u8, reader: &mut MultiBufferReader) -> Self {
         let header = reader.read_varint();
         if header & 1 == 0 {
