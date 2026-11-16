@@ -1,6 +1,6 @@
 //! [`SlotTenants`]: per ring slot, the keys of every entry with bytes in it.
 //!
-//! The reverse of a cache's [`FileMap`](super::FileMap): the map answers
+//! The reverse of a cache's [`FileMap`](super::file_map::FileMap): the map answers
 //! "where is this entry", the tenant list answers "what is in this slot", which
 //! is what an evictor holding only a slot index needs.
 //!

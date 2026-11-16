@@ -31,7 +31,7 @@
 //! A *family* groups the caches holding the same bytes in different forms.
 //! Within a family the caches are balanced by target share and reinforce each
 //! other when one drops a copy; across families, slots compete on recency and
-//! each cache's [`CachePolicy`] weight alone. See [`family`] and [`clock`].
+//! each cache's [`CachePolicy`] weight alone. See [`family`] and [`clock`](super::clock).
 //!
 //! [`setup`] declares the families this engine runs with.
 
