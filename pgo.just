@@ -33,6 +33,13 @@ floor_rustflags := if host_target =~ "x86_64" {
     ""
 }
 
+# Flags of every instrumented build. Counter updates are atomic: a plain update
+# is a load, an add and a store, so workers running the same code at once
+# overwrite each other's increments. The loss falls on the code all workers run
+# concurrently and differs from one training run to the next, so the profile
+# would under-weight the hottest paths by a varying amount.
+pgogen_rustflags := "-Cprofile-generate=" + pgo_dir + " -Cllvm-args=-instrprof-atomic-counter-update-all"
+
 # Run a cargo command instrumented for PGO profile generation, then merge the profiles.
 #
 #   just pgo-gen bench --bench clickbench
@@ -45,7 +52,7 @@ pgo-gen *args:
     # workload, so the profile records the wait-heavy control-flow mix that
     # cold runs on the full dataset execute, deterministically rather than
     # as a timing-dependent draw per build.
-    RUSTFLAGS="-Cprofile-generate={{pgo_dir}} {{floor_rustflags}}" \
+    RUSTFLAGS="{{pgogen_rustflags}} {{floor_rustflags}}" \
         PIVOT_SPIN_LIMIT=0 \
         CARGO_TARGET_DIR={{pgogen_target_dir}} cargo {{args}}
     $(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata merge -o {{pgo_dir}}/merged.profdata {{pgo_dir}}
@@ -67,7 +74,7 @@ pgo-use *args:
 pgo-gen-build subcmd *args:
     @[ -n "{{floor_rustflags}}" ] || { echo "no instruction floor defined for {{host_target}}" >&2; exit 1; }
     mkdir -p {{pgo_dir}}
-    RUSTFLAGS="-Cprofile-generate={{pgo_dir}} {{floor_rustflags}} -Clink-arg=-fuse-ld=lld" \
+    RUSTFLAGS="{{pgogen_rustflags}} {{floor_rustflags}} -Clink-arg=-fuse-ld=lld" \
         CARGO_TARGET_DIR={{pgogen_target_dir}} cargo {{subcmd}} --target {{host_target}} {{args}}
 
 # Like pgo-use but with a caller-supplied profdata path. rustc records the
