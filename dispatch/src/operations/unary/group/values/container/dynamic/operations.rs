@@ -120,6 +120,18 @@ impl<'b> OperationReader<'b> {
         row_index: usize,
         worker_context: &mut WorkerArena,
     ) -> A {
+        if ONLY_ADDITIVE {
+            // Three arms and one shared failure compile to a short chain of
+            // compares. One failing arm per other variant makes a switch
+            // wide enough that some builds turn it into an indirect jump,
+            // which costs every row of the probe loop.
+            return match self {
+                OperationReader::Count => Count::<A>::seed(()),
+                OperationReader::I64Sum(reader) => Sum::<A>::seed(reader.read(row_index)),
+                OperationReader::U128Sum(reader) => U128Sum::<A>::seed(reader.read(row_index)),
+                _ => fail_on_non_additive_operation(),
+            };
+        }
         match self {
             OperationReader::Count => Count::<A>::seed(()),
             OperationReader::I64Sum(reader) => Sum::<A>::seed(reader.read(row_index)),
@@ -282,6 +294,18 @@ impl<'b> OperationReader<'b> {
         worker_context: &mut WorkerArena,
         shared: &Arc<SharedArena>,
     ) -> A {
+        if ONLY_ADDITIVE {
+            // Kept to three arms and one shared failure for the same reason
+            // as in `seed`.
+            return match self {
+                OperationReader::Count => Count::<A>::update(cell, ()),
+                OperationReader::I64Sum(reader) => Sum::<A>::update(cell, reader.read(row_index)),
+                OperationReader::U128Sum(reader) => {
+                    U128Sum::<A>::update(cell, reader.read(row_index))
+                }
+                _ => fail_on_non_additive_operation(),
+            };
+        }
         match self {
             OperationReader::Count => Count::<A>::update(cell, ()),
             OperationReader::I64Sum(reader) => Sum::<A>::update(cell, reader.read(row_index)),
@@ -361,6 +385,14 @@ impl<'b> OperationReader<'b> {
             }
         }
     }
+}
+
+/// The planner enables the additive specialization only for COUNT and integer
+/// SUM slots, so any other operation reaching it is a planning bug.
+#[cold]
+#[inline(never)]
+fn fail_on_non_additive_operation() -> ! {
+    panic!("an additive group value holds only COUNT and integer SUM slots")
 }
 
 /// Aggregation operations bound to one record batch.
