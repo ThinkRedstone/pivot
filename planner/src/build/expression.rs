@@ -25,8 +25,8 @@ use crate::expression::{
     Concat, Conjunction, ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc,
     Divide, Error, Expression, FormatBytes, Function, InList, IntervalArithmetic, IsNull, Length,
     Like, MaybeError, NormalizedInterval, Not, NumericAggregate, Prefix, Ref, RegexpFullMatch,
-    RegexpJitReplace, RegexpReplace, StructExtract, StructPack, Substring, Suffix, TemporalConvert,
-    TimeBucket, VariantGet, count_epoch_months,
+    RegexpJitReplace, RegexpReplace, Round, Rounding, StructExtract, StructPack, Substring, Suffix,
+    TemporalConvert, TimeBucket, VariantGet, count_epoch_months,
 };
 use crate::types::{
     MICROS_PER_DAY, StructField, Type, build_scalar_value, physical_arrow_type, type_from_logical,
@@ -400,6 +400,8 @@ impl Function {
                 func,
             )?)),
             "/" => Ok(Function::Divide(Divide::from_handle(func)?)),
+            "floor" => Ok(Function::Round(Round::from_floor_call(func)?)),
+            "round" => Ok(Function::Round(Round::from_round_call(func)?)),
             "date_trunc" => Ok(Function::DateTrunc(DateTrunc::from_handle(func)?)),
             "time_bucket" => Ok(Function::TimeBucket(TimeBucket::from_handle(func)?)),
             "make_date" => Ok(Function::TemporalConvert(TemporalConvert::make_date(func)?)),
@@ -596,6 +598,38 @@ impl Divide {
         Ok(Divide {
             left: Box::new(Expression::from_handle(params[0])?),
             right: Box::new(Expression::from_handle(params[1])?),
+            return_type: type_from_logical(func.return_type()?)?,
+        })
+    }
+}
+
+impl Round {
+    pub(crate) fn from_floor_call(func: FunctionHandle<'_>) -> Result<Round, Error> {
+        let params = function_args(func, 1)?;
+        Ok(Round {
+            rounding: Rounding::Floor,
+            input: Box::new(Expression::from_handle(params[0])?),
+            return_type: type_from_logical(func.return_type()?)?,
+        })
+    }
+
+    pub(crate) fn from_round_call(func: FunctionHandle<'_>) -> Result<Round, Error> {
+        let has_digits = func.children()?.len() == 2;
+        let params = function_args(func, if has_digits { 2 } else { 1 })?;
+        let digits = match has_digits {
+            true => {
+                let digits = constant_int64(Expression::from_handle(params[1])?)?;
+                i32::try_from(digits).map_err(|_| {
+                    Error::UnsupportedScalarFunction(format!("round to {digits} digits"))
+                })?
+            }
+            false => 0,
+        };
+        Ok(Round {
+            rounding: Rounding::Nearest { digits },
+            input: Box::new(Expression::from_handle(params[0])?),
+            // DuckDB types the call: a decimal's result keeps only the scale
+            // the digits leave it.
             return_type: type_from_logical(func.return_type()?)?,
         })
     }

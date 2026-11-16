@@ -4,7 +4,7 @@
 use super::{
     Arithmetic, Concat, Contains, DatePart, DateTrunc, Divide, FormatBytes, IntervalArithmetic,
     Length, Like, NormalizedInterval, Prefix, RegexpFullMatch, RegexpJitReplace, RegexpReplace,
-    StructExtract, StructPack, Substring, Suffix, TemporalConvert, TimeBucket, VariantGet,
+    Round, StructExtract, StructPack, Substring, Suffix, TemporalConvert, TimeBucket, VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
@@ -73,6 +73,8 @@ pub enum Function {
     /// `regexp_jit_replace` — like `RegexpReplace` but always PCRE2 JIT-compiled.
     RegexpJitReplace(RegexpJitReplace),
     Divide(Divide),
+    /// `floor(value)` and `round(value[, digits])`.
+    Round(Round),
     /// `left || right` string concatenation.
     Concat(Concat),
     /// `substring(string, start[, length])` with constant positions.
@@ -143,6 +145,7 @@ impl Function {
                 visit(&c.left);
                 visit(&c.right);
             }
+            Function::Round(r) => visit(&r.input),
             Function::Substring(s) => visit(&s.input),
             Function::DateTrunc(d) => visit(&d.source),
             Function::TimeBucket(t) => visit(&t.source),
@@ -192,6 +195,7 @@ impl Function {
                 visit(&mut c.left);
                 visit(&mut c.right);
             }
+            Function::Round(r) => visit(&mut r.input),
             Function::Substring(s) => visit(&mut s.input),
             Function::DateTrunc(d) => visit(&mut d.source),
             Function::TimeBucket(t) => visit(&mut t.source),
@@ -221,6 +225,7 @@ impl Display for Function {
             Function::RegexpFullMatch(r) => write!(f, "{r}"),
             Function::RegexpJitReplace(r) => write!(f, "{r}"),
             Function::Divide(d) => write!(f, "{d}"),
+            Function::Round(r) => write!(f, "{r}"),
             Function::Concat(c) => write!(f, "{c}"),
             Function::Substring(s) => write!(f, "{s}"),
             Function::DateTrunc(dt) => write!(f, "{dt}"),
@@ -286,6 +291,9 @@ impl Function {
             | Function::FormatBytes(_) => Type::Utf8,
             // `/` computes a float quotient, single- or double-precision.
             Function::Divide(d) => d.return_type.clone(),
+            // Rounding keeps a float or an integer's type, and narrows a
+            // decimal's scale to the digits it leaves, as DuckDB bound it.
+            Function::Round(r) => r.return_type.clone(),
             // `date_trunc` keeps its source's timestamp type (with or without
             // a zone), as DuckDB bound it.
             Function::DateTrunc(d) => d.result.clone(),
@@ -321,6 +329,7 @@ impl Function {
             Function::RegexpFullMatch(r) => r.compile(),
             Function::RegexpJitReplace(r) => r.compile(),
             Function::Divide(d) => d.compile(),
+            Function::Round(r) => r.compile(),
             Function::Concat(c) => c.compile(),
             Function::Substring(s) => s.compile(),
             Function::DateTrunc(dt) => dt.compile(),

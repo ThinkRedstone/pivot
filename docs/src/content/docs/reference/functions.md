@@ -16,7 +16,7 @@ counts, sums, averages, and other summaries: `avg`, `count`, `first`, `min`,
 
 - [Strings and regular expressions](/docs/reference/functions/strings/) - search, measure, slice, and replace text.
 - [Dates and times](/docs/reference/functions/datetime/) - construct timestamps, truncate them, and extract fields.
-- [Arithmetic](/docs/reference/functions/arithmetic/) - numeric operators and supported interval arithmetic.
+- [Arithmetic](/docs/reference/functions/arithmetic/) - numeric operators, rounding, and supported interval arithmetic.
 - [VARIANT access](/docs/reference/functions/variant/) - read nested values and cast fields to SQL types.
 - [Utility functions](/docs/reference/functions/utilities/) - format byte counts and clear Pivot's data caches.
 
