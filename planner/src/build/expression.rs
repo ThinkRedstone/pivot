@@ -25,11 +25,11 @@ use crate::expression::{
     Concat, Conjunction, ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc,
     Divide, Error, Expression, FormatBytes, Function, InList, IntervalArithmetic, IsNull, Length,
     Like, MaybeError, NormalizedInterval, Not, NumericAggregate, Prefix, Ref, RegexpFullMatch,
-    RegexpJitReplace, RegexpReplace, Substring, Suffix, TemporalConvert, TimeBucket, VariantGet,
-    count_epoch_months,
+    RegexpJitReplace, RegexpReplace, StructExtract, StructPack, Substring, Suffix, TemporalConvert,
+    TimeBucket, VariantGet, count_epoch_months,
 };
 use crate::types::{
-    MICROS_PER_DAY, Type, build_scalar_value, physical_arrow_type, type_from_logical,
+    MICROS_PER_DAY, StructField, Type, build_scalar_value, physical_arrow_type, type_from_logical,
 };
 
 impl Expression {
@@ -81,8 +81,19 @@ impl Ref {
     }
 }
 
+/// Refuse `operation` over an operand that is a whole struct. The kernels
+/// behind comparisons and casts do not take a struct, and would fail on the
+/// first batch instead of when the query is planned.
+fn reject_struct_operand(operand: Expr<'_>, operation: &str) -> Result<(), Error> {
+    if operand.return_type()?.id == LogicalTypeId::STRUCT {
+        return Err(Error::UnsupportedStructOperation(operation.to_string()));
+    }
+    Ok(())
+}
+
 impl Compare {
     pub(crate) fn from_handle(view: CompareHandle<'_>) -> Result<Compare, Error> {
+        reject_struct_operand(view.left()?, "A comparison")?;
         Ok(Compare {
             left: Box::new(Expression::from_handle(view.left()?)?),
             right: Box::new(Expression::from_handle(view.right()?)?),
@@ -94,6 +105,7 @@ impl Compare {
 
 impl Between {
     pub(crate) fn from_handle(view: BetweenHandle<'_>) -> Result<Between, Error> {
+        reject_struct_operand(view.input()?, "BETWEEN")?;
         Ok(Between {
             input: Box::new(Expression::from_handle(view.input()?)?),
             lower: Box::new(Expression::from_handle(view.lower()?)?),
@@ -134,6 +146,7 @@ impl InList {
     pub(crate) fn from_handle(view: InListHandle<'_>) -> Result<InList, Error> {
         // Child 0 is the tested expression, children 1.. are the list values.
         let children: Vec<Expr<'_>> = view.children()?;
+        reject_struct_operand(children[0], "IN")?;
         Ok(InList {
             input: Box::new(Expression::from_handle(children[0])?),
             values: children[1..]
@@ -203,6 +216,11 @@ impl Cast {
         }
         // A `BoundCastExpression`'s target is its own result type.
         let target = type_from_logical(view.return_type()?)?;
+        // A struct casts to a struct field by field; nothing converts a
+        // whole struct to or from another type.
+        if !matches!(target, Type::Struct(_)) {
+            reject_struct_operand(view.child()?, "A cast to another type")?;
+        }
         let source = Expression::from_handle(view.child()?)?;
 
         // Fold a cast and its `->` chain into one typed read. This lets the
@@ -395,6 +413,16 @@ impl Function {
             "variant_extract" | "json_extract" => {
                 Ok(Function::VariantGet(VariantGet::from_handle(func)?))
             }
+            // `{'a': x, 'b': y}` binds to `struct_pack` and the unnamed
+            // `(x, y)` to `row`. The field names are in the result type.
+            "struct_pack" | "row" => Ok(Function::StructPack(StructPack::from_handle(func)?)),
+            // `pair.a` binds to `struct_extract` with the field's name. `pair[1]`
+            // binds to `array_extract` with the field's position from 1, which
+            // DuckDB's optimizer may rewrite to `struct_extract_at`. Only a
+            // struct is supported as the value `array_extract` reads from.
+            "struct_extract" | "struct_extract_at" | "array_extract" => {
+                Ok(Function::StructExtract(StructExtract::from_handle(func)?))
+            }
             "drop_cache" => {
                 function_args(func, 0)?;
                 Ok(Function::DropCache)
@@ -570,6 +598,72 @@ impl Divide {
             right: Box::new(Expression::from_handle(params[1])?),
             return_type: type_from_logical(func.return_type()?)?,
         })
+    }
+}
+
+impl StructPack {
+    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<StructPack, Error> {
+        let return_type = type_from_logical(func.return_type()?)?;
+        // A variant column's arrow layout differs per file, so no single
+        // struct type describes a field holding one.
+        if let Type::Struct(fields) = &return_type
+            && fields.iter().any(|field| field.field_type == Type::Variant)
+        {
+            return Err(Error::UnsupportedScalarFunction(
+                "a struct with a VARIANT field".to_string(),
+            ));
+        }
+        Ok(StructPack {
+            return_type,
+            fields: func
+                .children()?
+                .into_iter()
+                .map(Expression::from_handle)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+impl StructExtract {
+    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<StructExtract, Error> {
+        let name = func.name()?;
+        let params = function_args(func, 2)?;
+        let input = Expression::from_handle(params[0])?;
+        let Type::Struct(fields) = type_from_logical(params[0].return_type()?)? else {
+            return Err(Error::UnsupportedScalarFunction(format!(
+                "{name} of a value that is not a struct"
+            )));
+        };
+        let DuckExpression::Constant(field_key) = params[1].expression()? else {
+            return Err(Error::UnsupportedScalarFunction(format!(
+                "{name} with a field that is not a constant"
+            )));
+        };
+        let field_idx = find_struct_field(&fields, field_key.value()?).ok_or_else(|| {
+            Error::UnsupportedScalarFunction(format!("{name} of a field the struct does not have"))
+        })?;
+        Ok(StructExtract {
+            input: Box::new(input),
+            field_idx,
+            return_type: type_from_logical(func.return_type()?)?,
+        })
+    }
+}
+
+/// The position of the struct field a `struct_extract` names: a string is a
+/// field name, matched ignoring case as DuckDB's binder does, and an integer is
+/// a position counted from 1. `None` when the struct has no such field, which
+/// the binder has already ruled out for a query that reached planning.
+fn find_struct_field(fields: &[StructField], field_key: ScalarValue) -> Option<usize> {
+    match field_key {
+        ScalarValue::Utf8(name) => fields
+            .iter()
+            .position(|field| field.name.eq_ignore_ascii_case(&name)),
+        ScalarValue::Int64(position) => usize::try_from(position)
+            .ok()
+            .filter(|position| (1..=fields.len()).contains(position))
+            .map(|position| position - 1),
+        _ => None,
     }
 }
 

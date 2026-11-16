@@ -18,6 +18,7 @@
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
+#include "duckdb/planner/operator/logical_unnest.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
@@ -51,6 +52,7 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/common/types/interval.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/planner/planner.hpp"
@@ -445,8 +447,34 @@ static BridgeLogicalType bridge_logical_type(const duckdb::LogicalType &type) {
 	return out;
 }
 
-BridgeLogicalType lo_filter_type_id(const LogicalOperator &op, size_t index) {
-	return bridge_logical_type(as<duckdb::LogicalFilter>(op).types[index]);
+BridgeLogicalType logical_type_flat(const LogicalType &type) {
+	return bridge_logical_type(type);
+}
+
+// The fields of a STRUCT type. The type is checked here because DuckDB's own
+// accessor only asserts it in debug builds.
+static const duckdb::child_list_t<LogicalType> &struct_fields(const LogicalType &type) {
+	if (type.id() != duckdb::LogicalTypeId::STRUCT) {
+		throw duckdb::InternalException("expected a STRUCT type, got %s", type.ToString());
+	}
+	return duckdb::StructType::GetChildTypes(type);
+}
+
+size_t logical_type_struct_field_count(const LogicalType &type) {
+	return struct_fields(type).size();
+}
+
+// Empty for a field of an unnamed struct, such as a `(a, b)` tuple.
+rust::String logical_type_struct_field_name(const LogicalType &type, size_t index) {
+	return rust::String::lossy(struct_fields(type)[index].first);
+}
+
+const LogicalType &logical_type_struct_field_type(const LogicalType &type, size_t index) {
+	return struct_fields(type)[index].second;
+}
+
+const LogicalType &lo_filter_type_id(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalFilter>(op).types[index];
 }
 
 // ---- OrderBy ----
@@ -497,6 +525,24 @@ size_t lo_distinct_target_count(const LogicalOperator &op) {
 
 const Expression &lo_distinct_target(const LogicalOperator &op, size_t index) {
 	return *as<duckdb::LogicalDistinct>(op).distinct_targets[index];
+}
+
+// ---- Unnest ----
+//
+// The operator holds one BoundUnnestExpression per unnested list. Its child is
+// the list being unnested and its return type is the type of one element.
+
+size_t lo_unnest_list_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalUnnest>(op).expressions.size();
+}
+
+const Expression &lo_unnest_list(const LogicalOperator &op, size_t index) {
+	auto &unnest = *as<duckdb::LogicalUnnest>(op).expressions[index];
+	return *as_expr<duckdb::BoundUnnestExpression>(unnest).child;
+}
+
+const LogicalType &lo_unnest_element_type(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalUnnest>(op).expressions[index]->return_type;
 }
 
 // ---- TopN ----
@@ -1210,8 +1256,8 @@ uint8_t expr_type(const Expression &expr) {
 	return static_cast<uint8_t>(expr.type);
 }
 
-BridgeLogicalType expr_return_type(const Expression &expr) {
-	return bridge_logical_type(expr.return_type);
+const LogicalType &expr_return_type(const Expression &expr) {
+	return expr.return_type;
 }
 
 bool expr_has_alias(const Expression &expr) {
@@ -1235,8 +1281,8 @@ const Value &expr_constant(const Expression &expr) {
 // column's type for an INSERT), and none of the typed accessors below may be
 // called on one: they either throw or, for `value_string`, hand back the text
 // "NULL".
-BridgeLogicalType value_type(const Value &v) {
-	return bridge_logical_type(v.type());
+const LogicalType &value_type(const Value &v) {
+	return v.type();
 }
 bool value_is_null(const Value &v) {
 	return v.IsNull();
@@ -1334,6 +1380,31 @@ int32_t value_interval_days(const Value &v) {
 }
 int64_t value_interval_micros(const Value &v) {
 	return v.GetValue<duckdb::interval_t>().micros;
+}
+
+// The elements of a non-NULL LIST value. The type is checked here because
+// DuckDB's own accessor only asserts it in debug builds.
+static const duckdb::vector<Value> &list_elements(const Value &v) {
+	if (v.type().id() != duckdb::LogicalTypeId::LIST) {
+		throw duckdb::InternalException("expected a LIST value, got %s", v.type().ToString());
+	}
+	return duckdb::ListValue::GetChildren(v);
+}
+
+size_t value_list_element_count(const Value &v) {
+	return list_elements(v).size();
+}
+
+const Value &value_list_element(const Value &v, size_t index) {
+	return list_elements(v)[index];
+}
+
+// One field of a non-NULL STRUCT value, in the order of its type's fields.
+const Value &value_struct_field(const Value &v, size_t index) {
+	if (v.type().id() != duckdb::LogicalTypeId::STRUCT) {
+		throw duckdb::InternalException("expected a STRUCT value, got %s", v.type().ToString());
+	}
+	return duckdb::StructValue::GetChildren(v)[index];
 }
 
 size_t expr_ref_index(const Expression &expr) {

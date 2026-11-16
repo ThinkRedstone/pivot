@@ -6,10 +6,14 @@ use crate::dynamic_filter::{DynamicFilter, JoinFilterScanInfo, KeyBitsetFilter};
 use crate::expression::{Expression, Function, Ref, VariantGet};
 use crate::operator::Projection;
 use crate::types::{Type, physical_arrow_type};
+use arrow_array::{Array, ArrayRef, RecordBatch, new_null_array};
+use arrow_schema::{DataType, Field, FieldRef, Schema};
 use dispatch::{
-    DataFlowDispatcher, Projection as DispatchProjection, RecordBatchOperatorSpec, VariantExtract,
+    DataFlowDispatcher, Projection as DispatchProjection, RECORD_BATCH_SIZE,
+    RecordBatchOperatorSpec, VariantExtract,
 };
 use std::fmt;
+use std::sync::Arc;
 
 /// Scans a [`BoundTable`] from the catalog. `columns` lists the requested output
 /// columns (each as a [`Ref`] into the table schema)
@@ -88,10 +92,91 @@ impl Input {
             )
             .map_err(Error::TableScan)?;
         let scan = self.attach_key_bitset_filters(scan, slots);
-        match extract_projection {
-            Some(extract_projection) => extract_projection.compile(scan),
-            None => Ok(scan),
+        let scan = match extract_projection {
+            Some(extract_projection) => extract_projection.compile(scan)?,
+            None => scan,
+        };
+        Ok(self.add_placeholder_columns(scan))
+    }
+
+    /// Emit a NULL column for each placeholder among `columns`.
+    ///
+    /// When a query needs no column of the table (`SELECT count(*)`, or an
+    /// unnest of constants), DuckDB's scan still declares one placeholder
+    /// column, and the scan itself reads nothing for it. An operator above
+    /// that passes its input's columns through, such as an unnest, is bound
+    /// to positions that count the placeholder, so the batch has to hold a
+    /// column there. The NULLs are one shared array per worker, sliced to
+    /// each batch's length.
+    fn add_placeholder_columns(&self, scan: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {
+        let placeholder_types: Vec<Option<DataType>> = self
+            .columns
+            .iter()
+            .map(|column| match column {
+                Expression::Ref(r) if r.column_idx == usize::MAX => {
+                    Some(physical_arrow_type(&r.return_type))
+                }
+                _ => None,
+            })
+            .collect();
+        if placeholder_types.iter().all(Option::is_none) {
+            return scan;
         }
+        let placeholder_types = Arc::new(placeholder_types);
+        scan.project(move || {
+            let placeholder_types = placeholder_types.clone();
+            let mut shared_nulls: Vec<Option<ArrayRef>> = placeholder_types
+                .iter()
+                .map(|placeholder_type| {
+                    placeholder_type
+                        .as_ref()
+                        .map(|arrow_type| new_null_array(arrow_type, RECORD_BATCH_SIZE))
+                })
+                .collect();
+            move |batch: RecordBatch| {
+                let row_count = batch.num_rows();
+                let schema = batch.schema();
+                let mut scanned_fields = schema.fields().iter().cloned();
+                let mut scanned_columns = batch.columns().iter().cloned();
+                let mut fields: Vec<FieldRef> = Vec::with_capacity(shared_nulls.len());
+                let mut columns: Vec<ArrayRef> = Vec::with_capacity(shared_nulls.len());
+                for nulls in &mut shared_nulls {
+                    match nulls {
+                        Some(nulls) => {
+                            if nulls.len() < row_count {
+                                *nulls = new_null_array(nulls.data_type(), row_count);
+                            }
+                            fields.push(Arc::new(Field::new(
+                                "placeholder",
+                                nulls.data_type().clone(),
+                                true,
+                            )));
+                            columns.push(nulls.slice(0, row_count));
+                        }
+                        None => {
+                            fields.push(
+                                scanned_fields.next().expect(
+                                    "the scan emits every column that is not a placeholder",
+                                ),
+                            );
+                            columns.push(
+                                scanned_columns.next().expect(
+                                    "the scan emits every column that is not a placeholder",
+                                ),
+                            );
+                        }
+                    }
+                }
+                // Whatever the scan appends after the requested columns, such
+                // as row-group metadata, stays at the end.
+                fields.extend(scanned_fields);
+                columns.extend(scanned_columns);
+                Ok(RecordBatch::try_new(
+                    Arc::new(Schema::new(fields)),
+                    columns,
+                )?)
+            }
+        })
     }
 
     /// Chain each key-bitset filter directly above the scan: a row whose key

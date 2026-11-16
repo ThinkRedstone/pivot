@@ -2,12 +2,17 @@
 //!
 //! The operator (DuckDB's single-row input under e.g. `SELECT 1`,
 //! `SELECT drop_cache()`) compiles to the [`Nullary`] source below, which emits
-//! exactly one empty (zero-column) row on a single worker so the projection
-//! above it evaluates its expressions once and produces one output row.
+//! exactly one row on a single worker so the projection above it evaluates
+//! its expressions once and produces one output row.
+//!
+//! The row has one placeholder column, a NULL integer, because DuckDB's dummy
+//! scan declares one. An operator above that passes its input's columns
+//! through (an unnest) is bound against that layout, so the columns it adds
+//! start at position 1.
 
 use crate::compile::Error;
-use arrow_array::{RecordBatch, RecordBatchOptions};
-use arrow_schema::Schema;
+use arrow_array::{Int32Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use dispatch::{Built, BuiltNullary};
 use dispatch::{
     DataFlowDispatcher, Nullary, NullaryFactory, NullaryResult, RecordBatchOperatorSpec, Sender,
@@ -74,12 +79,12 @@ impl Nullary<RecordBatch> for DummyScanDispatchOperator {
         _io: &mut dispatch::OperatorIO,
     ) -> NullaryResult<WorkStatus> {
         if !self.emitted.swap(true, Ordering::Relaxed) {
-            let batch = RecordBatch::try_new_with_options(
-                Arc::new(Schema::empty()),
-                vec![],
-                &RecordBatchOptions::new().with_row_count(Some(1)),
+            let placeholder_field = Field::new("placeholder", DataType::Int32, true);
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![placeholder_field])),
+                vec![Arc::new(Int32Array::new_null(1))],
             )
-            .expect("empty single-row batch is always well-formed");
+            .expect("a single NULL integer row is always well-formed");
             sender.send(batch)?;
             Ok(WorkStatus::Ran)
         } else {

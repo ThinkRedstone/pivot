@@ -6,4 +6,5 @@ mod delim;
 mod expressions;
 mod joins;
 mod operators;
+mod unnest;
 mod variant;

@@ -1175,3 +1175,58 @@ fn computed_group_key_with_computed_aggregate_argument(mut testing_planner: Test
     let high = rows.iter().find(|r| r["bucket"] == 0).unwrap();
     assert_eq!(high["s"], 410);
 }
+
+#[rstest]
+fn struct_field_read_by_name(mut testing_planner: TestingPlanner) {
+    let rows = run(
+        &mut testing_planner,
+        "SELECT pair.label AS label, pair.amount AS amount \
+         FROM (SELECT {'label': name, 'amount': b} AS pair FROM example_table WHERE a = 2)",
+    );
+
+    assert_eq!(
+        rows,
+        vec![serde_json::json!({"label": "bob", "amount": 20})]
+    );
+}
+
+#[rstest]
+fn tuple_field_read_by_position(mut testing_planner: TestingPlanner) {
+    let rows = run(
+        &mut testing_planner,
+        "SELECT pair[1] AS label, pair[2] AS amount \
+         FROM (SELECT (name, b) AS pair FROM example_table WHERE a = 2)",
+    );
+
+    assert_eq!(
+        rows,
+        vec![serde_json::json!({"label": "bob", "amount": 20})]
+    );
+}
+
+#[rstest]
+#[case::comparison(
+    "SELECT a FROM example_table WHERE {'a': a} = {'a': 2}",
+    "A comparison is not supported on a struct"
+)]
+#[case::in_list(
+    "SELECT a FROM example_table WHERE {'a': a} IN ({'a': 2}, {'a': 3})",
+    "IN is not supported on a struct"
+)]
+#[case::cast_to_text(
+    "SELECT CAST({'a': a} AS VARCHAR) FROM example_table",
+    "A cast to another type is not supported on a struct"
+)]
+#[case::returned_to_the_client(
+    "SELECT {'a': a} AS pair FROM example_table",
+    "A query cannot return a struct"
+)]
+fn whole_struct_operations_are_rejected_when_planning(
+    mut testing_planner: TestingPlanner,
+    #[case] sql: &str,
+    #[case] expected_message: &str,
+) {
+    let error = testing_planner.plan(sql).unwrap_err();
+
+    assert!(error.to_string().contains(expected_message), "{error}");
+}

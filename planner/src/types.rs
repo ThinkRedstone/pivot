@@ -17,7 +17,7 @@
 use arrow_array::{
     ArrayRef, BooleanArray, Decimal64Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, IntervalMonthDayNanoArray, Scalar, StringViewArray,
-    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    StructArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_buffer::IntervalMonthDayNano;
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
@@ -100,6 +100,21 @@ pub enum Type {
     /// as its native `VARIANT` type: `d.age`, `d->'age'`, and casts all bind
     /// natively. The executor sees the Arrow struct of leaves the file stores.
     Variant,
+    /// DuckDB `STRUCT`: a fixed set of fields, each with its own type, such
+    /// as the `(name, value)` tuples of an unnested list. A struct exists
+    /// only inside a query: an expression builds one and reads its fields,
+    /// but no table stores one and no result returns one. The executor
+    /// carries it as an arrow struct column with one child column per field.
+    Struct(Vec<StructField>),
+}
+
+/// One field of a [`Type::Struct`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StructField {
+    /// Empty for a field of an unnamed struct, such as a `(a, b)` tuple, whose
+    /// fields are read by position.
+    pub name: String,
+    pub field_type: Type,
 }
 
 impl fmt::Display for Type {
@@ -126,6 +141,13 @@ impl fmt::Display for Type {
             Type::TimestampTz => "TimestampTz",
             Type::Interval => "Interval",
             Type::Variant => "Variant",
+            Type::Struct(fields) => {
+                let fields: Vec<String> = fields
+                    .iter()
+                    .map(|field| format!("{}:{}", field.name, field.field_type))
+                    .collect();
+                return write!(f, "Struct({})", fields.join(", "));
+            }
         };
         f.write_str(name)
     }
@@ -136,7 +158,7 @@ pub enum Error {
     #[error("Unsupported logical type: {0}")]
     UnsupportedLogicalType(LogicalTypeId),
     #[error("Unsupported scalar constant: {0}")]
-    UnsupportedScalarConstant(ScalarValue),
+    UnsupportedScalarConstant(Box<ScalarValue>),
     #[error("Unsupported decimal width/scale: DECIMAL({width},{scale})")]
     UnsupportedDecimal { width: u8, scale: u8 },
     #[error("{0}")]
@@ -210,6 +232,17 @@ pub fn type_from_logical(bound: BoundLogicalType) -> Result<Type, Error> {
         (LogicalTypeId::TIMESTAMP_TZ, ExtraTypeInfo::None) => Ok(Type::TimestampTz),
         (LogicalTypeId::INTERVAL, ExtraTypeInfo::None) => Ok(Type::Interval),
         (LogicalTypeId::VARIANT, ExtraTypeInfo::None) => Ok(Type::Variant),
+        (LogicalTypeId::STRUCT, ExtraTypeInfo::Struct(fields)) => Ok(Type::Struct(
+            fields
+                .into_iter()
+                .map(|(name, field_type)| {
+                    Ok(StructField {
+                        name,
+                        field_type: type_from_logical(field_type)?,
+                    })
+                })
+                .collect::<Result<_, Error>>()?,
+        )),
         _ => Err(Error::UnsupportedLogicalType(bound.id.clone())),
     }
 }
@@ -243,6 +276,15 @@ pub fn logical_from_type(pivot_type: &Type) -> BoundLogicalType {
         Type::TimestampTz => BoundLogicalType::plain(LogicalTypeId::TIMESTAMP_TZ),
         Type::Interval => BoundLogicalType::plain(LogicalTypeId::INTERVAL),
         Type::Variant => BoundLogicalType::plain(LogicalTypeId::VARIANT),
+        Type::Struct(fields) => BoundLogicalType {
+            id: LogicalTypeId::STRUCT,
+            extra: ExtraTypeInfo::Struct(
+                fields
+                    .iter()
+                    .map(|field| (field.name.clone(), logical_from_type(&field.field_type)))
+                    .collect(),
+            ),
+        },
     }
 }
 
@@ -271,6 +313,13 @@ pub fn sql_type_name(pivot_type: &Type) -> String {
         Type::TimestampTz => "TIMESTAMP WITH TIME ZONE",
         Type::Interval => "INTERVAL",
         Type::Variant => "VARIANT",
+        Type::Struct(fields) => {
+            let fields: Vec<String> = fields
+                .iter()
+                .map(|field| format!("{} {}", field.name, sql_type_name(&field.field_type)))
+                .collect();
+            return format!("STRUCT({})", fields.join(", "));
+        }
     };
     name.to_string()
 }
@@ -311,6 +360,18 @@ pub fn physical_arrow_type(pivot_type: &Type) -> DataType {
         Type::TimestampTz => DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIMEZONE.into())),
         Type::Interval => DataType::Interval(IntervalUnit::MonthDayNano),
         Type::Variant => variant_struct_type(),
+        Type::Struct(fields) => DataType::Struct(
+            fields
+                .iter()
+                .map(|field| {
+                    arrow_schema::Field::new(
+                        field.name.clone(),
+                        physical_arrow_type(&field.field_type),
+                        true,
+                    )
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -346,6 +407,17 @@ pub fn type_from_physical(data_type: &DataType) -> Option<Type> {
         }
         DataType::Interval(IntervalUnit::MonthDayNano) => Some(Type::Interval),
         other if *other == variant_struct_type() => Some(Type::Variant),
+        DataType::Struct(fields) => Some(Type::Struct(
+            fields
+                .iter()
+                .map(|field| {
+                    Some(StructField {
+                        name: field.name().clone(),
+                        field_type: type_from_physical(field.data_type())?,
+                    })
+                })
+                .collect::<Option<_>>()?,
+        )),
         _ => None,
     }
 }
@@ -509,14 +581,13 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
             days,
             micros,
         } => {
-            let nanoseconds =
-                micros
-                    .checked_mul(NANOS_PER_MICRO)
-                    .ok_or(Error::UnsupportedScalarConstant(ScalarValue::Interval {
-                        months,
-                        days,
-                        micros,
-                    }))?;
+            let nanoseconds = micros.checked_mul(NANOS_PER_MICRO).ok_or_else(|| {
+                Error::UnsupportedScalarConstant(Box::new(ScalarValue::Interval {
+                    months,
+                    days,
+                    micros,
+                }))
+            })?;
             Arc::new(
                 IntervalMonthDayNanoArray::new_scalar(IntervalMonthDayNano {
                     months,
@@ -526,6 +597,28 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
                 .into_inner(),
             )
         }
+        // A struct constant is a one-row struct column whose child columns are
+        // the field constants. Each field is declared nullable, matching
+        // `physical_arrow_type`, so a constant struct and a computed one of
+        // the same type have the same arrow type.
+        ScalarValue::Struct(fields) => {
+            let (arrow_fields, field_columns): (Vec<_>, Vec<_>) = fields
+                .into_iter()
+                .map(|(name, value)| {
+                    let field_column = build_scalar_value(value)?.into_inner();
+                    let arrow_field =
+                        arrow_schema::Field::new(name, field_column.data_type().clone(), true);
+                    Ok((Arc::new(arrow_field), field_column))
+                })
+                .collect::<Result<Vec<_>, Error>>()?
+                .into_iter()
+                .unzip();
+            Arc::new(StructArray::try_new(
+                arrow_schema::Fields::from(arrow_fields),
+                field_columns,
+                None,
+            )?)
+        }
         // A NULL constant carries the type the binder gave it, so it becomes a
         // one-element null array of that type's physical shape. An untyped NULL
         // (DuckDB's `SQLNULL`, what a bare `NULL` binds to outside a typed
@@ -534,7 +627,7 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
             arrow_array::new_null_array(&physical_arrow_type(&type_from_logical(logical_type)?), 1)
         }
         // Types the bridge doesn't decode arrive as `Other`.
-        other => return Err(Error::UnsupportedScalarConstant(other)),
+        other => return Err(Error::UnsupportedScalarConstant(Box::new(other))),
     };
 
     Ok(Scalar::new(array))
@@ -574,6 +667,16 @@ mod tests {
             Type::TimestampTz,
             Type::Interval,
             Type::Variant,
+            Type::Struct(vec![
+                StructField {
+                    name: "label".to_string(),
+                    field_type: Type::Utf8,
+                },
+                StructField {
+                    name: "amount".to_string(),
+                    field_type: Type::Int64,
+                },
+            ]),
         ]
     }
 

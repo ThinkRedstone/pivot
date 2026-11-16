@@ -54,7 +54,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use arrow_array::ArrowNativeTypeOp;
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::DataType;
 
 use crate::api::operator_spec::{OperatorFactory, OperatorSpec};
@@ -68,7 +68,7 @@ use crate::operations::{
     JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory, MapFactory,
     NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByFactory,
     OrderByLimitFactory, PackedKey, RangeJoinSpec, SingleColumnKey, UnaryFactory,
-    UnaryOperatorFactory, WideCell, copy_out, create_join_factories,
+    UnaryOperatorFactory, UnnestFactory, WideCell, copy_out, create_join_factories,
     create_normalizing_join_factories, create_normalizing_order_by_factories,
     create_range_join_factories,
 };
@@ -713,6 +713,28 @@ impl RecordBatchOperatorSpec {
             offset,
             worker_count,
         ))
+    }
+
+    /// Unnest lists with a fixed number of elements: repeat every input row
+    /// once per list element, adding one column per list after the input's
+    /// columns.
+    ///
+    /// `element_count` is the length of the longest list. The inner closure is
+    /// called with an input batch and an element position below
+    /// `element_count`, and returns one column per list holding that element
+    /// for every row of the batch; a list shorter than `element_count` gives a
+    /// NULL column past its end. With `element_count` zero, no rows come out.
+    /// The output rows of one input row are not adjacent.
+    ///
+    /// Same two-level closure pattern as [`filter`](Self::filter): the outer
+    /// builder closure is called once per worker.
+    pub fn unnest<F, FB>(self, element_count: usize, builder: FB) -> Self
+    where
+        F: FnMut(&RecordBatch, usize) -> crate::UnaryResult<Vec<ArrayRef>> + Send + 'static,
+        FB: Fn() -> F,
+    {
+        let worker_count = self.worker_count();
+        self.unary((0..worker_count).map(|_| UnnestFactory::new(builder(), element_count)))
     }
 
     /// Global `COUNT(DISTINCT x)`: GROUP BY `key_cols` with no aggregate, emitting

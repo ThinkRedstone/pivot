@@ -4,7 +4,7 @@
 use super::{
     Arithmetic, Concat, Contains, DatePart, DateTrunc, Divide, FormatBytes, IntervalArithmetic,
     Length, Like, NormalizedInterval, Prefix, RegexpFullMatch, RegexpJitReplace, RegexpReplace,
-    Substring, Suffix, TemporalConvert, TimeBucket, VariantGet,
+    StructExtract, StructPack, Substring, Suffix, TemporalConvert, TimeBucket, VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
@@ -100,6 +100,10 @@ pub enum Function {
     /// A variant (JSON) path read: `doc->'key'` chains, optionally typed by a
     /// fused `CAST`.
     VariantGet(VariantGet),
+    /// A struct built from its field values, such as `(name, n)`.
+    StructPack(StructPack),
+    /// One field of a struct, such as `pair.label` or `pair[1]`.
+    StructExtract(StructExtract),
 }
 
 impl Function {
@@ -148,6 +152,8 @@ impl Function {
             Function::NormalizedInterval(n) => visit(&n.input),
             Function::DropCache => {}
             Function::VariantGet(v) => visit(&v.input),
+            Function::StructPack(s) => s.fields.iter().for_each(visit),
+            Function::StructExtract(s) => visit(&s.input),
         }
     }
 
@@ -195,6 +201,8 @@ impl Function {
             Function::NormalizedInterval(n) => visit(&mut n.input),
             Function::DropCache => {}
             Function::VariantGet(v) => visit(&mut v.input),
+            Function::StructPack(s) => s.fields.iter_mut().for_each(visit),
+            Function::StructExtract(s) => visit(&mut s.input),
         }
     }
 }
@@ -223,6 +231,8 @@ impl Display for Function {
             Function::NormalizedInterval(n) => write!(f, "{n}"),
             Function::DropCache => write!(f, "drop_cache()"),
             Function::VariantGet(v) => write!(f, "{v}"),
+            Function::StructPack(s) => write!(f, "{s}"),
+            Function::StructExtract(s) => write!(f, "{s}"),
         }
     }
 }
@@ -240,6 +250,10 @@ impl Function {
         match self {
             // A path that a document does not have reads as NULL.
             Function::VariantGet(_) => true,
+            // Building a struct always yields a struct, whatever its fields
+            // hold.
+            Function::StructPack(_) => false,
+            Function::StructExtract(s) => s.nullability(input),
             _ => {
                 let mut any_argument_nullable = false;
                 self.for_each_argument(&mut |argument| {
@@ -286,6 +300,9 @@ impl Function {
             // A variant path read yields its cast's type (the sub-variant when
             // bare); a JSON-text render always yields a string.
             Function::VariantGet(v) => v.result_type(),
+            // A struct and a field read carry DuckDB's bound result type.
+            Function::StructPack(s) => s.return_type.clone(),
+            Function::StructExtract(s) => s.return_type.clone(),
             // `drop_cache()` returns the evicted-entry count.
             Function::DropCache => Type::Int64,
         }
@@ -313,6 +330,8 @@ impl Function {
             Function::TemporalConvert(c) => c.compile(),
             Function::NormalizedInterval(n) => n.compile(),
             Function::VariantGet(v) => v.compile(),
+            Function::StructPack(s) => s.compile(),
+            Function::StructExtract(s) => s.compile(),
             // `drop_cache()` evicts every in-memory cache *and* the on-disk cache
             // (so remote reads go cold to the network) as a side effect, then
             // returns the total entries dropped. Evaluated over the single

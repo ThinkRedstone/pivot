@@ -866,3 +866,17 @@ fn bare_extraction_under_late_materialization(mut testing_planner: TestingPlanne
     let got: Vec<Option<&str>> = rows.iter().map(|r| r["a"].as_str()).collect();
     assert_eq!(got, vec![Some("25"), Some("40")]);
 }
+
+#[rstest]
+fn struct_with_a_variant_field_is_rejected_when_planning(mut testing_planner: TestingPlanner) {
+    docs_table(&mut testing_planner, vec![r#"{"age": 1}"#]);
+
+    let error = testing_planner
+        .plan("SELECT pair.doc FROM (SELECT {'doc': d} AS pair FROM docs)")
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("a struct with a VARIANT field"),
+        "{error}"
+    );
+}

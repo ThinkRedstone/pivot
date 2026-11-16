@@ -10,16 +10,18 @@ use std::any::Any;
 use arrow_array::{Scalar, new_null_array};
 use dispatch::RowDelivery;
 use duckdb_planner::DuckDBTable;
+use duckdb_planner::ScalarValue;
 use duckdb_planner::catalog_provider::OptionalTableWrapper;
 use duckdb_planner::duckdb_bridge::duckdb_types::{LimitNodeType, OrderByNullType};
 use duckdb_planner::handle::{
     Aggregate as AggregateView, BridgeError, ChunkGet as ChunkGetView, Compact as CompactView,
     CopyFromStdin as CopyFromStdinView, CreateSchema as CreateSchemaView,
     CreateTable as CreateTableView, CreateUser as CreateUserView, Distinct as DistinctView,
-    Drop as DropView, Filter as FilterView, Insert as InsertView, Limit as LimitView,
-    OrderBy as OrderByView, OrderKey, Projection as ProjectionView, Reset as ResetView,
-    Set as SetView, TableFunctionScan as TableFunctionScanView, TableScan as TableScanView,
-    TopN as TopNView, Values as ValuesView,
+    Drop as DropView, Expression as DuckExpression, Filter as FilterView, Insert as InsertView,
+    Limit as LimitView, OrderBy as OrderByView, OrderKey, Projection as ProjectionView,
+    Reset as ResetView, Set as SetView, TableFunctionScan as TableFunctionScanView,
+    TableScan as TableScanView, TopN as TopNView, Unnest as UnnestView,
+    UnnestedList as UnnestedListView, Values as ValuesView,
 };
 
 use super::{BuildCtx, build_scan_columns};
@@ -32,9 +34,9 @@ use crate::expression::{Error as ExpressionError, Expression, Ref};
 use crate::operator::{
     Aggregate, Compact, CopyFormat, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Distinct,
     DropTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy, OrderByNode,
-    Projection, SetVariable, TableFunctionScan, TopN, Values,
+    Projection, SetVariable, TableFunctionScan, TopN, Unnest, UnnestedList, Values,
 };
-use crate::types::{build_scalar_value, physical_arrow_type, type_from_logical};
+use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
 impl Projection {
     pub(crate) fn from_handle(view: ProjectionView<'_>) -> Result<Projection, OperatorError> {
@@ -234,6 +236,59 @@ impl Distinct {
         }
         Ok(Distinct { keys })
     }
+}
+
+impl Unnest {
+    pub(crate) fn from_handle(view: UnnestView<'_>) -> Result<Unnest, OperatorError> {
+        Ok(Unnest {
+            lists: view
+                .lists()?
+                .into_iter()
+                .map(build_unnested_list)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+/// Read one unnested list as an expression per element. The list has to be
+/// written out in the query, which reaches here in one of two shapes: a
+/// `list_value(...)` call with one argument per element, or, when every
+/// element is a constant, the single list constant DuckDB folds that call into.
+fn build_unnested_list(unnested: UnnestedListView<'_>) -> Result<UnnestedList, OperatorError> {
+    let element_type = type_from_logical(unnested.element_type)?;
+    // A variant column is told apart from a plain struct by a tag on its
+    // field, which the unnest's output schema does not carry.
+    if element_type == Type::Variant {
+        return Err(OperatorError::Unsupported(
+            "UNNEST of a list of VARIANT values is not supported".to_string(),
+        ));
+    }
+    let elements = match unnested.list.expression()? {
+        DuckExpression::Constant(list) => match list.value()? {
+            // A NULL list unnests to no rows, the same as an empty one.
+            ScalarValue::Null(_) => Vec::new(),
+            _ => list
+                .list_elements()?
+                .into_iter()
+                .map(|element| Ok(Expression::Constant(build_scalar_value(element)?)))
+                .collect::<Result<Vec<_>, OperatorError>>()?,
+        },
+        DuckExpression::Function(list) if list.name()? == "list_value" => list
+            .children()?
+            .into_iter()
+            .map(|element| Ok(Expression::from_handle(element)?))
+            .collect::<Result<Vec<_>, OperatorError>>()?,
+        _ => {
+            return Err(OperatorError::Unsupported(
+                "UNNEST is only supported over a list written out in the query, such as [a, b]"
+                    .to_string(),
+            ));
+        }
+    };
+    Ok(UnnestedList {
+        element_type,
+        elements,
+    })
 }
 
 impl OrderBy {

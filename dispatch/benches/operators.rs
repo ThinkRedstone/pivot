@@ -1,5 +1,5 @@
 //! Microbenchmarks for individual dispatch operators (GROUP BY, filter/contains,
-//! ORDER BY ... LIMIT) driven in **complete isolation** — no Parquet, no IO, no
+//! ORDER BY ... LIMIT, unnest) driven in **complete isolation** — no Parquet, no IO, no
 //! catalog. Pre-built Arrow `RecordBatch`es are streamed straight into one
 //! operator through `values_input`, exactly as a table scan would fan morsels
 //! across the worker pool, and the result is drained with `.collect()`.
@@ -69,11 +69,13 @@
 use std::sync::Arc;
 
 use arrow_array::builder::StringViewBuilder;
+use arrow_array::cast::AsArray;
 use arrow_array::types::{Int16Type, Int32Type, Int64Type};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array, RecordBatch, StringViewArray,
+    Array, ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array, RecordBatch,
+    StringViewArray, StructArray, UInt32Array,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema};
 use criterion::{BatchSize, Criterion, Throughput, black_box};
 
 use dispatch::memory::SlabAllocator;
@@ -1162,6 +1164,226 @@ fn bench_aggregate(c: &mut Criterion, d: &DataFlowDispatcher) {
 }
 
 // ---------------------------------------------------------------------------
+// Unnest scenarios
+// ---------------------------------------------------------------------------
+
+/// `constant` (a one-row array) repeated for `row_count` rows, the way a
+/// constant list element is materialized for a batch.
+fn repeat_constant(constant: &ArrayRef, row_count: usize) -> ArrayRef {
+    let positions = UInt32Array::from_value(0, row_count);
+    arrow::compute::take(constant.as_ref(), &positions, None).unwrap()
+}
+
+/// A one-row string array holding `value`.
+fn string_constant(value: &str) -> ArrayRef {
+    Arc::new(StringViewArray::from(vec![value]))
+}
+
+/// `(label, name)` tuples as a struct column: `label` repeated for every row
+/// beside the batch's `name_column`.
+fn label_name_tuples(label: &ArrayRef, name_column: &ArrayRef) -> ArrayRef {
+    let fields = Fields::from(vec![
+        Field::new("label", DataType::Utf8View, true),
+        Field::new("name", DataType::Utf8View, true),
+    ]);
+    let labels = repeat_constant(label, name_column.len());
+    Arc::new(StructArray::try_new(fields, vec![labels, name_column.clone()], None).unwrap())
+}
+
+/// `name <> '' OR label = kept_label` over two string columns.
+fn keep_nonempty_or_label(
+    batch: &RecordBatch,
+    label_col: usize,
+    name_col: usize,
+    kept_label: &str,
+    indices: &mut Vec<u32>,
+) -> dispatch::UnaryResult<RowSelection> {
+    let labels = batch
+        .column(label_col)
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .unwrap();
+    let names = batch
+        .column(name_col)
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .unwrap();
+    let mask: BooleanArray = names
+        .views()
+        .iter()
+        .enumerate()
+        .map(|(row, &name_view)| Some((name_view as u32) != 0 || labels.value(row) == kept_label))
+        .collect();
+    collect_selected_indices(&mask, indices);
+    Ok(RowSelection::Indices)
+}
+
+fn count_rows(spec: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {
+    spec.aggregate::<i64>(vec![AggregationSlot::new(
+        AggregationKind::CountStar,
+        0,
+        DataType::Int64,
+    )])
+}
+
+fn bench_unnest(c: &mut Criterion, d: &DataFlowDispatcher) {
+    let rows = total_rows();
+
+    // (a) Two integer columns turned into one: each element is an existing
+    //     column of the batch, so nothing is computed per element. This is the
+    //     operator's own cost: emitting every input batch twice with one more
+    //     column.
+    bench(
+        c,
+        d,
+        "unnest/two_int_columns",
+        rows,
+        || {
+            let sch = schema(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("width", DataType::Int64, false),
+                Field::new("height", DataType::Int64, false),
+            ]);
+            let mut rng = Rng::new(40);
+            batch_sizes(rows)
+                .map(|n| {
+                    batch(
+                        &sch,
+                        vec![
+                            i64_keys(&mut rng, n, rows),
+                            i64_keys(&mut rng, n, 1_000),
+                            i64_keys(&mut rng, n, 1_000),
+                        ],
+                    )
+                })
+                .collect()
+        },
+        |s| {
+            count_rows(s.unnest(2, || {
+                |b: &RecordBatch, element_idx: usize| Ok(vec![b.column(1 + element_idx).clone()])
+            }))
+        },
+    );
+
+    // (b) A list of eight string constants: every element is a constant
+    //     written out for each row of each batch, and one input batch becomes
+    //     eight output batches.
+    bench(
+        c,
+        d,
+        "unnest/eight_string_constants",
+        rows,
+        || {
+            let sch = schema(vec![Field::new("id", DataType::Int64, false)]);
+            let mut rng = Rng::new(41);
+            batch_sizes(rows)
+                .map(|n| batch(&sch, vec![i64_keys(&mut rng, n, rows)]))
+                .collect()
+        },
+        |s| {
+            count_rows(s.unnest(8, || {
+                let labels: Vec<ArrayRef> = (0..8)
+                    .map(|label_idx| string_constant(&format!("label_{label_idx}")))
+                    .collect();
+                move |b: &RecordBatch, element_idx: usize| {
+                    Ok(vec![repeat_constant(&labels[element_idx], b.num_rows())])
+                }
+            }))
+        },
+    );
+
+    // (c) Turn the columns of pre-grouped rows into (label, name) tuples, then
+    //     filter and regroup on the tuple's fields. The input is two
+    //     low-cardinality string columns, one of them mostly blank, and a
+    //     count. Each row becomes one tuple per string column; a tuple is kept
+    //     when its name is not blank or its label is the first column's; the
+    //     counts are summed per (label, name). Models
+    //     `SELECT pair.label, pair.name, sum(row_count) FROM (SELECT
+    //     unnest([{label: 'first', name: first}, {label: 'second', name:
+    //     second}]) AS pair, row_count ...) WHERE pair.name <> '' OR
+    //     pair.label = 'first' GROUP BY 1, 2`.
+    {
+        let slots = vec![AggregationSlot::new(
+            AggregationKind::Sum,
+            2,
+            DataType::Decimal128(38, 0),
+        )];
+        bench(
+            c,
+            d,
+            "unnest/tuples_filter_group",
+            rows,
+            || {
+                let sch = schema(vec![
+                    Field::new("first", DataType::Utf8View, false),
+                    Field::new("second", DataType::Utf8View, false),
+                    Field::new("row_count", DataType::Int64, false),
+                ]);
+                let first_block = dict_block(&string_dict(2_000, "cluster-", 16));
+                let second_block = dict_block(&string_dict(500, "status ", 12));
+                let mut rng = Rng::new(42);
+                batch_sizes(rows)
+                    .map(|n| {
+                        batch(
+                            &sch,
+                            vec![
+                                string_col(&mut rng, n, &first_block),
+                                sparse_string_col(&mut rng, n, &second_block, 0.7),
+                                i64_keys(&mut rng, n, 100),
+                            ],
+                        )
+                    })
+                    .collect()
+            },
+            move |s| {
+                s.unnest(2, || {
+                    let labels = [string_constant("first"), string_constant("second")];
+                    move |b: &RecordBatch, element_idx: usize| {
+                        Ok(vec![label_name_tuples(
+                            &labels[element_idx],
+                            b.column(element_idx),
+                        )])
+                    }
+                })
+                // Read the tuple's two fields and keep the count beside them.
+                .project(|| {
+                    let sch = schema(vec![
+                        Field::new("label", DataType::Utf8View, true),
+                        Field::new("name", DataType::Utf8View, true),
+                        Field::new("row_count", DataType::Int64, false),
+                    ]);
+                    move |b: RecordBatch| {
+                        let tuples = b.column(3).as_struct();
+                        Ok(RecordBatch::try_new(
+                            sch.clone(),
+                            vec![
+                                tuples.column(0).clone(),
+                                tuples.column(1).clone(),
+                                b.column(2).clone(),
+                            ],
+                        )?)
+                    }
+                })
+                .filter(|| {
+                    move |b: &RecordBatch, _: &mut SlabAllocator, scratch: &mut SelectionScratch| {
+                        keep_nonempty_or_label(b, 0, 1, "first", &mut scratch.positions)
+                    }
+                })
+                .group_by_aggregate::<RowKeyExtractor, Dynamic<i64, true>>(
+                    vec![0, 1],
+                    slots.clone(),
+                    None,
+                    RowKeySchema::new(
+                        vec![DataType::Utf8View, DataType::Utf8View],
+                        vec![true, true],
+                    ),
+                )
+            },
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Harness: one shared Dispatch (worker pool) for every scenario.
 // ---------------------------------------------------------------------------
 
@@ -1181,6 +1403,7 @@ fn main() {
     bench_filter(&mut c, &dispatcher);
     bench_order_by(&mut c, &dispatcher);
     bench_aggregate(&mut c, &dispatcher);
+    bench_unnest(&mut c, &dispatcher);
     c.final_summary();
 
     dispatch.exit();

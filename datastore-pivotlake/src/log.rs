@@ -1358,12 +1358,15 @@ fn delta_type(column: &str, data_type: &Type) -> Result<DeltaDataType, Error> {
         // though the SQL dialects over Delta do have an INTERVAL expression
         // type. Nothing is lost, as an interval only ever arises here as a
         // computed result (a timestamp difference), never as a stored column.
+        //
+        // A struct exists only inside a query, so no table declares one.
         Type::Interval
         | Type::Int128
         | Type::UInt8
         | Type::UInt16
         | Type::UInt32
-        | Type::UInt64 => {
+        | Type::UInt64
+        | Type::Struct(_) => {
             return Err(Error::UnsupportedType {
                 column: column.to_string(),
                 data_type: data_type.to_string(),

@@ -5,9 +5,9 @@ use crate::duckdb_bridge::ffi;
 
 /// The payload that completes a parameterized DuckDB type, mirroring
 /// DuckDB's own `ExtraTypeInfo`. Most ids fully describe their type and
-/// carry [`ExtraTypeInfo::None`]; a parameterized id (today only `DECIMAL`)
+/// carry [`ExtraTypeInfo::None`]; a parameterized id (`DECIMAL`, `STRUCT`)
 /// carries its parameters here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtraTypeInfo {
     None,
     /// `DECIMAL(width, scale)`: total digits and fractional digits.
@@ -15,6 +15,10 @@ pub enum ExtraTypeInfo {
         width: u8,
         scale: u8,
     },
+    /// `STRUCT(name type, ...)`: each field's name and type, in field order.
+    /// A field of an unnamed struct, such as a `(a, b)` tuple, has an empty
+    /// name.
+    Struct(Vec<(String, BoundLogicalType)>),
 }
 
 /// A DuckDB logical type as read off a bound plan: the type id plus the
@@ -34,7 +38,8 @@ impl BoundLogicalType {
         }
     }
 
-    /// Decode the flat FFI type struct. CXX cannot pass an enum with a
+    /// Decode the flat FFI type struct, which holds everything about a type
+    /// except the fields of a `STRUCT`. CXX cannot pass an enum with a
     /// payload across the bridge, so the struct carries every parameter
     /// field flat and the id decides which of them are meaningful; this is
     /// the one place that mapping is interpreted.
@@ -54,9 +59,11 @@ impl BoundLogicalType {
     /// consumes, the inverse of `from_bridge`: every parameter field is
     /// written flat, zeroed when the id has none.
     pub fn to_duckdb_column(&self, name: String) -> ffi::DuckDBColumn {
-        let (decimal_width, decimal_scale) = match self.extra {
-            ExtraTypeInfo::Decimal { width, scale } => (width, scale),
-            ExtraTypeInfo::None => (0, 0),
+        let (decimal_width, decimal_scale) = match &self.extra {
+            ExtraTypeInfo::Decimal { width, scale } => (*width, *scale),
+            // The flat descriptor has no room for a struct's fields, and no
+            // table declares a struct column.
+            ExtraTypeInfo::None | ExtraTypeInfo::Struct(_) => (0, 0),
         };
         ffi::DuckDBColumn {
             name,
@@ -113,6 +120,8 @@ pub enum ScalarValue {
     /// string by wrapping the raw text, and hands it back as that same text
     /// under a variant-to-VARCHAR cast, so the consumer parses it as JSON.
     Variant(String),
+    /// A `STRUCT`: each field's name and value, in field order.
+    Struct(Vec<(String, ScalarValue)>),
     /// A NULL, carrying the type the binder resolved for it (an INSERT's NULL
     /// takes the target column's type) so the consumer can build a null of the
     /// right shape. An untyped NULL keeps DuckDB's own `SQLNULL` id.
@@ -151,6 +160,16 @@ impl fmt::Display for ScalarValue {
                 micros,
             } => write!(f, "INTERVAL {months} months {days} days {micros} micros"),
             ScalarValue::Variant(v) => write!(f, "{v}"),
+            ScalarValue::Struct(fields) => {
+                f.write_str("{")?;
+                for (field_idx, (name, value)) in fields.iter().enumerate() {
+                    if field_idx > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{name}: {value}")?;
+                }
+                f.write_str("}")
+            }
             ScalarValue::Null(ty) => write!(f, "NULL as {:?}", ty.id),
             ScalarValue::Other(ty) => write!(f, "{ty:?}"),
         }

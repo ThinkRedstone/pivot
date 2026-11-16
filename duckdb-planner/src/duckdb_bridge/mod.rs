@@ -189,6 +189,9 @@ pub mod ffi {
         /// Opaque; read via the `value_*` accessors after `value_type`
         /// and `value_is_null`.
         type Value;
+        /// A DuckDB `LogicalType`. Opaque; read via `logical_type_flat` and,
+        /// for a `STRUCT`, the `logical_type_struct_field_*` accessors.
+        type LogicalType;
 
         fn new_context(catalog: Box<CatalogContext>) -> Result<UniquePtr<DuckPlannerContext>>;
         /// Plan `query` with `transaction` published for its duration: every
@@ -256,7 +259,7 @@ pub mod ffi {
         fn lo_filter_projection_map_index(op: &LogicalOperator, index: usize) -> Result<usize>;
         /// The type of the filter's `index`th output column, paired with
         /// `lo_filter_projection_map_index` for the replay projection.
-        fn lo_filter_type_id(op: &LogicalOperator, index: usize) -> Result<BridgeLogicalType>;
+        fn lo_filter_type_id(op: &LogicalOperator, index: usize) -> Result<&LogicalType>;
 
         // ---- OrderBy ----
         fn lo_orderby_count(op: &LogicalOperator) -> Result<usize>;
@@ -276,6 +279,14 @@ pub mod ffi {
         fn lo_distinct_is_distinct_on(op: &LogicalOperator) -> Result<bool>;
         fn lo_distinct_target_count(op: &LogicalOperator) -> Result<usize>;
         fn lo_distinct_target(op: &LogicalOperator, index: usize) -> Result<&Expression>;
+
+        // ---- Unnest ----
+        /// How many lists the node unnests side by side.
+        fn lo_unnest_list_count(op: &LogicalOperator) -> Result<usize>;
+        /// The list-typed expression being unnested.
+        fn lo_unnest_list(op: &LogicalOperator, index: usize) -> Result<&Expression>;
+        /// The type of one element of that list.
+        fn lo_unnest_element_type(op: &LogicalOperator, index: usize) -> Result<&LogicalType>;
 
         // ---- TopN ----
         fn lo_topn_order_count(op: &LogicalOperator) -> Result<usize>;
@@ -534,7 +545,7 @@ pub mod ffi {
         /// DuckDB `ExpressionType` discriminant.
         fn expr_type(expr: &Expression) -> Result<u8>;
         /// The type of the expression's result.
-        fn expr_return_type(expr: &Expression) -> Result<BridgeLogicalType>;
+        fn expr_return_type(expr: &Expression) -> Result<&LogicalType>;
         fn expr_has_alias(expr: &Expression) -> Result<bool>;
         fn expr_alias(expr: &Expression) -> Result<String>;
 
@@ -560,7 +571,7 @@ pub mod ffi {
         // arguments). Read `value_type` and `value_is_null` first, then the
         // matching accessor: the typed accessors are only valid on a non-NULL
         // value.
-        fn value_type(v: &Value) -> Result<BridgeLogicalType>;
+        fn value_type(v: &Value) -> Result<&LogicalType>;
         fn value_is_null(v: &Value) -> Result<bool>;
         fn value_bool(v: &Value) -> Result<bool>;
         fn value_i8(v: &Value) -> Result<i8>;
@@ -582,6 +593,27 @@ pub mod ffi {
         fn value_interval_months(v: &Value) -> Result<i32>;
         fn value_interval_days(v: &Value) -> Result<i32>;
         fn value_interval_micros(v: &Value) -> Result<i64>;
+        // The elements of a non-NULL LIST value.
+        fn value_list_element_count(v: &Value) -> Result<usize>;
+        fn value_list_element(v: &Value, index: usize) -> Result<&Value>;
+        // One field of a non-NULL STRUCT value, in the order of its type's
+        // fields.
+        fn value_struct_field(v: &Value, index: usize) -> Result<&Value>;
+
+        // ---- LogicalType ----
+        /// The type's id, plus the width and scale of a `DECIMAL`.
+        fn logical_type_flat(logical_type: &LogicalType) -> Result<BridgeLogicalType>;
+        // The fields of a STRUCT type. A field of an unnamed struct, such
+        // as a `(a, b)` tuple, has an empty name.
+        fn logical_type_struct_field_count(logical_type: &LogicalType) -> Result<usize>;
+        fn logical_type_struct_field_name(
+            logical_type: &LogicalType,
+            index: usize,
+        ) -> Result<String>;
+        fn logical_type_struct_field_type(
+            logical_type: &LogicalType,
+            index: usize,
+        ) -> Result<&LogicalType>;
 
         // BoundAggregateExpression
         fn expr_aggregate_name(expr: &Expression) -> Result<String>;

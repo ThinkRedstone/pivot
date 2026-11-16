@@ -29,7 +29,7 @@ use crate::duckdb_bridge::duckdb_types::{
     OrderType, TransactionType,
 };
 use crate::duckdb_bridge::ffi;
-use crate::types::{BoundLogicalType, ScalarValue};
+use crate::types::{BoundLogicalType, ExtraTypeInfo, ScalarValue};
 
 /// A DuckDB C++ exception caught at the FFI boundary while reading plan
 /// objects. Reaching one means a shape assumption in the plan walk was wrong;
@@ -62,6 +62,27 @@ fn bound_type_from(raw: ffi::BridgeLogicalType) -> BoundLogicalType {
     BoundLogicalType::from_bridge(raw)
 }
 
+/// Read a DuckDB type in full, including the fields of a `STRUCT`, which the
+/// flat FFI type struct cannot carry.
+fn bound_type_from_logical_type(raw: &ffi::LogicalType) -> Result<BoundLogicalType> {
+    let flat = bound_type_from(ffi::logical_type_flat(raw)?);
+    if flat.id != LogicalTypeId::STRUCT {
+        return Ok(flat);
+    }
+    let fields = (0..ffi::logical_type_struct_field_count(raw)?)
+        .map(|i| {
+            Ok((
+                ffi::logical_type_struct_field_name(raw, i)?,
+                bound_type_from_logical_type(ffi::logical_type_struct_field_type(raw, i)?)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(BoundLogicalType {
+        id: LogicalTypeId::STRUCT,
+        extra: ExtraTypeInfo::Struct(fields),
+    })
+}
+
 /// Decode a DuckDB [`Value`](ffi::Value) into a typed [`ScalarValue`]: read its
 /// type, then the matching typed accessor. Shared by query constants and
 /// table-function arguments. A type the bridge doesn't decode lands in
@@ -71,7 +92,7 @@ fn bound_type_from(raw: ffi::BridgeLogicalType) -> BoundLogicalType {
 /// payload, and the typed accessors are only defined on a value that has one.
 pub(crate) fn scalar_from_value(v: &ffi::Value) -> Result<ScalarValue> {
     use LogicalTypeId as L;
-    let value_type = bound_type_from(ffi::value_type(v)?);
+    let value_type = bound_type_from_logical_type(ffi::value_type(v)?)?;
     if ffi::value_is_null(v)? {
         return Ok(ScalarValue::Null(value_type));
     }
@@ -104,6 +125,19 @@ pub(crate) fn scalar_from_value(v: &ffi::Value) -> Result<ScalarValue> {
         // variant-to-VARCHAR is a direct string conversion, not a JSON render),
         // so `value_string` recovers the document the variant was built from.
         L::VARIANT => ScalarValue::Variant(ffi::value_string(v)?),
+        L::STRUCT => {
+            let ExtraTypeInfo::Struct(field_types) = value_type.extra else {
+                unreachable!("a STRUCT type is read with its fields")
+            };
+            let fields = field_types
+                .into_iter()
+                .enumerate()
+                .map(|(i, (name, _))| {
+                    Ok((name, scalar_from_value(ffi::value_struct_field(v, i)?)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ScalarValue::Struct(fields)
+        }
         L::DATE => ScalarValue::Date(ffi::value_date(v)?),
         L::TIMESTAMP => ScalarValue::Timestamp(ffi::value_timestamp(v)?),
         L::TIMESTAMP_TZ => ScalarValue::TimestampTz(ffi::value_timestamp_tz(v)?),
@@ -210,6 +244,7 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_FILTER => Operator::Filter(Filter { raw: self.raw }),
             L::LOGICAL_AGGREGATE_AND_GROUP_BY => Operator::Aggregate(Aggregate { raw: self.raw }),
             L::LOGICAL_DISTINCT => Operator::Distinct(Distinct { raw: self.raw }),
+            L::LOGICAL_UNNEST => Operator::Unnest(Unnest { raw: self.raw }),
             L::LOGICAL_ORDER_BY => Operator::OrderBy(OrderBy { raw: self.raw }),
             L::LOGICAL_TOP_N => Operator::TopN(TopN { raw: self.raw }),
             L::LOGICAL_LIMIT => Operator::Limit(Limit { raw: self.raw }),
@@ -261,6 +296,9 @@ pub enum Operator<'plan> {
     Aggregate(Aggregate<'plan>),
     /// A `DISTINCT` over the child's rows.
     Distinct(Distinct<'plan>),
+    /// An `UNNEST` in a select list: each child row repeated once per list
+    /// element.
+    Unnest(Unnest<'plan>),
     OrderBy(OrderBy<'plan>),
     TopN(TopN<'plan>),
     Limit(Limit<'plan>),
@@ -342,6 +380,9 @@ define_handles! { ffi::LogicalOperator;
     Aggregate,
     /// A `LogicalDistinct`: dedup of the child's rows on the distinct targets.
     Distinct,
+    /// A `LogicalUnnest`: the lists whose elements each child row is repeated
+    /// over.
+    Unnest,
     /// A `LogicalOrder`: a list of sort keys.
     OrderBy,
     /// A `LogicalTopN`: ORDER BY + LIMIT, optionally a dynamic-filter producer.
@@ -494,7 +535,7 @@ impl<'plan> Filter<'plan> {
             .map(|i| {
                 Ok((
                     ffi::lo_filter_projection_map_index(self.raw, i)?,
-                    bound_type_from(ffi::lo_filter_type_id(self.raw, i)?),
+                    bound_type_from_logical_type(ffi::lo_filter_type_id(self.raw, i)?)?,
                 ))
             })
             .collect()
@@ -537,6 +578,34 @@ impl<'plan> Distinct<'plan> {
             .map(|i| {
                 Ok(Expr {
                     raw: ffi::lo_distinct_target(self.raw, i)?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// One list an [`Unnest`] node unnests.
+pub struct UnnestedList<'plan> {
+    /// The list-typed expression being unnested.
+    pub list: Expr<'plan>,
+    /// The type of one element, which is the type of the column the node
+    /// adds for this list.
+    pub element_type: BoundLogicalType,
+}
+
+impl<'plan> Unnest<'plan> {
+    /// The lists the node unnests side by side. The node emits its child's
+    /// columns followed by one element column per list, in this order.
+    pub fn lists(self) -> Result<Vec<UnnestedList<'plan>>> {
+        (0..ffi::lo_unnest_list_count(self.raw)?)
+            .map(|i| {
+                Ok(UnnestedList {
+                    list: Expr {
+                        raw: ffi::lo_unnest_list(self.raw, i)?,
+                    },
+                    element_type: bound_type_from_logical_type(ffi::lo_unnest_element_type(
+                        self.raw, i,
+                    )?)?,
                 })
             })
             .collect()
@@ -1181,6 +1250,11 @@ impl<'plan> Expr<'plan> {
         Expr { raw }
     }
 
+    /// The type the expression evaluates to, whatever its kind.
+    pub fn return_type(self) -> Result<BoundLogicalType> {
+        bound_type_from_logical_type(ffi::expr_return_type(self.raw)?)
+    }
+
     /// Dispatch on the expression's [`ExpressionType`] into a typed [`Expression`]
     /// view that exposes only that kind's accessors. Any kind the consumer doesn't
     /// handle is [`Expression::Unsupported`], carrying the raw type.
@@ -1283,7 +1357,7 @@ impl<'plan> Ref<'plan> {
 
     /// The column's logical type.
     pub fn return_type(self) -> Result<BoundLogicalType> {
-        Ok(bound_type_from(ffi::expr_return_type(self.raw)?))
+        bound_type_from_logical_type(ffi::expr_return_type(self.raw)?)
     }
 
     /// The column's source name from DuckDB's binding, or `None`. Display-only.
@@ -1316,7 +1390,7 @@ impl<'plan> Compare<'plan> {
 
     /// The comparison's result type.
     pub fn return_type(self) -> Result<BoundLogicalType> {
-        Ok(bound_type_from(ffi::expr_return_type(self.raw)?))
+        bound_type_from_logical_type(ffi::expr_return_type(self.raw)?)
     }
 }
 
@@ -1354,9 +1428,18 @@ impl<'plan> Constant<'plan> {
         scalar_from_value(ffi::expr_constant(self.raw)?)
     }
 
+    /// The elements of a constant list, in list order. Only valid on a
+    /// non-NULL constant of a `LIST` type.
+    pub fn list_elements(self) -> Result<Vec<ScalarValue>> {
+        let list = ffi::expr_constant(self.raw)?;
+        (0..ffi::value_list_element_count(list)?)
+            .map(|i| scalar_from_value(ffi::value_list_element(list, i)?))
+            .collect()
+    }
+
     /// The constant's logical type, without decoding its value.
     pub fn return_type(self) -> Result<BoundLogicalType> {
-        Ok(bound_type_from(ffi::expr_return_type(self.raw)?))
+        bound_type_from_logical_type(ffi::expr_return_type(self.raw)?)
     }
 }
 
@@ -1386,7 +1469,7 @@ impl<'plan> AggregateFunc<'plan> {
 
     /// DuckDB's declared result type for the call.
     pub fn return_type(self) -> Result<BoundLogicalType> {
-        Ok(bound_type_from(ffi::expr_return_type(self.raw)?))
+        bound_type_from_logical_type(ffi::expr_return_type(self.raw)?)
     }
 }
 
@@ -1407,7 +1490,7 @@ impl<'plan> Function<'plan> {
 
     /// The function's result type.
     pub fn return_type(self) -> Result<BoundLogicalType> {
-        Ok(bound_type_from(ffi::expr_return_type(self.raw)?))
+        bound_type_from_logical_type(ffi::expr_return_type(self.raw)?)
     }
 }
 
@@ -1503,7 +1586,7 @@ impl<'plan> Cast<'plan> {
 
     /// The cast's target type (a `BoundCastExpression`'s own result type).
     pub fn return_type(self) -> Result<BoundLogicalType> {
-        Ok(bound_type_from(ffi::expr_return_type(self.raw)?))
+        bound_type_from_logical_type(ffi::expr_return_type(self.raw)?)
     }
 
     /// Whether this is a `TRY_CAST`, which yields NULL for a value the target

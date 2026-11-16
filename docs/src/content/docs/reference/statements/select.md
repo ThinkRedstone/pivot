@@ -49,6 +49,37 @@ Tables can be qualified as `datastore.schema.table`. An unqualified table
 name uses the default datastore and schema. System tables use two-part names,
 such as `system.tables`.
 
+## Unnesting a list
+
+`unnest` in the select list repeats each input row once per element of a
+list, with the element as an output column. The row order of the result is
+not defined.
+
+```sql
+SELECT unnest([width, height]) AS dimension, name FROM products;
+```
+
+The list must be written out in the query, as `[element, ...]`. Each element
+can be any expression over the row. A list read from a column is not
+supported, and neither is `unnest` in the `FROM` clause.
+
+An element can be a struct, whose fields are then read by name. A query
+cannot return the struct itself, only its fields. This turns several columns
+of a row into one row per column:
+
+```sql
+SELECT pair.label, pair.amount
+FROM (
+  SELECT unnest([{'label': 'width', 'amount': width},
+                 {'label': 'height', 'amount': height}]) AS pair
+  FROM products
+);
+```
+
+With several `unnest` calls in one select list, the lists are stepped through
+together, and a list shorter than the longest one gives `NULL` past its end.
+An empty or `NULL` list produces no rows.
+
 ## Filtering
 
 `WHERE` filters input rows before aggregation.

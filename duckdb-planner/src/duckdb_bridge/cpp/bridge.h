@@ -40,6 +40,7 @@ static void trycatch(Try &&func, Fail &&fail) noexcept try {
 using LogicalOperator = duckdb::LogicalOperator;
 using Expression = duckdb::Expression;
 using Value = duckdb::Value;
+using LogicalType = duckdb::LogicalType;
 
 struct DuckPlannerContext {
 	rust::Box<CatalogContext> catalog;  // owns the CatalogContext; must outlive db
@@ -114,7 +115,7 @@ size_t lo_filter_expr_count(const LogicalOperator &op);
 const Expression &lo_filter_expr(const LogicalOperator &op, size_t index);
 size_t lo_filter_projection_map_count(const LogicalOperator &op);
 size_t lo_filter_projection_map_index(const LogicalOperator &op, size_t index);
-BridgeLogicalType lo_filter_type_id(const LogicalOperator &op, size_t index);
+const LogicalType &lo_filter_type_id(const LogicalOperator &op, size_t index);
 
 // ---- OrderBy ----
 size_t lo_orderby_count(const LogicalOperator &op);
@@ -132,6 +133,11 @@ const Expression &lo_aggregate_expr(const LogicalOperator &op, size_t index);
 bool lo_distinct_is_distinct_on(const LogicalOperator &op);
 size_t lo_distinct_target_count(const LogicalOperator &op);
 const Expression &lo_distinct_target(const LogicalOperator &op, size_t index);
+
+// ---- Unnest ----
+size_t lo_unnest_list_count(const LogicalOperator &op);
+const Expression &lo_unnest_list(const LogicalOperator &op, size_t index);
+const LogicalType &lo_unnest_element_type(const LogicalOperator &op, size_t index);
 
 // ---- TopN ----
 size_t lo_topn_order_count(const LogicalOperator &op);
@@ -278,13 +284,19 @@ const Expression &expr_list_get(const ExpressionList &list, size_t index);
 
 // ---- Expression: shared ----
 uint8_t expr_type(const Expression &expr);
-BridgeLogicalType expr_return_type(const Expression &expr);
+const LogicalType &expr_return_type(const Expression &expr);
 bool expr_has_alias(const Expression &expr);
 rust::String expr_alias(const Expression &expr);
 
 const Value &expr_constant(const Expression &expr);
 
-BridgeLogicalType value_type(const Value &v);
+// ---- LogicalType ----
+BridgeLogicalType logical_type_flat(const LogicalType &type);
+size_t logical_type_struct_field_count(const LogicalType &type);
+rust::String logical_type_struct_field_name(const LogicalType &type, size_t index);
+const LogicalType &logical_type_struct_field_type(const LogicalType &type, size_t index);
+
+const LogicalType &value_type(const Value &v);
 bool value_is_null(const Value &v);
 bool value_bool(const Value &v);
 int8_t value_i8(const Value &v);
@@ -306,6 +318,9 @@ int64_t value_timestamp_tz(const Value &v);
 int32_t value_interval_months(const Value &v);
 int32_t value_interval_days(const Value &v);
 int64_t value_interval_micros(const Value &v);
+size_t value_list_element_count(const Value &v);
+const Value &value_list_element(const Value &v, size_t index);
+const Value &value_struct_field(const Value &v, size_t index);
 
 size_t expr_ref_index(const Expression &expr);
 size_t expr_columnref_index(const Expression &expr);

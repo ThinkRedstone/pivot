@@ -34,7 +34,7 @@ use crate::operator::{
     Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Cte, CteScan,
     Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert, Join,
     JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan,
-    TopN, TransactionStatement, Values,
+    TopN, TransactionStatement, Unnest, Values,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::{Type, physical_arrow_type, type_from_logical};
@@ -49,7 +49,24 @@ use context::BuildCtx;
 pub(crate) fn build_plan(root: LogicalOp<'_>) -> Result<PlanNode, plan::Error> {
     let mut ctx = BuildCtx::default();
     let plan = build_node(root, &mut ctx)?;
+    reject_struct_outputs(&plan)?;
     Ok(render_variant_outputs(plan)?)
+}
+
+/// Refuse a query whose result has a struct column. A struct exists only
+/// inside a query, and the result encoders have no form for one.
+fn reject_struct_outputs(plan: &PlanNode) -> Result<(), plan::Error> {
+    if plan
+        .output_types()?
+        .iter()
+        .any(|column_type| matches!(column_type, Type::Struct(_)))
+    {
+        return Err(OperatorError::Unsupported(
+            "A query cannot return a struct; select its fields instead".to_string(),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Render the query's variant-typed output columns as JSON text.
@@ -165,6 +182,7 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
             let child = inputs.first().expect("a DISTINCT dedups a child's rows");
             Operator::Distinct(Distinct::from_handle(d, child.output_types()?.len())?)
         }
+        DuckOperator::Unnest(u) => Operator::Unnest(Unnest::from_handle(u)?),
         DuckOperator::OrderBy(o) => Operator::OrderBy(OrderBy::from_handle(o)?),
         DuckOperator::TopN(t) => Operator::TopN(TopN::from_handle(t, ctx)?),
         DuckOperator::Limit(l) => Operator::Limit(Limit::from_handle(l)?),

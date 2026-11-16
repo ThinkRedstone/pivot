@@ -36,6 +36,7 @@ mod set_variable;
 mod table_function;
 mod top_n;
 mod transaction;
+mod unnest;
 mod values;
 
 pub use aggregate::Aggregate;
@@ -62,6 +63,7 @@ pub use table_function::{TableFunction, TableFunctionScan, TableFunctionSignatur
 pub(crate) use table_function::{built_in_table_function, built_in_table_function_defs};
 pub use top_n::TopN;
 pub use transaction::TransactionStatement;
+pub use unnest::{Unnest, UnnestedList};
 pub use values::Values;
 
 use crate::compile;
@@ -138,6 +140,9 @@ pub enum Operator {
     CteScan(CteScan),
     /// The distinct values of a tuple of input columns (see [`Distinct`]).
     Distinct(Distinct),
+    /// Each input row repeated once per element of a list written out in the
+    /// query (see [`Unnest`]).
+    Unnest(Unnest),
 }
 
 impl Operator {
@@ -190,8 +195,9 @@ impl Operator {
                 }
                 Ok(types)
             }
-            // A FROM-less SELECT's one-row source has no columns of its own.
-            Operator::DummyScan(_) => Ok(Vec::new()),
+            // A FROM-less SELECT's one-row source emits one placeholder
+            // column, as DuckDB's dummy scan declares.
+            Operator::DummyScan(_) => Ok(vec![Type::Int32]),
             // EXPLAIN renders its child plan as text, one line per row.
             Operator::Explain(_) => Ok(vec![Type::Utf8]),
             // A CTE emits what the query reading it emits; the definition
@@ -203,6 +209,13 @@ impl Operator {
             // A distinct emits its key columns, in key order.
             Operator::Distinct(distinct) => {
                 Ok(distinct.keys.iter().map(|(_, ty)| ty.clone()).collect())
+            }
+            // An unnest passes its input through and appends one element
+            // column per list.
+            Operator::Unnest(unnest) => {
+                let mut types = inputs[0].clone();
+                types.extend(unnest.element_types());
+                Ok(types)
             }
             // Statements, not queries: no result columns.
             Operator::CreateTable(_)
@@ -260,7 +273,7 @@ impl Operator {
             Operator::Filter(_) | Operator::OrderBy(_) | Operator::TopN(_) | Operator::Limit(_) => {
                 inputs[0].clone()
             }
-            Operator::DummyScan(_) => Vec::new(),
+            Operator::DummyScan(_) => vec![true],
             Operator::Explain(_) => vec![false],
             // A VALUES row may hold NULL literals; stay conservative.
             Operator::Values(values) => {
@@ -301,6 +314,11 @@ impl Operator {
                 .iter()
                 .map(|&(idx, _)| inputs[0][idx])
                 .collect(),
+            Operator::Unnest(unnest) => {
+                let mut nullable = inputs[0].clone();
+                nullable.extend(unnest.element_nullability(&inputs[0]));
+                nullable
+            }
             Operator::CreateTable(_)
             | Operator::CreateSchema(_)
             | Operator::DropTable(_)
@@ -348,6 +366,7 @@ impl fmt::Display for Operator {
             Operator::Cte(c) => write!(f, "{c}"),
             Operator::CteScan(c) => write!(f, "{c}"),
             Operator::Distinct(d) => write!(f, "{d}"),
+            Operator::Unnest(u) => write!(f, "{u}"),
         }
     }
 }

@@ -10,7 +10,8 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Decimal128Type, Int64Type};
 use arrow_array::{
-    BooleanArray, Decimal128Array, Float64Array, Int64Array, RecordBatch, StringViewArray,
+    Array, ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int64Array, RecordBatch,
+    StringViewArray,
 };
 use arrow_buffer::BooleanBuffer;
 use arrow_schema::{DataType, Field, Schema};
@@ -468,4 +469,109 @@ fn group_by_count_row_key_with_string_field() {
     assert_eq!(collect_strings(&results, 0), vec!["alice", "bob", "carol"]);
     assert_eq!(collect_i64s(&results, 1), vec![10, 20, 40]);
     assert_eq!(collect_i64s(&results, 2), vec![3, 2, 1]);
+}
+
+/// One element of a constant list, repeated for every row of `batch`, or NULL
+/// past the list's end.
+fn repeat_list_element(list: &ArrayRef, element_idx: usize, batch: &RecordBatch) -> ArrayRef {
+    if element_idx >= list.len() {
+        return arrow_array::new_null_array(list.data_type(), batch.num_rows());
+    }
+    let positions = arrow_array::UInt32Array::from_value(element_idx as u32, batch.num_rows());
+    arrow::compute::take(list.as_ref(), &positions, None).unwrap()
+}
+
+#[test]
+fn unnest_repeats_each_row_once_per_element() {
+    let dispatch = dispatch(1);
+    let batch = strings_and_ints(&["a", "b"], &[1, 2]);
+
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
+        .unnest(2, || {
+            // Element 0 is the row's own value, element 1 is ten times it.
+            |batch: &RecordBatch, element_idx: usize| {
+                let values = batch.column(1).as_primitive::<Int64Type>();
+                let scale = [1, 10][element_idx];
+                let element: Int64Array = values.unary(|value| value * scale);
+                Ok(vec![Arc::new(element) as ArrayRef])
+            }
+        })
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(String, i64, i64)> = collect_strings(&results, 0)
+        .into_iter()
+        .zip(collect_i64s(&results, 1))
+        .zip(collect_i64s(&results, 2))
+        .map(|((name, value), element)| (name, value, element))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("a".to_string(), 1, 1),
+            ("a".to_string(), 1, 10),
+            ("b".to_string(), 2, 2),
+            ("b".to_string(), 2, 20),
+        ]
+    );
+}
+
+#[test]
+fn unnest_steps_through_several_lists_together() {
+    let dispatch = dispatch(1);
+    let batch = strings_and_ints(&["a"], &[1]);
+    let short_list: ArrayRef = Arc::new(Int64Array::from(vec![10]));
+    let long_list: ArrayRef = Arc::new(StringViewArray::from(vec!["x", "y"]));
+
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
+        .unnest(2, move || {
+            let lists = [short_list.clone(), long_list.clone()];
+            move |batch: &RecordBatch, element_idx: usize| {
+                Ok(lists
+                    .iter()
+                    .map(|list| repeat_list_element(list, element_idx, batch))
+                    .collect())
+            }
+        })
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(String, Option<i64>)> = results
+        .iter()
+        .flat_map(|batch| {
+            let short_elements = batch.column(2).as_primitive::<Int64Type>();
+            let long_elements = batch.column(3).as_string_view();
+            (0..batch.num_rows())
+                .map(|row| {
+                    let short_element = short_elements
+                        .is_valid(row)
+                        .then(|| short_elements.value(row));
+                    (long_elements.value(row).to_string(), short_element)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![("x".to_string(), Some(10)), ("y".to_string(), None)]
+    );
+}
+
+#[test]
+fn unnest_with_no_elements_emits_no_rows() {
+    let dispatch = dispatch(1);
+    let batch = strings_and_ints(&["a", "b"], &[1, 2]);
+
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
+        .unnest(0, || |_: &RecordBatch, _: usize| Ok(Vec::<ArrayRef>::new()))
+        .collect()
+        .unwrap();
+
+    let row_count: usize = results.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(row_count, 0);
 }

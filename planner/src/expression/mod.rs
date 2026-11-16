@@ -36,6 +36,8 @@ mod prefix;
 mod reference;
 mod regexp;
 mod regexp_jit;
+mod struct_extract;
+mod struct_pack;
 mod substring;
 mod suffix;
 mod time_bucket;
@@ -71,6 +73,8 @@ pub use prefix::Prefix;
 pub use reference::Ref;
 pub use regexp::{RegexpFullMatch, RegexpReplace};
 pub use regexp_jit::RegexpJitReplace;
+pub use struct_extract::StructExtract;
+pub use struct_pack::StructPack;
 pub use substring::Substring;
 pub use suffix::Suffix;
 pub(crate) use time_bucket::count_epoch_months;
@@ -109,6 +113,9 @@ pub enum Error {
     InvalidTimeBucket(String),
     #[error("Unsupported expression type: {0:?}")]
     UnsupportedExpressionType(ExpressionType),
+    /// An operation over a whole struct that only its fields support.
+    #[error("{0} is not supported on a struct; read its fields instead")]
+    UnsupportedStructOperation(String),
     /// A sort key whose null placement the binder left unresolved.
     #[error("Unsupported null order: {0}")]
     UnsupportedNullOrder(OrderByNullType),
