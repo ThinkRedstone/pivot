@@ -79,9 +79,10 @@ impl Aggregate {
     ///
     /// The materialised columns take the leading positions in a fixed order: the
     /// computed group keys (in GROUP BY order), then the computed aggregate
-    /// arguments (in expression order). Each keeps a canonical type
-    /// (`Int64`/`Utf8View`, or `Date`/`Timestamp` for a temporal one) so it is
-    /// typed for the extractor and the numeric readers. The original input columns
+    /// arguments (in expression order). An integer key keeps its declared width;
+    /// every other one takes a canonical type (`Int64`/`Utf8View`, or
+    /// `Date`/`Timestamp` for a temporal one) so it is typed for the extractor
+    /// and the numeric readers. The original input columns
     /// follow, shifted right by that count, and every surviving plain reference is
     /// shifted to match.
     ///
@@ -117,11 +118,18 @@ impl Aggregate {
         for g in &self.groups {
             if !matches!(g, Expression::Ref(_)) {
                 let result = g.result_type()?;
-                let ty =
-                    canonical_input_type(&result).ok_or(Error::DataTypeNotSupportedForGroupBy {
-                        column: None,
-                        data_type: result,
-                    })?;
+                let ty = match result {
+                    // An integer key groups at its declared width, as a plain
+                    // column of that width does, so the key column comes out
+                    // in the type the plan declares for it.
+                    Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64 => result,
+                    _ => canonical_input_type(&result).ok_or(
+                        Error::DataTypeNotSupportedForGroupBy {
+                            column: None,
+                            data_type: result,
+                        },
+                    )?,
+                };
                 computed.push(g);
                 types.push(ty);
             }
@@ -405,7 +413,8 @@ pub(super) fn column_nullable(nullability: &[bool], column: usize) -> bool {
 /// materialised as. Strings and temporal values keep their own type (a temporal
 /// key/value flows through the same int-ify/restore path a plain temporal column
 /// does, so its output is restored to `Date`/`Timestamp` rather than left a raw
-/// int); integer widths are widened to the `Int64` the numeric readers consume.
+/// int); integer widths are widened to the `Int64` the numeric readers consume
+/// (an integer group key is the exception: the caller keeps its declared width).
 /// Any other result type has no materialised column, so the caller rejects it
 /// rather than silently coercing it.
 fn canonical_input_type(result_type: &Type) -> Option<Type> {
@@ -429,9 +438,9 @@ fn canonical_input_type(result_type: &Type) -> Option<Type> {
     }
 }
 
-/// Evaluate each `expr` per batch, cast it to the physical arrow type of its
-/// canonical [`canonical_input_type`] (`Utf8View`/`Int64`/`Date32`/`Timestamp`),
-/// and prepend them as leading columns `k0, k1, ...`. The original columns follow,
+/// Evaluate each `expr` per batch, cast it to the physical arrow type of the
+/// matching entry of `types` (`Utf8View`/`Int64`/`Date32`/`Timestamp`, or an
+/// integer key's own width), and prepend them as leading columns `k0, k1, ...`. The original columns follow,
 /// shifted right by `exprs.len()`, so the aggregates can still read their value
 /// columns.
 fn project_leading_columns(
@@ -855,7 +864,7 @@ mod tests {
     use crate::test_support::*;
     use crate::types::Type;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::{Date32Type, Float64Type, Int64Type};
+    use arrow_array::types::{Date32Type, Float64Type, Int32Type, Int64Type};
     use arrow_array::{
         ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, RecordBatch,
     };
@@ -1329,6 +1338,34 @@ mod tests {
         // The group-by computes on the int key but the emitted key column must be
         // restored to a real Date32 so it renders as a date.
         assert_eq!(batches[0].schema().field(0).data_type(), &DataType::Date32);
+    }
+
+    #[rstest]
+    fn group_by_computed_integer_emits_its_declared_width(mut testing_planner: TestingPlanner) {
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT a + b AS total, count(*) FROM example_table GROUP BY a + b",
+        );
+
+        assert_eq!(batches[0].schema().field(0).data_type(), &DataType::Int32);
+    }
+
+    #[rstest]
+    fn arithmetic_reads_a_computed_integer_group_key(mut testing_planner: TestingPlanner) {
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT total + 1 FROM (
+                 SELECT a + b AS total, count(*) AS row_count FROM example_table GROUP BY 1
+             ) AS totals",
+        );
+
+        let mut sums = batches[0]
+            .column(0)
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        sums.sort();
+        assert_eq!(sums, vec![12, 23, 34, 45, 56]);
     }
 
     #[rstest]
