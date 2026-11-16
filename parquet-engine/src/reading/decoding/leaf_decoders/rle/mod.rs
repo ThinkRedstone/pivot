@@ -36,6 +36,62 @@ unsafe fn gather_entries<D: Dict>(dict: &D, keys: &[u32], dest: &mut [D::Item]) 
     }
 }
 
+/// Appends `dict`'s entry for each of `keys` to `builder`.
+///
+/// Keys are bounded by the bit width; when the dictionary is at least that
+/// large (`keys_in_range`) no key can be out of range. Otherwise one max-scan
+/// (auto-vectorized) checks all of `keys` up front: slab-backed dictionaries
+/// index with no per-element bounds check, so out-of-range keys must be
+/// impossible by the time the lookup loop runs.
+#[inline(always)]
+fn push_entries_for_keys<I, B: ArrayBuilder<Element = I>, D: Dict<Builder = B, Item = I>>(
+    builder: &mut B,
+    dict: &D,
+    keys: &[u32],
+    keys_in_range: bool,
+) {
+    if !keys_in_range {
+        // Folding from zero, rather than from the first key, leaves a count
+        // that is a whole number of vectors whenever the key count is.
+        let max = keys.iter().copied().fold(0, u32::max);
+        assert!(
+            (max as usize) < dict.len(),
+            "dictionary key {max} out of range ({} entries)",
+            dict.len()
+        );
+    }
+    let dest = builder.spare_mut(keys.len());
+    // SAFETY: every key is < dict.len() - by the bit-width bound or the
+    // max-scan assert above.
+    unsafe { gather_entries(dict, keys, dest) };
+}
+
+/// Bytes a run takes up to the end of its repeated value when its header
+/// fits one byte: the header, then at most four bytes of value.
+const SHORT_RUN_PREFIX: usize = 1 + size_of::<u32>();
+
+/// Slots written at a time by [`fill_run`]. Writers rarely emit a repeated
+/// run shorter than this, so nearly every run is at least one block long.
+const FILL_BLOCK: usize = 8;
+
+/// Sets every slot of `dest` to `value`.
+///
+/// Runs are short, so the fill is shaped for them: whole blocks from the
+/// front, and one block flush with the end that overlaps the block before it
+/// instead of finishing slot by slot.
+#[inline(always)]
+fn fill_run<T: Copy>(dest: &mut [T], value: T) {
+    let block = [value; FILL_BLOCK];
+    let Some(last) = dest.last_chunk_mut::<FILL_BLOCK>() else {
+        dest.fill(value);
+        return;
+    };
+    *last = block;
+    for chunk in dest.as_chunks_mut::<FILL_BLOCK>().0 {
+        *chunk = block;
+    }
+}
+
 /// A single run in the RLE/bit-packed stream.
 pub enum Run {
     Rle {
@@ -226,12 +282,6 @@ impl Run {
                 partial,
                 partial_count,
             } => {
-                // Keys are bounded by the bit width; when the dictionary is
-                // at least that large no key can be out of range. Otherwise
-                // one max-scan per chunk (auto-vectorized) checks the whole
-                // chunk up front: slab-backed dictionaries index with no
-                // per-element bounds check, so out-of-range keys must be
-                // impossible by the time the lookup loop runs.
                 let keys_in_range = (1u64 << bit_width) as usize <= dict.len();
                 let (_, leftover) = decode_bitpacked(
                     remaining_in_run,
@@ -243,19 +293,7 @@ impl Run {
                     position,
                     limit,
                     |scratch, count| {
-                        let keys = &scratch[..count];
-                        if !keys_in_range {
-                            let max = keys.iter().copied().max().unwrap_or(0);
-                            assert!(
-                                (max as usize) < dict.len(),
-                                "dictionary key {max} out of range ({} entries)",
-                                dict.len()
-                            );
-                        }
-                        let dest = builder.spare_mut(count);
-                        // SAFETY: every key is < dict.len() - by the bit-width
-                        // bound or the max-scan assert above.
-                        unsafe { gather_entries(dict, keys, dest) };
+                        push_entries_for_keys(builder, dict, &scratch[..count], keys_in_range)
                     },
                 );
                 leftover
@@ -377,6 +415,76 @@ impl RleDecoder {
         }
     }
 
+    /// Decodes runs straight out of the current buffer for as long as each
+    /// one is short and whole: its header fits one byte, all of it lies in
+    /// this buffer, and it holds no more values than `builder` still needs
+    /// to reach `target` elements.
+    ///
+    /// Most runs of a page are like that and a page holds very many of them,
+    /// so this loop keeps the read offset and the count of values still
+    /// wanted in locals and writes the decoder's position once, on the way
+    /// out. It stops at the first run that is anything else, leaving the
+    /// position on that run's header.
+    ///
+    /// No run may be pending when this is called.
+    fn read_short_runs<B: ArrayBuilder, D: Dict<Builder = B, Item = B::Element>>(
+        &mut self,
+        builder: &mut B,
+        dict: &D,
+        target: usize,
+    ) {
+        // A position past the last buffer has no run to offer here.
+        let Some(buffer) = self.data.get(self.position.buffer_index) else {
+            return;
+        };
+        let bytes: &[u8] = buffer;
+        let value_bytes = byte_width(self.bit_width) as usize;
+        let value_mask = ((1u64 << (8 * value_bytes)) - 1) as u32;
+        let keys_in_range = (1u64 << self.bit_width) as usize <= dict.len();
+        let mut offset = self.position.offset;
+        let mut wanted = target - builder.len();
+
+        while wanted > 0 {
+            // The header and the widest repeated value are read together, so
+            // a run within a few bytes of the buffer's end is not taken here
+            // even when its own bytes all fit.
+            let Some(&[header, value @ ..]) = bytes
+                .get(offset..)
+                .and_then(<[u8]>::first_chunk::<SHORT_RUN_PREFIX>)
+            else {
+                break;
+            };
+            if header & 0x80 != 0 {
+                break;
+            }
+            let count = usize::from(header >> 1);
+            if header & 1 == 0 {
+                if count > wanted {
+                    break;
+                }
+                let key = u32::from_le_bytes(value) & value_mask;
+                fill_run(builder.spare_mut(count), dict.entry(key as usize));
+                offset += 1 + value_bytes;
+                wanted -= count;
+            } else {
+                let values = count * 8;
+                let packed_end = offset + 1 + count * usize::from(self.bit_width);
+                if values > wanted || packed_end > bytes.len() {
+                    break;
+                }
+                let keys = &mut self.buffer[..values];
+                BitPackDecoder::new(bytes, offset + 1, self.bit_width, [0; 7], 0)
+                    .decode(keys)
+                    .expect("every group of the run lies inside the buffer");
+                push_entries_for_keys(builder, dict, keys, keys_in_range);
+                offset = packed_end;
+                wanted -= values;
+            }
+        }
+
+        self.position.offset = offset;
+    }
+
     /// Decodes `size` values, looking up each index in `dict` and pushing
     /// the result into `builder`.
     pub fn read<I, B: ArrayBuilder<Element = I>, D: Dict<Builder = B, Item = I>>(
@@ -387,6 +495,12 @@ impl RleDecoder {
     ) {
         let target = builder.len() + size;
         while builder.len() < target {
+            if self.run.is_none() {
+                self.read_short_runs(builder, dict, target);
+                if builder.len() == target {
+                    break;
+                }
+            }
             let size = target - builder.len();
             let run = self.get_or_set_next_run();
             self.run = run.read_into(
@@ -538,6 +652,76 @@ mod tests {
         let result = push_all(&mut allocator, &mut dec, &dict, 8);
 
         assert_eq!(result, vec!["AA", "BB", "CC", "DD", "AA", "BB", "CC", "DD"]);
+    }
+
+    /// Repeated and bit-packed runs: 5 x CC, one group, 3 x BB, one group,
+    /// 2 x AA. Every run but the last has room after it in the buffer.
+    const MIXED_SHORT_RUNS: [u8; 12] = [10, 2, 3, 0xE4, 0xE4, 6, 1, 3, 0xE4, 0xE4, 4, 0];
+
+    fn mixed_short_runs_values() -> Vec<&'static str> {
+        let group = ["AA", "BB", "CC", "DD", "AA", "BB", "CC", "DD"];
+        [&["CC"; 5][..], &group, &["BB"; 3], &group, &["AA"; 2]].concat()
+    }
+
+    #[test]
+    fn reads_consecutive_short_runs() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        let mut dec = new_decoder(MIXED_SHORT_RUNS.to_vec(), 2);
+
+        let result = push_all(&mut allocator, &mut dec, &dict, 26);
+
+        assert_eq!(result, mixed_short_runs_values());
+    }
+
+    /// Reads that end inside a repeated run and inside a bit-packed group
+    /// pick up where they stopped.
+    #[test]
+    fn short_runs_split_across_reads() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        let mut dec = new_decoder(MIXED_SHORT_RUNS.to_vec(), 2);
+
+        let mut result = Vec::new();
+        for size in [3, 4, 9, 10] {
+            result.extend(push_all(&mut allocator, &mut dec, &dict, size));
+        }
+
+        assert_eq!(result, mixed_short_runs_values());
+    }
+
+    /// Repeated runs longer than one fill block, neither a whole number of
+    /// blocks: 13 x BB then 37 x DD.
+    #[test]
+    fn fills_repeated_runs_longer_than_a_block() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        let mut dec = new_decoder(vec![26, 1, 74, 3, 3, 0xE4, 0xE4], 2);
+
+        let result = push_all(&mut allocator, &mut dec, &dict, 58);
+
+        let group = ["AA", "BB", "CC", "DD", "AA", "BB", "CC", "DD"];
+        let expected = [&["BB"; 13][..], &["DD"; 37], &group].concat();
+        assert_eq!(result, expected);
+    }
+
+    /// A run whose header takes two bytes (70 x BB) sits between short runs.
+    #[test]
+    fn long_run_between_short_runs() {
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let dict = make_dict(&["AA", "BB", "CC", "DD"]);
+        let data = vec![4, 3, 0x8C, 0x01, 1, 3, 0xE4, 0xE4, 6, 2, 3, 0xE4, 0xE4];
+        let mut dec = new_decoder(data, 2);
+
+        let result = push_all(&mut allocator, &mut dec, &dict, 91);
+
+        let group = ["AA", "BB", "CC", "DD", "AA", "BB", "CC", "DD"];
+        let expected = [&["DD"; 2][..], &["BB"; 70], &group, &["CC"; 3], &group].concat();
+        assert_eq!(result, expected);
     }
 
     /// Skipping into the middle of a bit-packed run leaves the decoder at the
