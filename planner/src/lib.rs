@@ -158,7 +158,8 @@ use thiserror::Error;
 use crate::catalog::{CatalogTransaction, DuckDBTransactionAdapter};
 use crate::operator::built_in_table_function_defs;
 pub use duckdb_planner::{
-    BoundLogicalType, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, ScalarValue,
+    BoundLogicalType, DuckDBColumn, DuckDBTable, DuckDBTransaction, ExtraTypeInfo, LogicalTypeId,
+    ScalarValue,
 };
 
 /// Errors surfaced by planning and validating a [`Plan`].

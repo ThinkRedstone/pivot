@@ -3,8 +3,9 @@
 mod common;
 
 use common::*;
-use planner::{BoundLogicalType, LogicalTypeId, ScalarValue};
+use planner::{BoundLogicalType, ExtraTypeInfo, LogicalTypeId, ScalarValue};
 use rstest::rstest;
+use serde_json::json;
 
 #[rstest]
 #[case(ScalarValue::Boolean(true), "true")]
@@ -114,6 +115,111 @@ fn select_reuses_parameter_among_several(mut testing_planner: TestingPlanner) {
     ));
 
     assert_eq!(only_column(&rows[0]), 16);
+}
+
+fn build_integer_list(elements: Vec<ScalarValue>) -> ScalarValue {
+    ScalarValue::List {
+        element_type: BoundLogicalType::plain(LogicalTypeId::INTEGER),
+        elements,
+    }
+}
+
+#[rstest]
+fn unnest_expands_list_parameter(mut testing_planner: TestingPlanner) {
+    let list = build_integer_list(vec![
+        ScalarValue::Int32(1),
+        ScalarValue::Int32(2),
+        ScalarValue::Int32(3),
+    ]);
+
+    let rows = batches_to_json(&run_batches_with_parameters(
+        &mut testing_planner,
+        "SELECT unnest($1) AS element ORDER BY element",
+        vec![list],
+    ));
+
+    assert_eq!(
+        rows,
+        vec![
+            json!({"element": 1}),
+            json!({"element": 2}),
+            json!({"element": 3})
+        ]
+    );
+}
+
+#[rstest]
+fn unnest_keeps_null_element_of_list_parameter(mut testing_planner: TestingPlanner) {
+    let list = build_integer_list(vec![
+        ScalarValue::Int32(1),
+        ScalarValue::Null(BoundLogicalType::plain(LogicalTypeId::INTEGER)),
+    ]);
+
+    let batches =
+        run_batches_with_parameters(&mut testing_planner, "SELECT unnest($1)", vec![list]);
+
+    let row_count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    let null_count: usize = batches
+        .iter()
+        .map(|batch| batch.column(0).null_count())
+        .sum();
+    assert_eq!((row_count, null_count), (2, 1));
+}
+
+#[rstest]
+#[case::empty_list(build_integer_list(Vec::new()))]
+#[case::null_list(ScalarValue::Null(BoundLogicalType {
+    id: LogicalTypeId::LIST,
+    extra: ExtraTypeInfo::List(Box::new(BoundLogicalType::plain(LogicalTypeId::INTEGER))),
+}))]
+fn unnest_of_list_parameter_without_elements_emits_no_rows(
+    mut testing_planner: TestingPlanner,
+    #[case] list: ScalarValue,
+) {
+    let batches =
+        run_batches_with_parameters(&mut testing_planner, "SELECT unnest($1)", vec![list]);
+
+    let row_count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(row_count, 0);
+}
+
+#[rstest]
+fn unnest_expands_scalar_parameters_in_written_out_list(mut testing_planner: TestingPlanner) {
+    let parameters = vec![ScalarValue::Int32(7), ScalarValue::Int32(8)];
+
+    let rows = batches_to_json(&run_batches_with_parameters(
+        &mut testing_planner,
+        "SELECT unnest([$1, $2]) AS element ORDER BY element",
+        parameters,
+    ));
+
+    assert_eq!(rows, vec![json!({"element": 7}), json!({"element": 8})]);
+}
+
+#[rstest]
+fn unnest_expands_list_parameter_per_table_row(mut testing_planner: TestingPlanner) {
+    let list = build_integer_list(vec![ScalarValue::Int32(1), ScalarValue::Int32(2)]);
+
+    let batches = run_batches_with_parameters(
+        &mut testing_planner,
+        "SELECT a, unnest($1) FROM example_table",
+        vec![list],
+    );
+
+    let row_count: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(row_count, 10);
+}
+
+#[rstest]
+fn select_of_list_parameter_is_rejected(mut testing_planner: TestingPlanner) {
+    let list = build_integer_list(vec![ScalarValue::Int32(1)]);
+    let transaction = testing_planner.transaction();
+
+    let result = testing_planner
+        .planner
+        .plan_with_parameters("SELECT $1", vec![list], transaction);
+
+    assert!(result.is_err());
 }
 
 #[rstest]

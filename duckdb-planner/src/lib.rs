@@ -85,6 +85,8 @@ pub enum Error {
     Bridge(String),
     #[error("a parameter of type {0:?} cannot be bound")]
     UnsupportedParameterType(LogicalTypeId),
+    #[error("a parameter of type {0:?} is missing its element or field types")]
+    IncompleteParameterType(LogicalTypeId),
 }
 
 impl From<cxx::Exception> for Error {
@@ -178,15 +180,15 @@ impl PlannerContext {
         parameters: Vec<ScalarValue>,
         transaction: Arc<dyn DuckDBTransaction>,
     ) -> Result<Plan, Error> {
-        let mut parameter_list = ffi::new_parameter_list()?;
+        let mut parameter_values = ffi::new_value_list()?;
         for parameter in parameters {
-            ffi::push_parameter(parameter_list.pin_mut(), parameter.into_duckdb_value()?)?;
+            ffi::push_value(parameter_values.pin_mut(), parameter.into_duckdb_value()?)?;
         }
         let transaction_ctx = catalog_provider::TransactionContext::new(transaction);
         let result = ffi::extract_plan(
             self.cxx_context.pin_mut(),
             query,
-            &parameter_list,
+            &parameter_values,
             &transaction_ctx,
         )?;
         if !result.error_kind.is_empty() {

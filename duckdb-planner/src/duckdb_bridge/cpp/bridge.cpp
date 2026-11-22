@@ -223,7 +223,7 @@ PlanHandle::~PlanHandle() {
 // captured without patching the bundled DuckDB.
 static duckdb::unique_ptr<duckdb::LogicalOperator>
 extract_plan_with_names(duckdb::Connection &con, const std::string &query,
-                        const ParameterList &parameters,
+                        const ValueList &parameters,
                         duckdb::vector<std::string> &result_names, bool &requires_rebind) {
 	auto statements = con.ExtractStatements(query);
 	if (statements.size() != 1) {
@@ -283,7 +283,7 @@ struct CurrentTransactionScope {
 };
 
 ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
-                               const ParameterList &parameters,
+                               const ValueList &parameters,
                                const TransactionContext &transaction) {
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
 	duckdb::vector<std::string> name_list;
@@ -331,12 +331,12 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 	return result;
 }
 
-std::unique_ptr<ParameterList> new_parameter_list() {
-	return std::make_unique<ParameterList>();
+std::unique_ptr<ValueList> new_value_list() {
+	return std::make_unique<ValueList>();
 }
 
-void push_parameter(ParameterList &parameters, std::unique_ptr<Value> value) {
-	parameters.values.push_back(std::move(*value));
+void push_value(ValueList &values, std::unique_ptr<Value> value) {
+	values.values.push_back(std::move(*value));
 }
 
 const LogicalOperator &plan_root(const PlanHandle &plan) {
@@ -1519,6 +1519,18 @@ static duckdb::LogicalType build_logical_type(const BridgeLogicalType &logical_t
 // A Value built from a type alone is a NULL of that type.
 std::unique_ptr<Value> build_null_value(BridgeLogicalType logical_type) {
 	return std::make_unique<Value>(Value(build_logical_type(logical_type)));
+}
+
+// A list of `element_type` holding `elements`. DuckDB casts each element to
+// that type, and throws for one that cannot be converted.
+std::unique_ptr<Value> build_list_value(BridgeLogicalType element_type, std::unique_ptr<ValueList> elements) {
+	return std::make_unique<Value>(
+	    Value::LIST(build_logical_type(element_type), std::move(elements->values)));
+}
+
+// A NULL of type LIST(element_type).
+std::unique_ptr<Value> build_null_list_value(BridgeLogicalType element_type) {
+	return std::make_unique<Value>(Value(duckdb::LogicalType::LIST(build_logical_type(element_type))));
 }
 
 size_t expr_ref_index(const Expression &expr) {

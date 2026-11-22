@@ -205,18 +205,15 @@ pub mod ffi {
         fn extract_plan(
             ctx: Pin<&mut DuckPlannerContext>,
             query: &str,
-            parameters: &ParameterList,
+            parameters: &ValueList,
             transaction: &TransactionContext,
         ) -> Result<ExtractPlanResult>;
 
-        /// The values a statement's placeholders take, filled one
-        /// `push_parameter` at a time.
-        type ParameterList;
-        fn new_parameter_list() -> Result<UniquePtr<ParameterList>>;
-        fn push_parameter(
-            parameters: Pin<&mut ParameterList>,
-            value: UniquePtr<Value>,
-        ) -> Result<()>;
+        /// An ordered run of values, filled one `push_value` at a time: a
+        /// statement's placeholder values, or the elements of a list value.
+        type ValueList;
+        fn new_value_list() -> Result<UniquePtr<ValueList>>;
+        fn push_value(values: Pin<&mut ValueList>, value: UniquePtr<Value>) -> Result<()>;
 
         fn plan_root(plan: &PlanHandle) -> Result<&LogicalOperator>;
 
@@ -655,6 +652,13 @@ pub mod ffi {
         fn build_timestamp_tz_value(micros: i64) -> Result<UniquePtr<Value>>;
         fn build_interval_value(months: i32, days: i32, micros: i64) -> Result<UniquePtr<Value>>;
         fn build_null_value(logical_type: BridgeLogicalType) -> Result<UniquePtr<Value>>;
+        /// A list of `element_type`. An element of another type is cast to
+        /// it, and one that cannot be converted is an error.
+        fn build_list_value(
+            element_type: BridgeLogicalType,
+            elements: UniquePtr<ValueList>,
+        ) -> Result<UniquePtr<Value>>;
+        fn build_null_list_value(element_type: BridgeLogicalType) -> Result<UniquePtr<Value>>;
 
         // BoundAggregateExpression
         fn expr_aggregate_name(expr: &Expression) -> Result<String>;

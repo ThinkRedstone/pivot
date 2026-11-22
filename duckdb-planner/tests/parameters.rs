@@ -1,6 +1,7 @@
 use duckdb_planner::handle::{Expression, Operator};
 use duckdb_planner::{
-    DuckDBTable, DuckDBTransaction, Error, LogicalTypeId, PlannerContext, ScalarValue,
+    BoundLogicalType, DuckDBTable, DuckDBTransaction, Error, LogicalTypeId, PlannerContext,
+    ScalarValue,
 };
 use std::sync::Arc;
 
@@ -71,6 +72,59 @@ fn plan_reuses_parameter_among_several() {
         panic!("expected the sum folded into a constant");
     };
     assert!(matches!(constant.value().unwrap(), ScalarValue::Int32(16)));
+}
+
+fn build_integer_list(elements: Vec<ScalarValue>) -> ScalarValue {
+    ScalarValue::List {
+        element_type: BoundLogicalType::plain(LogicalTypeId::INTEGER),
+        elements,
+    }
+}
+
+#[test]
+fn plan_binds_list_parameter_as_constant() {
+    let mut context = create_context();
+    let list = build_integer_list(vec![ScalarValue::Int32(1), ScalarValue::Int32(2)]);
+
+    let plan = context
+        .plan("SELECT unnest($1)", vec![list], Arc::new(EmptyTransaction))
+        .unwrap();
+
+    let projection = plan.root().unwrap();
+    let Operator::Unnest(unnest) = projection.child(0).unwrap().operator().unwrap() else {
+        panic!("expected an unnest below the projection");
+    };
+    let Expression::Constant(constant) = unnest.lists().unwrap()[0].list.expression().unwrap()
+    else {
+        panic!("expected a constant list");
+    };
+    assert!(matches!(
+        constant.list_elements().unwrap()[..],
+        [ScalarValue::Int32(1), ScalarValue::Int32(2)]
+    ));
+}
+
+#[test]
+fn plan_rejects_list_parameter_with_unconvertible_element() {
+    let mut context = create_context();
+    let list = build_integer_list(vec![ScalarValue::Utf8("abc".to_string())]);
+
+    let result = context.plan("SELECT unnest($1)", vec![list], Arc::new(EmptyTransaction));
+
+    assert!(matches!(result, Err(Error::Bridge(_))));
+}
+
+#[test]
+fn plan_rejects_list_parameter_without_element_type() {
+    let mut context = create_context();
+    let list = ScalarValue::Null(BoundLogicalType::plain(LogicalTypeId::LIST));
+
+    let result = context.plan("SELECT unnest($1)", vec![list], Arc::new(EmptyTransaction));
+
+    assert!(matches!(
+        result,
+        Err(Error::IncompleteParameterType(LogicalTypeId::LIST))
+    ));
 }
 
 #[test]

@@ -67,20 +67,20 @@ struct ExpressionList {
 	std::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
 };
 
-// The values a statement's `$1..$n` placeholders take, in placeholder order.
-// Built on this side because cxx cannot append a non-trivial C++ object to a
-// vector from Rust.
-struct ParameterList {
+// An ordered run of values: the values a statement's `$1..$n` placeholders
+// take, or the elements of a list value. Built on this side because cxx cannot
+// append a non-trivial C++ object to a vector from Rust.
+struct ValueList {
 	duckdb::vector<duckdb::Value> values;
 };
 
 std::unique_ptr<DuckPlannerContext> new_context(rust::Box<CatalogContext> catalog);
 ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
-                               const ParameterList &parameters,
+                               const ValueList &parameters,
                                const TransactionContext &transaction);
 
-std::unique_ptr<ParameterList> new_parameter_list();
-void push_parameter(ParameterList &parameters, std::unique_ptr<Value> value);
+std::unique_ptr<ValueList> new_value_list();
+void push_value(ValueList &values, std::unique_ptr<Value> value);
 
 const LogicalOperator &plan_root(const PlanHandle &plan);
 size_t rowid_column_id();
@@ -353,6 +353,8 @@ std::unique_ptr<Value> build_timestamp_value(int64_t micros);
 std::unique_ptr<Value> build_timestamp_tz_value(int64_t micros);
 std::unique_ptr<Value> build_interval_value(int32_t months, int32_t days, int64_t micros);
 std::unique_ptr<Value> build_null_value(BridgeLogicalType logical_type);
+std::unique_ptr<Value> build_list_value(BridgeLogicalType element_type, std::unique_ptr<ValueList> elements);
+std::unique_ptr<Value> build_null_list_value(BridgeLogicalType element_type);
 
 size_t expr_ref_index(const Expression &expr);
 size_t expr_columnref_index(const Expression &expr);
