@@ -199,11 +199,24 @@ pub mod ffi {
         /// `PivotSchemaCatalogEntry::LookupEntry`). The reference only
         /// needs to outlive this call; the C++ side clears its pointer before
         /// returning.
+        ///
+        /// `parameters` holds the values of the statement's `$1..$n`
+        /// placeholders, in placeholder order; each is bound as a constant.
         fn extract_plan(
             ctx: Pin<&mut DuckPlannerContext>,
             query: &str,
+            parameters: &ParameterList,
             transaction: &TransactionContext,
         ) -> Result<ExtractPlanResult>;
+
+        /// The values a statement's placeholders take, filled one
+        /// `push_parameter` at a time.
+        type ParameterList;
+        fn new_parameter_list() -> Result<UniquePtr<ParameterList>>;
+        fn push_parameter(
+            parameters: Pin<&mut ParameterList>,
+            value: UniquePtr<Value>,
+        ) -> Result<()>;
 
         fn plan_root(plan: &PlanHandle) -> Result<&LogicalOperator>;
 
@@ -614,6 +627,34 @@ pub mod ffi {
             logical_type: &LogicalType,
             index: usize,
         ) -> Result<&LogicalType>;
+
+        // ---- Value: constructors, the inverse of the typed accessors. A
+        // 128-bit integer crosses as its two halves.
+        fn build_boolean_value(value: bool) -> Result<UniquePtr<Value>>;
+        fn build_int8_value(value: i8) -> Result<UniquePtr<Value>>;
+        fn build_int16_value(value: i16) -> Result<UniquePtr<Value>>;
+        fn build_int32_value(value: i32) -> Result<UniquePtr<Value>>;
+        fn build_int64_value(value: i64) -> Result<UniquePtr<Value>>;
+        fn build_uint8_value(value: u8) -> Result<UniquePtr<Value>>;
+        fn build_uint16_value(value: u16) -> Result<UniquePtr<Value>>;
+        fn build_uint32_value(value: u32) -> Result<UniquePtr<Value>>;
+        fn build_uint64_value(value: u64) -> Result<UniquePtr<Value>>;
+        fn build_int128_value(upper: i64, lower: u64) -> Result<UniquePtr<Value>>;
+        fn build_float32_value(value: f32) -> Result<UniquePtr<Value>>;
+        fn build_float64_value(value: f64) -> Result<UniquePtr<Value>>;
+        fn build_decimal_value(
+            upper: i64,
+            lower: u64,
+            width: u8,
+            scale: u8,
+        ) -> Result<UniquePtr<Value>>;
+        fn build_varchar_value(value: &str) -> Result<UniquePtr<Value>>;
+        fn build_variant_value(text: &str) -> Result<UniquePtr<Value>>;
+        fn build_date_value(days: i32) -> Result<UniquePtr<Value>>;
+        fn build_timestamp_value(micros: i64) -> Result<UniquePtr<Value>>;
+        fn build_timestamp_tz_value(micros: i64) -> Result<UniquePtr<Value>>;
+        fn build_interval_value(months: i32, days: i32, micros: i64) -> Result<UniquePtr<Value>>;
+        fn build_null_value(logical_type: BridgeLogicalType) -> Result<UniquePtr<Value>>;
 
         // BoundAggregateExpression
         fn expr_aggregate_name(expr: &Expression) -> Result<String>;

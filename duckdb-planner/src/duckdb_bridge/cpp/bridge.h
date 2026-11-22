@@ -67,9 +67,20 @@ struct ExpressionList {
 	std::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
 };
 
+// The values a statement's `$1..$n` placeholders take, in placeholder order.
+// Built on this side because cxx cannot append a non-trivial C++ object to a
+// vector from Rust.
+struct ParameterList {
+	duckdb::vector<duckdb::Value> values;
+};
+
 std::unique_ptr<DuckPlannerContext> new_context(rust::Box<CatalogContext> catalog);
 ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
+                               const ParameterList &parameters,
                                const TransactionContext &transaction);
+
+std::unique_ptr<ParameterList> new_parameter_list();
+void push_parameter(ParameterList &parameters, std::unique_ptr<Value> value);
 
 const LogicalOperator &plan_root(const PlanHandle &plan);
 size_t rowid_column_id();
@@ -321,6 +332,27 @@ int64_t value_interval_micros(const Value &v);
 size_t value_list_element_count(const Value &v);
 const Value &value_list_element(const Value &v, size_t index);
 const Value &value_struct_field(const Value &v, size_t index);
+
+std::unique_ptr<Value> build_boolean_value(bool value);
+std::unique_ptr<Value> build_int8_value(int8_t value);
+std::unique_ptr<Value> build_int16_value(int16_t value);
+std::unique_ptr<Value> build_int32_value(int32_t value);
+std::unique_ptr<Value> build_int64_value(int64_t value);
+std::unique_ptr<Value> build_uint8_value(uint8_t value);
+std::unique_ptr<Value> build_uint16_value(uint16_t value);
+std::unique_ptr<Value> build_uint32_value(uint32_t value);
+std::unique_ptr<Value> build_uint64_value(uint64_t value);
+std::unique_ptr<Value> build_int128_value(int64_t upper, uint64_t lower);
+std::unique_ptr<Value> build_float32_value(float value);
+std::unique_ptr<Value> build_float64_value(double value);
+std::unique_ptr<Value> build_decimal_value(int64_t upper, uint64_t lower, uint8_t width, uint8_t scale);
+std::unique_ptr<Value> build_varchar_value(rust::Str value);
+std::unique_ptr<Value> build_variant_value(rust::Str text);
+std::unique_ptr<Value> build_date_value(int32_t days);
+std::unique_ptr<Value> build_timestamp_value(int64_t micros);
+std::unique_ptr<Value> build_timestamp_tz_value(int64_t micros);
+std::unique_ptr<Value> build_interval_value(int32_t months, int32_t days, int64_t micros);
+std::unique_ptr<Value> build_null_value(BridgeLogicalType logical_type);
 
 size_t expr_ref_index(const Expression &expr);
 size_t expr_columnref_index(const Expression &expr);

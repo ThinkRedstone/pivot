@@ -89,7 +89,7 @@ fn create_simple_context() -> PlannerContext {
 }
 
 fn plan(p: &mut PlannerContext, query: &str) -> Result<duckdb_planner::Plan, Error> {
-    p.plan(query, Arc::new(TestTransaction))
+    p.plan(query, Vec::new(), Arc::new(TestTransaction))
 }
 
 #[test]
@@ -99,6 +99,7 @@ fn scalar_functions_resolve_through_the_current_transaction() {
     planner
         .plan(
             "SELECT transaction_scalar()",
+            Vec::new(),
             Arc::new(ScalarTransaction {
                 defines_function: true,
             }),
@@ -107,6 +108,7 @@ fn scalar_functions_resolve_through_the_current_transaction() {
 
     let result = planner.plan(
         "SELECT transaction_scalar()",
+        Vec::new(),
         Arc::new(ScalarTransaction {
             defines_function: false,
         }),

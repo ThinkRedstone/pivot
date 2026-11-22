@@ -1,7 +1,8 @@
-use std::fmt;
-
+use crate::Error;
 use crate::duckdb_bridge::duckdb_types::LogicalTypeId;
 use crate::duckdb_bridge::ffi;
+use cxx::UniquePtr;
+use std::fmt;
 
 /// The payload that completes a parameterized DuckDB type, mirroring
 /// DuckDB's own `ExtraTypeInfo`. Most ids fully describe their type and
@@ -53,6 +54,23 @@ impl BoundLogicalType {
             _ => ExtraTypeInfo::None,
         };
         BoundLogicalType { id, extra }
+    }
+
+    /// Encode into the flat FFI type struct, the inverse of `from_bridge`. The
+    /// flat struct has no room for a `STRUCT`'s fields, so that type is refused.
+    fn to_bridge(&self) -> Result<ffi::BridgeLogicalType, Error> {
+        let (decimal_width, decimal_scale) = match self.extra {
+            ExtraTypeInfo::None => (0, 0),
+            ExtraTypeInfo::Decimal { width, scale } => (width, scale),
+            ExtraTypeInfo::Struct(_) => {
+                return Err(Error::UnsupportedParameterType(self.id.clone()));
+            }
+        };
+        Ok(ffi::BridgeLogicalType {
+            id: self.id.clone() as u8,
+            decimal_width,
+            decimal_scale,
+        })
     }
 
     /// Encode into the flat FFI column descriptor the DuckDB catalog glue
@@ -128,6 +146,52 @@ pub enum ScalarValue {
     Null(BoundLogicalType),
     /// A DuckDB type the bridge does not decode into a typed variant.
     Other(LogicalTypeId),
+}
+
+impl ScalarValue {
+    /// Build the DuckDB value this scalar describes, the inverse of decoding
+    /// one off a plan. [`Other`](ScalarValue::Other) names a type without a
+    /// value, so it has nothing to build, and a `STRUCT` cannot be built yet.
+    pub fn into_duckdb_value(self) -> Result<UniquePtr<ffi::Value>, Error> {
+        Ok(match self {
+            ScalarValue::Boolean(value) => ffi::build_boolean_value(value)?,
+            ScalarValue::Int8(value) => ffi::build_int8_value(value)?,
+            ScalarValue::Int16(value) => ffi::build_int16_value(value)?,
+            ScalarValue::Int32(value) => ffi::build_int32_value(value)?,
+            ScalarValue::Int64(value) => ffi::build_int64_value(value)?,
+            ScalarValue::UInt8(value) => ffi::build_uint8_value(value)?,
+            ScalarValue::UInt16(value) => ffi::build_uint16_value(value)?,
+            ScalarValue::UInt32(value) => ffi::build_uint32_value(value)?,
+            ScalarValue::UInt64(value) => ffi::build_uint64_value(value)?,
+            ScalarValue::Int128(value) => {
+                ffi::build_int128_value((value >> 64) as i64, value as u64)?
+            }
+            ScalarValue::Float32(value) => ffi::build_float32_value(value)?,
+            ScalarValue::Float64(value) => ffi::build_float64_value(value)?,
+            ScalarValue::Decimal {
+                value,
+                width,
+                scale,
+            } => ffi::build_decimal_value((value >> 64) as i64, value as u64, width, scale)?,
+            ScalarValue::Utf8(value) => ffi::build_varchar_value(&value)?,
+            ScalarValue::Date(days) => ffi::build_date_value(days)?,
+            ScalarValue::Timestamp(micros) => ffi::build_timestamp_value(micros)?,
+            ScalarValue::TimestampTz(micros) => ffi::build_timestamp_tz_value(micros)?,
+            ScalarValue::Interval {
+                months,
+                days,
+                micros,
+            } => ffi::build_interval_value(months, days, micros)?,
+            ScalarValue::Variant(text) => ffi::build_variant_value(&text)?,
+            ScalarValue::Null(logical_type) => ffi::build_null_value(logical_type.to_bridge()?)?,
+            ScalarValue::Struct(_) => {
+                return Err(Error::UnsupportedParameterType(LogicalTypeId::STRUCT));
+            }
+            ScalarValue::Other(logical_type) => {
+                return Err(Error::UnsupportedParameterType(logical_type));
+            }
+        })
+    }
 }
 
 impl fmt::Display for ScalarValue {

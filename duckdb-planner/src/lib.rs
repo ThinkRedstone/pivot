@@ -51,7 +51,7 @@
 //!     .unwrap();
 //!
 //! // Plan a query inside a transaction; walk the root handle.
-//! let plan = ctx.plan("SELECT name FROM users", Arc::new(MyTransaction)).unwrap();
+//! let plan = ctx.plan("SELECT name FROM users", Vec::new(), Arc::new(MyTransaction)).unwrap();
 //! let root = plan.root().unwrap();
 //! assert_eq!(root.op_type().unwrap(), LogicalOperatorType::LOGICAL_PROJECTION);
 //! ```
@@ -83,6 +83,8 @@ pub enum Error {
     UnsupportedPlan(String),
     #[error("Bridge error: {0}")]
     Bridge(String),
+    #[error("a parameter of type {0:?} cannot be bound")]
+    UnsupportedParameterType(LogicalTypeId),
 }
 
 impl From<cxx::Exception> for Error {
@@ -165,13 +167,28 @@ impl PlannerContext {
     /// Every table the query references is bound through `transaction`, so one
     /// plan sees one consistent snapshot of the catalog. The transaction is
     /// published to the bridge only for the duration of this call.
+    ///
+    /// `parameters` are the values of the statement's `$1..$n` placeholders, in
+    /// placeholder order. DuckDB binds each as a constant of the value's type,
+    /// so the plan holds no placeholders; a statement whose placeholder count
+    /// differs from `parameters.len()` is an error.
     pub fn plan(
         &mut self,
         query: &str,
+        parameters: Vec<ScalarValue>,
         transaction: Arc<dyn DuckDBTransaction>,
     ) -> Result<Plan, Error> {
+        let mut parameter_list = ffi::new_parameter_list()?;
+        for parameter in parameters {
+            ffi::push_parameter(parameter_list.pin_mut(), parameter.into_duckdb_value()?)?;
+        }
         let transaction_ctx = catalog_provider::TransactionContext::new(transaction);
-        let result = ffi::extract_plan(self.cxx_context.pin_mut(), query, &transaction_ctx)?;
+        let result = ffi::extract_plan(
+            self.cxx_context.pin_mut(),
+            query,
+            &parameter_list,
+            &transaction_ctx,
+        )?;
         if !result.error_kind.is_empty() {
             return Err(bridge_error(&result));
         }

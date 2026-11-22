@@ -158,7 +158,7 @@ use thiserror::Error;
 use crate::catalog::{CatalogTransaction, DuckDBTransactionAdapter};
 use crate::operator::built_in_table_function_defs;
 pub use duckdb_planner::{
-    DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, ScalarValue,
+    BoundLogicalType, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, ScalarValue,
 };
 
 /// Errors surfaced by planning and validating a [`Plan`].
@@ -245,8 +245,20 @@ impl Planner {
         query: &str,
         transaction: Arc<dyn CatalogTransaction>,
     ) -> Result<Plan, Error> {
+        self.plan_with_parameters(query, Vec::new(), transaction)
+    }
+
+    /// Plan a SQL statement whose `$1..$n` placeholders take `parameters`, in
+    /// placeholder order. Each placeholder is planned as a constant of its
+    /// value's type, so the plan is specific to these values.
+    pub fn plan_with_parameters(
+        &mut self,
+        query: &str,
+        parameters: Vec<ScalarValue>,
+        transaction: Arc<dyn CatalogTransaction>,
+    ) -> Result<Plan, Error> {
         let adapter = Arc::new(DuckDBTransactionAdapter { transaction });
-        let planned = self.planner_context.plan(query, adapter)?;
+        let planned = self.planner_context.plan(query, parameters, adapter)?;
         let mut root = build::build_plan(planned.root()?)?;
         // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
         root.annotate_group_topn();

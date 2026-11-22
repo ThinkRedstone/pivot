@@ -53,6 +53,8 @@
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
+#include "duckdb/common/types/decimal.hpp"
+#include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/interval.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/planner/planner.hpp"
@@ -221,6 +223,7 @@ PlanHandle::~PlanHandle() {
 // captured without patching the bundled DuckDB.
 static duckdb::unique_ptr<duckdb::LogicalOperator>
 extract_plan_with_names(duckdb::Connection &con, const std::string &query,
+                        const ParameterList &parameters,
                         duckdb::vector<std::string> &result_names, bool &requires_rebind) {
 	auto statements = con.ExtractStatements(query);
 	if (statements.size() != 1) {
@@ -230,7 +233,22 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
 	context.RunFunctionInTransaction([&]() {
 		duckdb::Planner planner(context);
+		// DuckDB binds a placeholder that already has a value as a constant, which
+		// is how bound params end up in the plan.
+		// We pass the type explicitly to prevent duckdb from coercing it into a different
+		// type than the one passed to us.
+		for (duckdb::idx_t i = 0; i < parameters.values.size(); i++) {
+			auto &value = parameters.values[i];
+			planner.parameter_data.emplace(std::to_string(i + 1),
+			                               duckdb::BoundParameterData(value, value.type()));
+		}
 		planner.CreatePlan(std::move(statements[0]));
+		// A placeholder left without a value produces no plan to optimize.
+		if (!planner.plan || planner.properties.parameter_count != parameters.values.size()) {
+			throw duckdb::InvalidInputException(
+			    "statement takes " + std::to_string(planner.properties.parameter_count) +
+			    " parameters, " + std::to_string(parameters.values.size()) + " were supplied");
+		}
 		// The binder resolves the client-facing result column names before
 		// optimization rewrites the plan; capture them while still intact.
 		result_names = planner.names;
@@ -265,6 +283,7 @@ struct CurrentTransactionScope {
 };
 
 ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
+                               const ParameterList &parameters,
                                const TransactionContext &transaction) {
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
 	duckdb::vector<std::string> name_list;
@@ -276,7 +295,7 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 		std::string query_str(query.data(), query.size());
 		// The result column names DuckDB would hand a client, in select order
 		// (e.g. `["hour", "count_star()"]` for `SELECT f(t) AS hour, COUNT(*)`).
-		plan = extract_plan_with_names(ctx.con, query_str, name_list, requires_rebind);
+		plan = extract_plan_with_names(ctx.con, query_str, parameters, name_list, requires_rebind);
 		// Rewrite DuckDB's column *bindings* (table_index, column_index) into
 		// positional BoundReference indices against each operator's actual child
 		// output. This is the standard resolution DuckDB runs before execution;
@@ -310,6 +329,14 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 		result.output_names.push_back(rust::String::lossy(name));
 	}
 	return result;
+}
+
+std::unique_ptr<ParameterList> new_parameter_list() {
+	return std::make_unique<ParameterList>();
+}
+
+void push_parameter(ParameterList &parameters, std::unique_ptr<Value> value) {
+	parameters.values.push_back(std::move(*value));
 }
 
 const LogicalOperator &plan_root(const PlanHandle &plan) {
@@ -1405,6 +1432,93 @@ const Value &value_struct_field(const Value &v, size_t index) {
 		throw duckdb::InternalException("expected a STRUCT value, got %s", v.type().ToString());
 	}
 	return duckdb::StructValue::GetChildren(v)[index];
+}
+
+// Constructors for a DuckDB `Value`, the inverse of the typed accessors above:
+// each builds a non-NULL value of exactly the named type.
+std::unique_ptr<Value> build_boolean_value(bool value) {
+	return std::make_unique<Value>(Value::BOOLEAN(value));
+}
+std::unique_ptr<Value> build_int8_value(int8_t value) {
+	return std::make_unique<Value>(Value::TINYINT(value));
+}
+std::unique_ptr<Value> build_int16_value(int16_t value) {
+	return std::make_unique<Value>(Value::SMALLINT(value));
+}
+std::unique_ptr<Value> build_int32_value(int32_t value) {
+	return std::make_unique<Value>(Value::INTEGER(value));
+}
+std::unique_ptr<Value> build_int64_value(int64_t value) {
+	return std::make_unique<Value>(Value::BIGINT(value));
+}
+std::unique_ptr<Value> build_uint8_value(uint8_t value) {
+	return std::make_unique<Value>(Value::UTINYINT(value));
+}
+std::unique_ptr<Value> build_uint16_value(uint16_t value) {
+	return std::make_unique<Value>(Value::USMALLINT(value));
+}
+std::unique_ptr<Value> build_uint32_value(uint32_t value) {
+	return std::make_unique<Value>(Value::UINTEGER(value));
+}
+std::unique_ptr<Value> build_uint64_value(uint64_t value) {
+	return std::make_unique<Value>(Value::UBIGINT(value));
+}
+std::unique_ptr<Value> build_int128_value(int64_t upper, uint64_t lower) {
+	return std::make_unique<Value>(Value::HUGEINT(duckdb::hugeint_t(upper, lower)));
+}
+std::unique_ptr<Value> build_float32_value(float value) {
+	return std::make_unique<Value>(Value::FLOAT(value));
+}
+std::unique_ptr<Value> build_float64_value(double value) {
+	return std::make_unique<Value>(Value::DOUBLE(value));
+}
+// A DECIMAL stores its unscaled integer in the physical width its precision
+// requires, so only a wide decimal takes the 128-bit value as is.
+std::unique_ptr<Value> build_decimal_value(int64_t upper, uint64_t lower, uint8_t width, uint8_t scale) {
+	duckdb::hugeint_t unscaled(upper, lower);
+	if (width > duckdb::Decimal::MAX_WIDTH_INT64) {
+		return std::make_unique<Value>(Value::DECIMAL(unscaled, width, scale));
+	}
+	// Throws when the value does not fit the narrower storage.
+	return std::make_unique<Value>(Value::DECIMAL(duckdb::Hugeint::Cast<int64_t>(unscaled), width, scale));
+}
+std::unique_ptr<Value> build_varchar_value(rust::Str value) {
+	return std::make_unique<Value>(Value(std::string(value.data(), value.size())));
+}
+// A variant is built from its document text the way a cast in SQL builds one.
+std::unique_ptr<Value> build_variant_value(rust::Str text) {
+	return std::make_unique<Value>(
+	    Value(std::string(text.data(), text.size())).DefaultCastAs(duckdb::LogicalType::VARIANT()));
+}
+std::unique_ptr<Value> build_date_value(int32_t days) {
+	return std::make_unique<Value>(Value::DATE(duckdb::date_t(days)));
+}
+std::unique_ptr<Value> build_timestamp_value(int64_t micros) {
+	return std::make_unique<Value>(Value::TIMESTAMP(duckdb::timestamp_t(micros)));
+}
+std::unique_ptr<Value> build_timestamp_tz_value(int64_t micros) {
+	return std::make_unique<Value>(Value::TIMESTAMPTZ(duckdb::timestamp_tz_t(micros)));
+}
+std::unique_ptr<Value> build_interval_value(int32_t months, int32_t days, int64_t micros) {
+	return std::make_unique<Value>(Value::INTERVAL(months, days, micros));
+}
+// The DuckDB type a flat FFI type struct describes.
+// DECIMAL and VARIANT need internal type structure (even for nulls), so both are built
+// through their factories.
+static duckdb::LogicalType build_logical_type(const BridgeLogicalType &logical_type) {
+	auto id = static_cast<duckdb::LogicalTypeId>(logical_type.id);
+	if (id == duckdb::LogicalTypeId::DECIMAL) {
+		return duckdb::LogicalType::DECIMAL(logical_type.decimal_width, logical_type.decimal_scale);
+	}
+	if (id == duckdb::LogicalTypeId::VARIANT) {
+		return duckdb::LogicalType::VARIANT();
+	}
+	return duckdb::LogicalType(id);
+}
+
+// A Value built from a type alone is a NULL of that type.
+std::unique_ptr<Value> build_null_value(BridgeLogicalType logical_type) {
+	return std::make_unique<Value>(Value(build_logical_type(logical_type)));
 }
 
 size_t expr_ref_index(const Expression &expr) {

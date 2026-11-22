@@ -17,7 +17,7 @@ use planner::catalog::{
     BoundTable, CatalogTransaction, Column, DynamicScanPredicate, TableReference, TableRevision,
 };
 use planner::types::Type;
-use planner::{DEFAULT_DATASTORE_NAME, DEFAULT_SCHEMA_NAME, Planner};
+use planner::{DEFAULT_DATASTORE_NAME, DEFAULT_SCHEMA_NAME, Planner, ScalarValue};
 
 #[derive(Clone, Debug)]
 struct TestTable {
@@ -419,6 +419,25 @@ pub fn run_batches(planner: &mut TestingPlanner, sql: &str) -> Vec<RecordBatch> 
     planner
         .planner
         .plan(sql, transaction.clone())
+        .unwrap()
+        .compile(planner.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap()
+}
+
+/// Plan `sql` with `parameters` as its placeholder values, compile, and run
+/// it, returning the raw result batches.
+#[allow(dead_code)]
+pub fn run_batches_with_parameters(
+    planner: &mut TestingPlanner,
+    sql: &str,
+    parameters: Vec<ScalarValue>,
+) -> Vec<RecordBatch> {
+    let transaction = planner.transaction();
+    planner
+        .planner
+        .plan_with_parameters(sql, parameters, transaction.clone())
         .unwrap()
         .compile(planner.dispatcher(), transaction.as_ref())
         .unwrap()

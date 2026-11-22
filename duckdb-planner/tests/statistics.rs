@@ -71,6 +71,7 @@ fn join_planning_consults_table_row_counts() {
     planner
         .plan(
             "SELECT small.id FROM small JOIN big ON small.id = big.id",
+            Vec::new(),
             Arc::new(StatsTransaction {
                 asked: asked.clone(),
             }),

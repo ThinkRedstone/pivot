@@ -89,6 +89,7 @@ fn no_memory_leak_across_repeated_plans() {
                     let plan = ctx
                         .plan(
                             "SELECT id, name FROM users WHERE age <> 0",
+                            Vec::new(),
                             Arc::new(TestTransaction),
                         )
                         .unwrap();

@@ -1,0 +1,126 @@
+use duckdb_planner::handle::{Expression, Operator};
+use duckdb_planner::{
+    DuckDBTable, DuckDBTransaction, Error, LogicalTypeId, PlannerContext, ScalarValue,
+};
+use std::sync::Arc;
+
+struct EmptyTransaction;
+
+impl DuckDBTransaction for EmptyTransaction {
+    fn does_schema_exist(
+        &self,
+        _datastore: &str,
+        schema: &str,
+    ) -> duckdb_planner::catalog_provider::Result<bool> {
+        Ok(schema == "main")
+    }
+
+    fn bind_table(
+        &self,
+        _datastore: &str,
+        _schema: &str,
+        _table_name: &str,
+    ) -> duckdb_planner::catalog_provider::Result<Option<Box<dyn DuckDBTable>>> {
+        Ok(None)
+    }
+}
+
+fn create_context() -> PlannerContext {
+    PlannerContext::new(Vec::new(), vec!["db".to_string()], "db".to_string()).unwrap()
+}
+
+#[test]
+fn plan_binds_parameter_as_constant() {
+    let mut context = create_context();
+
+    let plan = context
+        .plan(
+            "SELECT $1",
+            vec![ScalarValue::Int32(7)],
+            Arc::new(EmptyTransaction),
+        )
+        .unwrap();
+
+    let Operator::Projection(projection) = plan.root().unwrap().operator().unwrap() else {
+        panic!("expected a projection");
+    };
+    let Expression::Constant(constant) = projection.exprs().unwrap()[0].expression().unwrap()
+    else {
+        panic!("expected a constant");
+    };
+    assert!(matches!(constant.value().unwrap(), ScalarValue::Int32(7)));
+}
+
+#[test]
+fn plan_reuses_parameter_among_several() {
+    let mut context = create_context();
+
+    let plan = context
+        .plan(
+            "SELECT $1 + $2 + $1",
+            vec![ScalarValue::Int32(3), ScalarValue::Int32(10)],
+            Arc::new(EmptyTransaction),
+        )
+        .unwrap();
+
+    let Operator::Projection(projection) = plan.root().unwrap().operator().unwrap() else {
+        panic!("expected a projection");
+    };
+    let Expression::Constant(constant) = projection.exprs().unwrap()[0].expression().unwrap()
+    else {
+        panic!("expected the sum folded into a constant");
+    };
+    assert!(matches!(constant.value().unwrap(), ScalarValue::Int32(16)));
+}
+
+#[test]
+fn plan_rejects_missing_parameter() {
+    let mut context = create_context();
+
+    let result = context.plan("SELECT $1", Vec::new(), Arc::new(EmptyTransaction));
+
+    let Err(Error::DuckDBPlanning(error)) = result else {
+        panic!("expected a planning error");
+    };
+    assert!(
+        error
+            .exception_message
+            .contains("statement takes 1 parameters, 0 were supplied")
+    );
+}
+
+#[test]
+fn plan_rejects_surplus_parameter() {
+    let mut context = create_context();
+
+    let result = context.plan(
+        "SELECT 1",
+        vec![ScalarValue::Int32(7)],
+        Arc::new(EmptyTransaction),
+    );
+
+    let Err(Error::DuckDBPlanning(error)) = result else {
+        panic!("expected a planning error");
+    };
+    assert!(
+        error
+            .exception_message
+            .contains("statement takes 0 parameters, 1 were supplied")
+    );
+}
+
+#[test]
+fn plan_rejects_parameter_without_value() {
+    let mut context = create_context();
+
+    let result = context.plan(
+        "SELECT $1",
+        vec![ScalarValue::Other(LogicalTypeId::BLOB)],
+        Arc::new(EmptyTransaction),
+    );
+
+    assert!(matches!(
+        result,
+        Err(Error::UnsupportedParameterType(LogicalTypeId::BLOB))
+    ));
+}
