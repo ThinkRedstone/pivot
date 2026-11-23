@@ -62,10 +62,17 @@ fn bound_type_from(raw: ffi::BridgeLogicalType) -> BoundLogicalType {
     BoundLogicalType::from_bridge(raw)
 }
 
-/// Read a DuckDB type in full, including the fields of a `STRUCT`, which the
-/// flat FFI type struct cannot carry.
-fn bound_type_from_logical_type(raw: &ffi::LogicalType) -> Result<BoundLogicalType> {
+/// Read a DuckDB type in full, including the fields of a `STRUCT` and the
+/// element type of a `LIST`, which the flat FFI type struct cannot carry.
+pub(crate) fn bound_type_from_logical_type(raw: &ffi::LogicalType) -> Result<BoundLogicalType> {
     let flat = bound_type_from(ffi::logical_type_flat(raw)?);
+    if flat.id == LogicalTypeId::LIST {
+        let element_type = bound_type_from_logical_type(ffi::logical_type_list_element_type(raw)?)?;
+        return Ok(BoundLogicalType {
+            id: LogicalTypeId::LIST,
+            extra: ExtraTypeInfo::List(Box::new(element_type)),
+        });
+    }
     if flat.id != LogicalTypeId::STRUCT {
         return Ok(flat);
     }

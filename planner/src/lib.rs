@@ -249,6 +249,19 @@ impl Planner {
         self.plan_with_parameters(query, Vec::new(), transaction)
     }
 
+    /// The type each of the statement's `$1..$n` placeholders takes from the
+    /// context it appears in, in placeholder order, resolving tables through
+    /// `transaction`. A placeholder no context gives a type to (e.g.
+    /// `SELECT $1`) is `UNKNOWN`.
+    pub fn infer_parameter_types(
+        &mut self,
+        query: &str,
+        transaction: Arc<dyn CatalogTransaction>,
+    ) -> Result<Vec<BoundLogicalType>, Error> {
+        let adapter = Arc::new(DuckDBTransactionAdapter { transaction });
+        Ok(self.planner_context.infer_parameter_types(query, adapter)?)
+    }
+
     /// Plan a SQL statement whose `$1..$n` placeholders take `parameters`, in
     /// placeholder order. Each placeholder is planned as a constant of its
     /// value's type, so the plan is specific to these values.

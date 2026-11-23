@@ -241,3 +241,39 @@ fn plan_rejects_parameter_count_mismatch(
         "{message}"
     );
 }
+
+#[rstest]
+fn infer_parameter_types_reads_column_comparisons(mut testing_planner: TestingPlanner) {
+    let transaction = testing_planner.transaction();
+
+    let types = testing_planner.planner.infer_parameter_types(
+        "SELECT a FROM example_table WHERE a > $1 AND name = $2",
+        transaction,
+    );
+
+    assert_eq!(
+        types.unwrap(),
+        vec![
+            BoundLogicalType::plain(LogicalTypeId::INTEGER),
+            BoundLogicalType::plain(LogicalTypeId::VARCHAR),
+        ]
+    );
+}
+
+#[rstest]
+fn plan_after_infer_parameter_types_uses_inferred_type(mut testing_planner: TestingPlanner) {
+    let sql = "SELECT a FROM example_table WHERE a > $1 ORDER BY a";
+    let transaction = testing_planner.transaction();
+    testing_planner
+        .planner
+        .infer_parameter_types(sql, transaction)
+        .unwrap();
+
+    let rows = batches_to_json(&run_batches_with_parameters(
+        &mut testing_planner,
+        sql,
+        vec![ScalarValue::Int32(3)],
+    ));
+
+    assert_eq!(rows, vec![json!({"a": 4}), json!({"a": 5})]);
+}

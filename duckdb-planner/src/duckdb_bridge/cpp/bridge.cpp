@@ -108,17 +108,17 @@ std::string bridge_exception_message(const std::exception &e) {
 	return e.what();
 }
 
-static ExtractPlanResult make_error(const string &kind, const string &message,
-                                    std::optional<string> position = std::nullopt) {
-	ExtractPlanResult result;
-	result.error_kind = rust::String::lossy(kind);
-	result.error_message = rust::String::lossy(message);
-	result.has_error_position = position.has_value();
-	result.error_position = rust::String::lossy(position.value_or(""));
-	return result;
+static BridgeErrorInfo make_error(const string &kind, const string &message,
+                                  std::optional<string> position = std::nullopt) {
+	BridgeErrorInfo error;
+	error.kind = rust::String::lossy(kind);
+	error.message = rust::String::lossy(message);
+	error.has_position = position.has_value();
+	error.position = rust::String::lossy(position.value_or(""));
+	return error;
 }
 
-static ExtractPlanResult build_duckdb_error(const duckdb::Exception &e) {
+static BridgeErrorInfo build_duckdb_error(const duckdb::Exception &e) {
 	using json = nlohmann::json;
 	auto parsed = json::parse(e.what(), nullptr, false);
 	string message = e.what();
@@ -143,6 +143,24 @@ static ExtractPlanResult build_duckdb_error(const duckdb::Exception &e) {
 	}
 
 	return make_error("duckdb_planning", message, position);
+}
+
+// Run `body`, turning any exception it throws into the error a bridge result
+// carries. The error is empty (no kind) when `body` returns normally.
+template <class F>
+static BridgeErrorInfo catch_bridge_error(F &&body) {
+	try {
+		body();
+	} catch (duckdb::Exception &e) {
+		return build_duckdb_error(e);
+	} catch (const UnsupportedPlanError &e) {
+		return make_error("unsupported_plan", e.what());
+	} catch (const std::exception &e) {
+		return make_error("bridge_error", e.what());
+	} catch (...) {
+		return make_error("bridge_error", "unknown C++ exception");
+	}
+	return BridgeErrorInfo {};
 }
 
 // Create new context for an in-memory DB. The context only binds and optimizes
@@ -215,24 +233,17 @@ PlanHandle::~PlanHandle() {
 	}
 }
 
-// Replicates `duckdb::ClientContext::ExtractPlan`, additionally returning the
-// binder-resolved result column names (in select order) via `result_names`.
-// The stock `ExtractPlan` computes those names on its local `Planner` and then
-// discards them when it returns only the plan; we reproduce its body here (the
-// binder/optimizer/resolver steps are all public API) so the names can be
-// captured without patching the bundled DuckDB.
-static duckdb::unique_ptr<duckdb::LogicalOperator>
-extract_plan_with_names(duckdb::Connection &con, const std::string &query,
-                        const ValueList &parameters,
-                        duckdb::vector<std::string> &result_names, bool &requires_rebind) {
+// Parse `query` as a single statement and bind it with `parameters`, then hand
+// the planner to `use_planner` while the binding transaction is still open.
+template <class F>
+static void bind_statement(duckdb::Connection &con, const std::string &query,
+                           const ValueList &parameters, F &&use_planner) {
 	auto statements = con.ExtractStatements(query);
 	if (statements.size() != 1) {
 		throw duckdb::InvalidInputException("ExtractPlan can only prepare a single statement");
 	}
-	auto &context = *con.context;
-	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
-	context.RunFunctionInTransaction([&]() {
-		duckdb::Planner planner(context);
+	con.context->RunFunctionInTransaction([&]() {
+		duckdb::Planner planner(*con.context);
 		// DuckDB binds a placeholder that already has a value as a constant, which
 		// is how bound params end up in the plan.
 		// We pass the type explicitly to prevent duckdb from coercing it into a different
@@ -243,6 +254,23 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 			                               duckdb::BoundParameterData(value, value.type()));
 		}
 		planner.CreatePlan(std::move(statements[0]));
+		use_planner(planner);
+	});
+}
+
+// Replicates `duckdb::ClientContext::ExtractPlan`, additionally returning the
+// binder-resolved result column names (in select order) via `result_names`.
+// The stock `ExtractPlan` computes those names on its local `Planner` and then
+// discards them when it returns only the plan; we reproduce its body here (the
+// binder/optimizer/resolver steps are all public API) so the names can be
+// captured without patching the bundled DuckDB.
+static duckdb::unique_ptr<duckdb::LogicalOperator>
+extract_plan_with_names(duckdb::Connection &con, const std::string &query,
+                        const ValueList &parameters,
+                        duckdb::vector<std::string> &result_names, bool &requires_rebind) {
+	auto &context = *con.context;
+	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
+	bind_statement(con, query, parameters, [&](duckdb::Planner &planner) {
 		// A placeholder left without a value produces no plan to optimize.
 		if (!planner.plan || planner.properties.parameter_count != parameters.values.size()) {
 			throw duckdb::InvalidInputException(
@@ -288,10 +316,10 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
 	duckdb::vector<std::string> name_list;
 	bool requires_rebind = false;
-	std::optional<ExtractPlanResult> error;
 	CurrentTransactionScope transaction_scope(PivotStorageInfo::Get(*ctx.db.instance), transaction);
 
-	try {
+	ExtractPlanResult result;
+	result.error = catch_bridge_error([&]() {
 		std::string query_str(query.data(), query.size());
 		// The result column names DuckDB would hand a client, in select order
 		// (e.g. `["hour", "count_star()"]` for `SELECT f(t) AS hour, COUNT(*)`).
@@ -302,24 +330,15 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 		// the Rust walk then reads those positional indices directly.
 		duckdb::ColumnBindingResolver resolver;
 		resolver.VisitOperator(*plan);
-	} catch (duckdb::Exception &e) {
-		error = build_duckdb_error(e);
-	} catch (const UnsupportedPlanError &e) {
-		error = make_error("unsupported_plan", e.what());
-	} catch (const std::exception &e) {
-		error = make_error("bridge_error", e.what());
-	} catch (...) {
-		error = make_error("bridge_error", "unknown C++ exception");
-	}
+	});
 
-	if (error) {
+	if (!result.error.kind.empty()) {
 		// No plan was produced, so nothing took the table handles; free the
 		// per-plan catalog entries now.
 		PivotStorageInfo::Get(*ctx.db.instance).ClearTableEntries();
-		return std::move(*error);
+		return result;
 	}
 
-	ExtractPlanResult result;
 	auto handle = std::make_unique<PlanHandle>();
 	handle->root = std::move(plan);
 	handle->ctx = &ctx;
@@ -329,6 +348,39 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 		result.output_names.push_back(rust::String::lossy(name));
 	}
 	return result;
+}
+
+ExtractParamTypesResult extract_param_types(DuckPlannerContext &ctx, rust::Str query,
+                                            const TransactionContext &transaction) {
+	CurrentTransactionScope transaction_scope(PivotStorageInfo::Get(*ctx.db.instance), transaction);
+	auto parameter_types = std::make_unique<ParameterTypes>();
+
+	ExtractParamTypesResult result;
+	result.error = catch_bridge_error([&]() {
+		std::string query_str(query.data(), query.size());
+		bind_statement(ctx.con, query_str, ValueList {}, [&](duckdb::Planner &planner) {
+			for (duckdb::idx_t i = 1; i <= planner.properties.parameter_count; i++) {
+				auto entry = planner.value_map.find(std::to_string(i));
+				// DuckDB leaves a placeholder that no context gives a type out of
+				// value_map.
+				parameter_types->types.push_back(entry == planner.value_map.end()
+				                                     ? duckdb::LogicalType(duckdb::LogicalTypeId::UNKNOWN)
+				                                     : entry->second->return_type);
+			}
+		});
+	});
+	// Binding created per-statement catalog entries, and no plan takes them.
+	PivotStorageInfo::Get(*ctx.db.instance).ClearTableEntries();
+	result.parameter_types = std::move(parameter_types);
+	return result;
+}
+
+size_t parameter_type_count(const ParameterTypes &parameter_types) {
+	return parameter_types.types.size();
+}
+
+const LogicalType &parameter_type(const ParameterTypes &parameter_types, size_t index) {
+	return parameter_types.types[index];
 }
 
 std::unique_ptr<ValueList> new_value_list() {
@@ -498,6 +550,15 @@ rust::String logical_type_struct_field_name(const LogicalType &type, size_t inde
 
 const LogicalType &logical_type_struct_field_type(const LogicalType &type, size_t index) {
 	return struct_fields(type)[index].second;
+}
+
+// The type is checked here because DuckDB's own accessor only asserts it in
+// debug builds.
+const LogicalType &logical_type_list_element_type(const LogicalType &type) {
+	if (type.id() != duckdb::LogicalTypeId::LIST) {
+		throw duckdb::InternalException("expected a LIST type, got %s", type.ToString());
+	}
+	return duckdb::ListType::GetChildType(type);
 }
 
 const LogicalType &lo_filter_type_id(const LogicalOperator &op, size_t index) {

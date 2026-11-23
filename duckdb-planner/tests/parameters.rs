@@ -1,7 +1,7 @@
 use duckdb_planner::handle::{Expression, Operator};
 use duckdb_planner::{
-    BoundLogicalType, DuckDBTable, DuckDBTransaction, Error, LogicalTypeId, PlannerContext,
-    ScalarValue,
+    BoundLogicalType, DuckDBTable, DuckDBTransaction, Error, ExtraTypeInfo, LogicalTypeId,
+    PlannerContext, ScalarValue,
 };
 use std::sync::Arc;
 
@@ -177,4 +177,70 @@ fn plan_rejects_parameter_without_value() {
         result,
         Err(Error::UnsupportedParameterType(LogicalTypeId::BLOB))
     ));
+}
+
+#[test]
+fn infer_parameter_types_reads_casts() {
+    let mut context = create_context();
+
+    let types = context
+        .infer_parameter_types(
+            "SELECT $1::DOUBLE, $2::INTEGER[]",
+            Arc::new(EmptyTransaction),
+        )
+        .unwrap();
+
+    let integer_list = BoundLogicalType {
+        id: LogicalTypeId::LIST,
+        extra: ExtraTypeInfo::List(Box::new(BoundLogicalType::plain(LogicalTypeId::INTEGER))),
+    };
+    assert_eq!(
+        types,
+        vec![BoundLogicalType::plain(LogicalTypeId::DOUBLE), integer_list]
+    );
+}
+
+#[test]
+fn infer_parameter_types_reports_unresolved_placeholder_as_unknown() {
+    let mut context = create_context();
+
+    let types = context
+        .infer_parameter_types("SELECT $1", Arc::new(EmptyTransaction))
+        .unwrap();
+
+    assert_eq!(types, vec![BoundLogicalType::plain(LogicalTypeId::UNKNOWN)]);
+}
+
+#[test]
+fn infer_parameter_types_lists_reused_placeholder_once() {
+    let mut context = create_context();
+
+    let types = context
+        .infer_parameter_types("SELECT $1::BIGINT + $1", Arc::new(EmptyTransaction))
+        .unwrap();
+
+    assert_eq!(types, vec![BoundLogicalType::plain(LogicalTypeId::BIGINT)]);
+}
+
+#[test]
+fn infer_parameter_types_of_statement_without_placeholders_is_empty() {
+    let mut context = create_context();
+
+    let types = context
+        .infer_parameter_types("SELECT 1", Arc::new(EmptyTransaction))
+        .unwrap();
+
+    assert!(types.is_empty());
+}
+
+#[test]
+fn infer_parameter_types_rejects_unknown_table() {
+    let mut context = create_context();
+
+    let result = context.infer_parameter_types(
+        "SELECT * FROM missing_table WHERE x = $1",
+        Arc::new(EmptyTransaction),
+    );
+
+    assert!(matches!(result, Err(Error::DuckDBPlanning(_))));
 }

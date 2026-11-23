@@ -109,17 +109,22 @@ pub mod ffi {
         pub rows: u64,
     }
 
+    /// What went wrong in a bridge call. `kind` is empty when nothing did, and
+    /// otherwise one of `duckdb_planning`, `unsupported_plan`, `bridge_error`.
+    struct BridgeErrorInfo {
+        pub kind: String,
+        pub message: String,
+        pub has_position: bool,
+        pub position: String,
+    }
+
     /// Outcome of `extract_plan`.
     ///
-    /// On success `error_kind` is empty and `plan` owns DuckDB's resolved plan
+    /// On success `error.kind` is empty and `plan` owns DuckDB's resolved plan
     /// tree (kept alive for the duration of the Rust walk). On failure `plan` is
-    /// null and the `error_*` fields describe what went wrong (`error_kind` is
-    /// one of `duckdb_planning`, `unsupported_plan`, `bridge_error`).
+    /// null and `error` describes what went wrong.
     struct ExtractPlanResult {
-        pub error_kind: String,
-        pub error_message: String,
-        pub has_error_position: bool,
-        pub error_position: String,
+        pub error: BridgeErrorInfo,
         pub plan: UniquePtr<PlanHandle>,
         /// The binder-resolved result column names DuckDB would hand a client,
         /// in select order (e.g. `["hour", "count_star()"]`). Empty when the
@@ -128,6 +133,13 @@ pub mod ffi {
         /// DuckDB found query-dependent state (such as its native `now()`)
         /// whose optimized value requires a fresh plan for another execution.
         pub requires_rebind: bool,
+    }
+
+    /// Outcome of `extract_param_types`. On failure `error` describes what
+    /// went wrong.
+    struct ExtractParamTypesResult {
+        pub error: BridgeErrorInfo,
+        pub parameter_types: UniquePtr<ParameterTypes>,
     }
 
     extern "Rust" {
@@ -208,6 +220,20 @@ pub mod ffi {
             parameters: &ValueList,
             transaction: &TransactionContext,
         ) -> Result<ExtractPlanResult>;
+
+        /// The type DuckDB infers for each of the statement's `$1..$n`
+        /// placeholders while binding it, in placeholder order, with
+        /// `transaction` published as for `extract_plan`. The statement is
+        /// bound but not planned further. A placeholder no context gives a type
+        /// to is `UNKNOWN`.
+        fn extract_param_types(
+            ctx: Pin<&mut DuckPlannerContext>,
+            query: &str,
+            transaction: &TransactionContext,
+        ) -> Result<ExtractParamTypesResult>;
+        type ParameterTypes;
+        fn parameter_type_count(parameter_types: &ParameterTypes) -> Result<usize>;
+        fn parameter_type(parameter_types: &ParameterTypes, index: usize) -> Result<&LogicalType>;
 
         /// An ordered run of values, filled one `push_value` at a time: a
         /// statement's placeholder values, or the elements of a list value.
@@ -624,6 +650,7 @@ pub mod ffi {
             logical_type: &LogicalType,
             index: usize,
         ) -> Result<&LogicalType>;
+        fn logical_type_list_element_type(logical_type: &LogicalType) -> Result<&LogicalType>;
 
         // ---- Value: constructors, the inverse of the typed accessors. A
         // 128-bit integer crosses as its two halves.

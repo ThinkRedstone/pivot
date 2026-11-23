@@ -10,6 +10,8 @@ struct CatalogContext;
 struct TransactionContext;
 struct OptionalTableWrapper;
 struct ExtractPlanResult;
+struct ExtractParamTypesResult;
+struct BridgeErrorInfo;
 struct BridgeLogicalType;
 struct BridgeDecimalValue;
 struct BridgeHugeint;
@@ -78,6 +80,16 @@ std::unique_ptr<DuckPlannerContext> new_context(rust::Box<CatalogContext> catalo
 ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
                                const ValueList &parameters,
                                const TransactionContext &transaction);
+
+// The type DuckDB inferred for each of a statement's `$1..$n` placeholders.
+struct ParameterTypes {
+	duckdb::vector<duckdb::LogicalType> types;
+};
+
+ExtractParamTypesResult extract_param_types(DuckPlannerContext &ctx, rust::Str query,
+                                            const TransactionContext &transaction);
+size_t parameter_type_count(const ParameterTypes &parameter_types);
+const LogicalType &parameter_type(const ParameterTypes &parameter_types, size_t index);
 
 std::unique_ptr<ValueList> new_value_list();
 void push_value(ValueList &values, std::unique_ptr<Value> value);
@@ -306,6 +318,7 @@ BridgeLogicalType logical_type_flat(const LogicalType &type);
 size_t logical_type_struct_field_count(const LogicalType &type);
 rust::String logical_type_struct_field_name(const LogicalType &type, size_t index);
 const LogicalType &logical_type_struct_field_type(const LogicalType &type, size_t index);
+const LogicalType &logical_type_list_element_type(const LogicalType &type);
 
 const LogicalType &value_type(const Value &v);
 bool value_is_null(const Value &v);
